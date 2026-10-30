@@ -26,7 +26,7 @@ type NovelState = {
   current: Novel | null;
   currentLoading: boolean;
   currentError: string | null;
-  load: (query?: Partial<NovelListQuery>) => Promise<void>;
+  load: (query?: Partial<NovelListQuery>, options?: { silent?: boolean }) => Promise<void>;
   loadOne: (id: string, options?: { silent?: boolean }) => Promise<Novel | null>;
   setQuery: (query: Partial<NovelQuery>) => void;
   create: (req: Wire<CreateNovelReq>) => Promise<Novel>;
@@ -36,6 +36,17 @@ type NovelState = {
 };
 
 let listSeq = 0;
+
+/** 与后端 list 的 title/summary LIKE 条件保持一致，用于判断新项能否直接插入当前列表。 */
+function matchesNovelQuery(novel: Novel, query: NovelQuery): boolean {
+  if (query.status && novel.status !== query.status) return false;
+  const needle = query.q.trim().toLowerCase();
+  if (!needle) return true;
+  return (
+    novel.title.toLowerCase().includes(needle) ||
+    (novel.summary ?? "").toLowerCase().includes(needle)
+  );
+}
 
 export const useNovelStore = create<NovelState>()(
   immer((set, get) => ({
@@ -51,7 +62,7 @@ export const useNovelStore = create<NovelState>()(
     currentLoading: false,
     currentError: null,
 
-    load: async (patch = {}) => {
+    load: async (patch = {}, options = {}) => {
       const next: NovelQuery = {
         ...get().query,
         ...(patch.q !== undefined ? { q: patch.q } : {}),
@@ -62,8 +73,10 @@ export const useNovelStore = create<NovelState>()(
       const seq = ++listSeq;
       set((state) => {
         state.query = next;
-        state.loading = true;
-        state.error = null;
+        if (!options.silent) {
+          state.loading = true;
+          state.error = null;
+        }
       });
       try {
         const page = await api.listNovels({
@@ -84,7 +97,7 @@ export const useNovelStore = create<NovelState>()(
         if (seq !== listSeq) return;
         set((state) => {
           state.loading = false;
-          state.error = userMessage(error);
+          if (!options.silent) state.error = userMessage(error);
         });
       }
     },
@@ -124,10 +137,16 @@ export const useNovelStore = create<NovelState>()(
 
     create: async (req) => {
       const novel = await api.createNovel(req);
-      set((state) => {
-        state.total += 1;
-        state.items.unshift(novel);
-      });
+      const { page, query } = get();
+      if (page === 1 && query.page === 1 && matchesNovelQuery(novel, query)) {
+        set((state) => {
+          state.items.unshift(novel);
+          state.total += 1;
+        });
+      } else {
+        // 当前筛选/页码下无法确定插入位置，保持本地 total 不变并静默对齐服务端。
+        void get().load({}, { silent: true });
+      }
       return novel;
     },
 

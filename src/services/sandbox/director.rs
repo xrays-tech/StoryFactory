@@ -122,27 +122,32 @@ pub async fn decide(
             };
 
             let terminate = value["terminate"].as_bool().unwrap_or(false);
-            let request_input = value
-                .get("request_user_input")
-                .and_then(|v| v.as_object())
-                .map(|obj| {
-                    let question = obj
-                        .get("question")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("请选择剧情走向")
-                        .to_string();
-                    let suggestions = obj
-                        .get("suggestions")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .take(4)
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    (question, suggestions)
-                });
+            // terminate 优先：两者同时出现时直接收尾，绝不进入等待输入。
+            let request_input = if terminate {
+                None
+            } else {
+                value
+                    .get("request_user_input")
+                    .and_then(|v| v.as_object())
+                    .map(|obj| {
+                        let question = obj
+                            .get("question")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("请选择剧情走向")
+                            .to_string();
+                        let suggestions = obj
+                            .get("suggestions")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(str::to_string))
+                                    .take(4)
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        (question, suggestions)
+                    })
+            };
             let hint = value["inject_scene_hint"]
                 .as_str()
                 .map(str::to_string)

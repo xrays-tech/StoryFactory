@@ -162,6 +162,14 @@ pub async fn run_engine(
             .await?;
         }
 
+        if decision.terminate {
+            let cause = if decision.scripted_done {
+                "scripted_done"
+            } else {
+                "terminate"
+            };
+            return finalize(&pool, &session_id, &cfg, &llm, &hub, cause, &row).await;
+        }
         if let Some((question, suggestions)) = decision.request_input {
             let applied = transition_with_event(
                 &pool,
@@ -204,14 +212,6 @@ pub async fn run_engine(
                 }
             }
             continue;
-        }
-        if decision.terminate {
-            let cause = if decision.scripted_done {
-                "scripted_done"
-            } else {
-                "terminate"
-            };
-            return finalize(&pool, &session_id, &cfg, &llm, &hub, cause, &row).await;
         }
 
         emit(
@@ -322,6 +322,26 @@ async fn commit_step(
 ) -> Result<(), AppError> {
     let mut tx = db::begin_immediate(pool).await.map_err(db_err)?;
 
+    // 状态守卫必须先于任何副作用写入：用户 Abort 后，在途 LLM 结果不得推进步骤或改写情感关系。
+    let advanced = sqlx::query(
+        "UPDATE sandbox_sessions SET current_step = ?, pending_directive = NULL, updated_at = strftime('%s','now') WHERE id = ? AND status IN ('running','paused')",
+    )
+    .bind(outcome.step as i64)
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    if advanced == 0 {
+        tx.rollback().await.map_err(db_err)?;
+        tracing::info!(
+            session_id = %session_id,
+            step = outcome.step,
+            "会话已离开运行态，丢弃在途步骤"
+        );
+        return Ok(());
+    }
+
     if let Some(target) = &outcome.target_actor_id {
         if target != &outcome.actor_id && actor_ids.iter().any(|id| id == target) {
             let (a, b) = if outcome.actor_id < *target {
@@ -392,14 +412,6 @@ async fn commit_step(
     )
     .await?;
 
-    sqlx::query(
-        "UPDATE sandbox_sessions SET current_step = ?, pending_directive = NULL, updated_at = strftime('%s','now') WHERE id = ?",
-    )
-    .bind(outcome.step as i64)
-    .bind(session_id)
-    .execute(&mut *tx)
-    .await
-    .map_err(db_err)?;
     tx.commit().await.map_err(db_err)?;
     let _ = hub.send(action_event);
     Ok(())
@@ -484,6 +496,7 @@ async fn finalize(
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
+        crate::services::outline::reindex_chapter(&mut tx, &row.novel_id, cid).await?;
     }
     let completed = sqlx::query(
         "UPDATE sandbox_sessions SET summary_text = ?, status = 'completed', finished_at = strftime('%s','now'), updated_at = strftime('%s','now') WHERE id = ? AND status = 'finalizing'",

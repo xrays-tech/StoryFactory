@@ -23,7 +23,8 @@ pub fn resolve_page(page: i64, page_size: i64) -> (i64, i64, i64, i64) {
         page_size
     };
     let p = if page <= 0 { 1 } else { page };
-    (p, ps, ps, (p - 1) * ps)
+    // page 为用户输入的无界 i64；饱和运算保证超大页码返回 i64::MAX 偏移（空结果）而不是溢出 panic。
+    (p, ps, ps, (p - 1).saturating_mul(ps))
 }
 
 /// 构造分页容器（表达式泛型构造受限, 使用工厂函数）。
@@ -51,4 +52,33 @@ where
         })
         .collect();
     serde_json::json!(items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_page;
+
+    #[test]
+    fn resolve_page_keeps_defaults_for_invalid_input() {
+        assert_eq!(resolve_page(0, 20), (1, 20, 20, 0));
+        assert_eq!(resolve_page(-5, 20), (1, 20, 20, 0));
+        assert_eq!(resolve_page(1, 0), (1, 20, 20, 0));
+        assert_eq!(resolve_page(1, -3), (1, 20, 20, 0));
+    }
+
+    #[test]
+    fn resolve_page_handles_normal_values() {
+        assert_eq!(resolve_page(1, 20), (1, 20, 20, 0));
+        assert_eq!(resolve_page(2, 20), (2, 20, 20, 20));
+        assert_eq!(resolve_page(3, 999), (3, 100, 100, 200));
+    }
+
+    #[test]
+    fn resolve_page_saturates_instead_of_overflowing() {
+        let (p, ps, limit, offset) = resolve_page(i64::MAX, 100);
+        assert_eq!(p, i64::MAX);
+        assert_eq!(ps, 100);
+        assert_eq!(limit, 100);
+        assert_eq!(offset, i64::MAX);
+    }
 }

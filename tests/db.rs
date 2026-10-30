@@ -54,3 +54,54 @@ async fn fts_trigram_cjk() {
     .expect("trigram match");
     assert_eq!(hit.len(), 1, "trigram should match CJK substring");
 }
+
+#[tokio::test]
+async fn instance_lock_is_exclusive() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().display().to_string();
+    let held = db::acquire_instance_lock(&data_dir).expect("first lock");
+    assert!(held.path().exists());
+
+    let second = db::acquire_instance_lock(&data_dir);
+    assert!(
+        second.is_err(),
+        "同一数据目录的第二个实例必须被拒绝（多进程共享 WAL 会丢数据）"
+    );
+
+    drop(held);
+    let third = db::acquire_instance_lock(&data_dir).expect("lock reacquired after release");
+    drop(third);
+}
+
+#[tokio::test]
+async fn unclean_marker_lifecycle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().display().to_string();
+    assert!(!db::was_unclean(&data_dir), "全新目录不应有残留标记");
+
+    db::mark_running(&data_dir).expect("mark running");
+    assert!(db::was_unclean(&data_dir));
+
+    db::mark_clean(&data_dir).expect("mark clean");
+    assert!(!db::was_unclean(&data_dir));
+
+    // 重复清理是幂等的
+    db::mark_clean(&data_dir).expect("mark clean twice");
+}
+
+#[tokio::test]
+async fn checkpoint_and_quick_check_ok() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = dir.path().display().to_string();
+    let pool = db::open_pool(&data_dir).await.expect("pool");
+    db::migrate(&pool).await.expect("migrate");
+
+    assert!(
+        db::checkpoint(&pool, "FULL").await.expect("checkpoint"),
+        "单连接下 FULL checkpoint 必须完整落盘"
+    );
+    let report = db::quick_check(&pool).await.expect("quick_check");
+    assert_eq!(report, "ok");
+
+    db::close(pool).await;
+}

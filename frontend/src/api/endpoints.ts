@@ -45,7 +45,6 @@ import {
   request,
   requestBlob,
   uploadFile,
-  withTokenInQuery,
   type QueryValue,
 } from "./client";
 
@@ -290,7 +289,7 @@ export async function inputSession(sid: string, req: Wire<InputReq>): Promise<Wi
 
 export function eventsUrl(sid: string, afterSeq?: number, extra?: Record<string, QueryValue>): string {
   const query = buildQuery({ after_seq: afterSeq, ...extra });
-  return withTokenInQuery(`${apiUrl(paths.events(sid))}${query}`);
+  return `${apiUrl(paths.events(sid))}${query}`;
 }
 
 export async function exportNovel(

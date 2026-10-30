@@ -109,6 +109,43 @@ async fn roundrobin_runs_to_completion_and_writes_outline() {
 }
 
 #[tokio::test]
+async fn finalize_indexes_generated_outline_for_search() {
+    let state = test_state_with_chain(Some(mock_chain(vec![
+        actor_json("A 的行动"),
+        outline_text(),
+    ])))
+    .await;
+    let (nid, actors, cid) = base_novel(&state).await;
+    let req = CreateSessionReq {
+        actor_ids: actors.split(',').map(str::to_string).collect(),
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let app = test_app(state.clone());
+    let (status, hits) = common::call(
+        &app,
+        axum::http::Method::GET,
+        "/api/v1/search?q=测试大纲",
+        None,
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "{hits}");
+    assert_eq!(hits["total"], 1, "finalize 生成的大纲必须可被检索: {hits}");
+    assert_eq!(hits["items"][0]["entity_type"], "chapter");
+    assert_eq!(hits["items"][0]["entity_id"], cid);
+}
+
+#[tokio::test]
 async fn director_mode_uses_llm_decision() {
     let state = test_state_with_chain(Some(mock_chain(vec![
         json!({ "next_actor_id": "placeholder", "reason": "冲突" }).to_string(),
@@ -231,6 +268,79 @@ async fn abort_during_llm_drops_half_step() {
     .await
     .unwrap();
     assert_eq!(actions, 0, "half step must not persist");
+}
+
+#[tokio::test]
+async fn in_flight_step_cannot_commit_after_abort() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    let state = test_state_with_chain(Some(ProviderChain::new(
+        vec![provider.clone()],
+        0,
+        Duration::from_secs(2),
+    )))
+    .await;
+    let (nid, actors, cid) = base_novel(&state).await;
+    let actor_ids: Vec<String> = actors.split(',').map(str::to_string).collect();
+    let target = actor_ids[1].clone();
+    provider.push_delay_ok(
+        Duration::from_millis(500),
+        json!({
+            "actor_action": { "type": "dialogue", "content": "迟到的行动" },
+            "emotion_delta": {
+                "target_actor_id": target,
+                "affinity_delta": 10,
+                "trust_delta": 10
+            }
+        })
+        .to_string(),
+    );
+    let req = CreateSessionReq {
+        actor_ids,
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(5),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 模拟竞态：Abort 状态已落库，但在途 LLM 结果尚未观察到取消令牌。
+    sqlx::query("UPDATE sandbox_sessions SET status = 'aborted' WHERE id = ?")
+        .bind(&created.id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let snap = state.sessions.snapshot(&created.id).await.unwrap();
+    assert_eq!(snap.status, SessionStatus::Aborted);
+    assert_eq!(snap.current_step, 0, "aborted session must not advance");
+
+    let actions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? AND event_type = 'actor_action'",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(actions, 0, "in-flight action must be dropped");
+    let emotions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? AND event_type = 'emotion_updated'",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(emotions, 0, "emotion update must be dropped");
+    let relations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM character_relations WHERE novel_id = ?")
+            .bind(&nid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(relations, 0, "relations must stay untouched");
 }
 
 #[tokio::test]
@@ -495,6 +605,71 @@ async fn waiting_input_timeout_finalizes() {
     })
     .await;
     assert_eq!(done.status, SessionStatus::Completed);
+}
+
+#[tokio::test]
+async fn terminate_precedes_request_input() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    let state = test_state_with_chain(Some(ProviderChain::new(
+        vec![provider.clone()],
+        0,
+        Duration::from_secs(2),
+    )))
+    .await;
+    {
+        let mut cfg = state.config.load().as_ref().clone();
+        cfg.sandbox.waiting_input_timeout_seconds = 1;
+        state.config.store(cfg.into());
+    }
+    let app = test_app(state.clone());
+    let nid = create_novel(&app, "终止优先测试").await;
+    let a = create_character(&app, &nid, "角色A").await;
+    let vid = create_volume(&app, &nid, "卷一").await;
+    let cid = create_chapter(&app, &nid, &vid, "第一章").await;
+
+    provider.push_ok(
+        json!({
+            "next_actor_id": a,
+            "reason": "收束",
+            "terminate": true,
+            "request_user_input": { "question": "继续吗？" }
+        })
+        .to_string(),
+    );
+    provider.push_ok(outline_text());
+    let req = CreateSessionReq {
+        actor_ids: vec![a],
+        mode: DirectorMode::Director,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(3),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+    let done = wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+    assert_eq!(done.status, SessionStatus::Completed);
+
+    let waiting: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? AND event_type = 'waiting_input'",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(waiting, 0, "terminate must win over request_user_input");
+
+    let cause: String = sqlx::query_scalar(
+        "SELECT json_extract(payload, '$.cause') FROM sandbox_events WHERE session_id = ? AND event_type = 'finalize_started' LIMIT 1",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(cause, "terminate");
 }
 
 #[tokio::test]

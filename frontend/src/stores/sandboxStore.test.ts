@@ -1,0 +1,175 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { CreateSessionReq, SessionSnapshot } from "../types/domain";
+import type { Wire, WirePage } from "../types/api";
+import type { SandboxEvent } from "../api/sse";
+
+const { listSessions, createSession } = vi.hoisted(() => ({
+  listSessions: vi.fn(),
+  createSession: vi.fn(),
+}));
+
+vi.mock("../api/endpoints", () => ({
+  listSessions,
+  createSession,
+}));
+
+import { useSandboxStore } from "./sandboxStore";
+
+type Session = Wire<SessionSnapshot>;
+
+function session(overrides: Partial<Session> = {}): Session {
+  return {
+    id: "s1",
+    novel_id: "n1",
+    chapter_id: null,
+    status: "created",
+    mode: "director",
+    current_step: 0,
+    step_limit: 10,
+    actor_ids: [],
+    actor_names: [],
+    last_event_seq: 0,
+    can_recover: false,
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      cost_usd: 0,
+      calls: 0,
+      by_purpose: [],
+    },
+    error: null,
+    created_at: 1,
+    updated_at: 1,
+    finished_at: null,
+    session_deadline: null,
+    ...overrides,
+  };
+}
+
+function event(seq: number): SandboxEvent {
+  return {
+    seq,
+    event_type: "step_started",
+    original_type: "step_started",
+    payload: {},
+    received_at: 0,
+  };
+}
+
+function emptyPage(page = 1): WirePage<SessionSnapshot> {
+  return { items: [], total: 0, page, page_size: 50 };
+}
+
+const createReq: Wire<CreateSessionReq> = {
+  actor_ids: [],
+  mode: "director",
+  scene_prompt: "场景",
+  step_limit: 10,
+  director_config: null,
+  user_directive: null,
+  autostart: true,
+};
+
+function resetStore() {
+  useSandboxStore.setState({
+    novelId: "n1",
+    sessions: [],
+    sessionsTotal: 0,
+    sessionsLoading: false,
+    sessionsError: null,
+    sessionFilter: "",
+    sessionsPage: 1,
+    session: session(),
+    snapshotLoading: false,
+    snapshotError: null,
+    events: [],
+    lastEventSeq: 0,
+    connection: "closed",
+    reconnectAttempt: 0,
+    autoScroll: true,
+    outline: null,
+    outlineChapterId: null,
+    streamError: null,
+  });
+}
+
+describe("useSandboxStore.ingestEvent", () => {
+  beforeEach(() => {
+    resetStore();
+  });
+
+  it("drops replayed events using the highest seen seq instead of scanning the trimmed buffer", () => {
+    const events = Array.from({ length: 500 }, (_, index) => event(501 + index));
+    useSandboxStore.setState({ events, lastEventSeq: 1000 });
+
+    useSandboxStore.getState().ingestEvent(event(900));
+
+    const state = useSandboxStore.getState();
+    expect(state.events).toHaveLength(500);
+    expect(state.events[0].seq).toBe(501);
+    expect(state.events.at(-1)?.seq).toBe(1000);
+    expect(state.lastEventSeq).toBe(1000);
+  });
+
+  it("appends newer events and trims the buffer", () => {
+    const events = Array.from({ length: 500 }, (_, index) => event(501 + index));
+    useSandboxStore.setState({ events, lastEventSeq: 1000 });
+
+    useSandboxStore.getState().ingestEvent(event(1001));
+
+    const state = useSandboxStore.getState();
+    expect(state.events).toHaveLength(500);
+    expect(state.events[0].seq).toBe(502);
+    expect(state.events.at(-1)?.seq).toBe(1001);
+    expect(state.lastEventSeq).toBe(1001);
+  });
+});
+
+describe("useSandboxStore.createSession", () => {
+  beforeEach(() => {
+    listSessions.mockReset();
+    createSession.mockReset();
+    listSessions.mockResolvedValue(emptyPage());
+    resetStore();
+  });
+
+  it("inserts a matching session on the first page", async () => {
+    const created = session();
+    createSession.mockResolvedValue(created);
+
+    await useSandboxStore.getState().createSession("n1", null, createReq);
+
+    expect(useSandboxStore.getState().sessions).toEqual([created]);
+    expect(useSandboxStore.getState().sessionsTotal).toBe(1);
+    expect(listSessions).not.toHaveBeenCalled();
+  });
+
+  it("reloads silently when the session misses the status filter", async () => {
+    useSandboxStore.setState({ sessionFilter: "running" });
+    createSession.mockResolvedValue(session({ status: "created" }));
+
+    await useSandboxStore.getState().createSession("n1", null, createReq);
+
+    expect(useSandboxStore.getState().sessions).toEqual([]);
+    expect(useSandboxStore.getState().sessionsTotal).toBe(0);
+    expect(listSessions).toHaveBeenCalledWith("n1", {
+      status: "running",
+      page: 1,
+      pageSize: 50,
+    });
+  });
+
+  it("reloads silently when the list is not on the first page", async () => {
+    useSandboxStore.setState({ sessionsPage: 2 });
+    createSession.mockResolvedValue(session());
+
+    await useSandboxStore.getState().createSession("n1", null, createReq);
+
+    expect(useSandboxStore.getState().sessions).toEqual([]);
+    expect(listSessions).toHaveBeenCalledWith("n1", {
+      status: "",
+      page: 2,
+      pageSize: 50,
+    });
+  });
+});

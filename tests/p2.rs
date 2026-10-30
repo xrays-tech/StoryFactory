@@ -6,6 +6,7 @@ use common::{
     call, create_chapter, create_character, create_novel, create_volume, test_app, test_state,
 };
 use serde_json::json;
+use story_architect::models::sandbox::{CreateSessionReq, DirectorMode};
 
 #[tokio::test]
 async fn novel_crud_lifecycle() {
@@ -166,6 +167,128 @@ async fn cross_volume_chapter_move() {
 }
 
 #[tokio::test]
+async fn chapter_index_rejects_unbounded_values() {
+    let app = test_app(test_state().await);
+    let nid = create_novel(&app, "小说").await;
+    let v1 = create_volume(&app, &nid, "卷一").await;
+    let c = create_chapter(&app, &nid, &v1, "章").await;
+
+    for bad in [0_i64, -1, 1_000_001, i64::MAX] {
+        let (status, body) = call(
+            &app,
+            Method::PATCH,
+            &format!("/api/v1/novels/{nid}/chapters/{c}"),
+            Some(json!({ "chapter_index": bad })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "chapter_index={bad} body={body}"
+        );
+        assert_eq!(body["error"]["code"], "validation_failed");
+    }
+
+    let (status, _) = call(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/novels/{nid}/chapters/{c}"),
+        Some(json!({ "chapter_index": 1_000_000 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "upper boundary must stay usable");
+}
+
+#[tokio::test]
+async fn cross_volume_move_keeps_indices_contiguous_and_idempotent() {
+    let app = test_app(test_state().await);
+    let nid = create_novel(&app, "小说").await;
+    let v1 = create_volume(&app, &nid, "卷一").await;
+    let v2 = create_volume(&app, &nid, "卷二").await;
+    let a = create_chapter(&app, &nid, &v1, "A").await;
+    let b = create_chapter(&app, &nid, &v1, "B").await;
+    let c = create_chapter(&app, &nid, &v1, "C").await;
+    let d = create_chapter(&app, &nid, &v2, "D").await;
+
+    let move_uri = format!("/api/v1/novels/{nid}/chapters/{d}");
+    let move_body = json!({ "volume_id": v1, "chapter_index": 2 });
+
+    let (status, moved) = call(&app, Method::PATCH, &move_uri, Some(move_body.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+
+    let (_, list) = call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novels/{nid}/volumes/{v1}/chapters"),
+        None,
+    )
+    .await;
+    let ids: Vec<&str> = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![a.as_str(), d.as_str(), b.as_str(), c.as_str()]);
+    let indices: Vec<i64> = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["chapter_index"].as_i64().unwrap())
+        .collect();
+    assert_eq!(indices, vec![1, 2, 3, 4], "卷内序号必须连续");
+
+    // 重复同一移动请求必须幂等：不重排、不产生重复序号
+    let (status, repeated) = call(&app, Method::PATCH, &move_uri, Some(move_body)).await;
+    assert_eq!(status, StatusCode::OK, "{repeated}");
+    let (_, list) = call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novels/{nid}/volumes/{v1}/chapters"),
+        None,
+    )
+    .await;
+    let indices: Vec<i64> = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["chapter_index"].as_i64().unwrap())
+        .collect();
+    assert_eq!(indices, vec![1, 2, 3, 4]);
+
+    // 同卷内向下移动（目标位置被占用）同样不得与后移章节撞唯一索引
+    let (status, moved) = call(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/novels/{nid}/chapters/{c}"),
+        Some(json!({ "chapter_index": 2 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    let (_, list) = call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novels/{nid}/volumes/{v1}/chapters"),
+        None,
+    )
+    .await;
+    let ids: Vec<&str> = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec![a.as_str(), c.as_str(), d.as_str(), b.as_str()]);
+    let indices: Vec<i64> = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["chapter_index"].as_i64().unwrap())
+        .collect();
+    assert_eq!(indices, vec![1, 2, 3, 4]);
+}
+
+#[tokio::test]
 async fn volume_move_up_down() {
     let app = test_app(test_state().await);
     let nid = create_novel(&app, "小说").await;
@@ -226,6 +349,49 @@ async fn relations_put_normalizes_and_rejects_self() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn relations_put_rejected_while_session_is_active() {
+    let state = test_state().await;
+    let app = test_app(state.clone());
+    let nid = create_novel(&app, "小说").await;
+    let a = create_character(&app, &nid, "A").await;
+    let b = create_character(&app, &nid, "B").await;
+
+    let session = state
+        .sessions
+        .create(
+            &nid,
+            None,
+            CreateSessionReq {
+                actor_ids: vec![a.clone(), b.clone()],
+                mode: DirectorMode::Roundrobin,
+                scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+                step_limit: Some(3),
+                director_config: None,
+                user_directive: None,
+                autostart: Some(false),
+            },
+        )
+        .await
+        .expect("create session");
+
+    let uri = format!("/api/v1/novels/{nid}/relations");
+    let body =
+        json!({ "relations": [{ "char_a_id": a, "char_b_id": b, "affinity": 20, "trust": 30 }] });
+    let (status, rejected) = call(&app, Method::PUT, &uri, Some(body.clone())).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "session_conflict");
+
+    // 会话进入终态后恢复原有全量替换行为
+    sqlx::query("UPDATE sandbox_sessions SET status = 'completed' WHERE id = ?")
+        .bind(&session.id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let (status, _) = call(&app, Method::PUT, &uri, Some(body)).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -361,6 +527,24 @@ async fn fts_sync_on_create_update_delete_restore() {
     assert_eq!(status, StatusCode::OK);
     let (_, back) = call(&app, Method::GET, "/api/v1/search?q=完全不同", None).await;
     assert_eq!(back["total"], 1);
+}
+
+#[tokio::test]
+async fn search_survives_fts_special_characters() {
+    let app = test_app(test_state().await);
+    let _ = create_novel(&app, "特殊字符检索").await;
+
+    for uri in [
+        "/api/v1/search?q=%22%22",    // 两个引号
+        "/api/v1/search?q=a%22b",     // 内嵌引号（走 MATCH）
+        "/api/v1/search?q=%2A%2A%2A", // ***（FTS 操作符）
+        "/api/v1/search?q=NEAR%28",   // NEAR(
+        "/api/v1/search?q=%20%20%20", // 纯空白
+        "/api/v1/search?q=%00%00",    // NUL 控制字符
+    ] {
+        let (status, body) = call(&app, Method::GET, uri, None).await;
+        assert_eq!(status, StatusCode::OK, "uri={uri} body={body}");
+    }
 }
 
 #[tokio::test]

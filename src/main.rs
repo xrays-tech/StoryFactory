@@ -23,8 +23,30 @@ async fn run() -> anyhow::Result<()> {
         tracing::warn!(warning = %warning, "config warning");
     }
 
-    let pool = db::open_pool(&data_dir.display().to_string()).await?;
+    // 同一数据目录只允许一个进程：多进程共享 WAL 是历史丢数据的唯一异常条件。
+    let data_dir_str = data_dir.display().to_string();
+    let _instance_lock = match db::acquire_instance_lock(&data_dir_str) {
+        Ok(lock) => {
+            tracing::info!(lock = %lock.path().display(), "data dir lock acquired");
+            lock
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context("无法获取数据目录独占锁"));
+        }
+    };
+
+    let unclean = db::was_unclean(&data_dir_str);
+    let pool = db::open_pool(&data_dir_str).await?;
     db::migrate(&pool).await?;
+    if unclean {
+        tracing::warn!("上次未正常关闭，正在检查数据库完整性");
+        match db::quick_check(&pool).await {
+            Ok(report) if report == "ok" => tracing::info!("sqlite quick_check ok"),
+            Ok(report) => tracing::error!(report = %report, "sqlite quick_check 报告异常"),
+            Err(e) => tracing::error!(error = %e, "sqlite quick_check 失败"),
+        }
+    }
+    db::mark_running(&data_dir_str)?;
     if let Some(patch) = config::load_runtime_patch(&pool).await {
         if let Err(e) = patch.apply(&mut cfg) {
             tracing::warn!(error = %e, "runtime config patch rejected");
@@ -57,8 +79,9 @@ async fn run() -> anyhow::Result<()> {
     let app = router::build_router(app_state);
 
     // 后台任务：回收站过期（每日）与幂等记录 TTL（10 分钟）
+    let mut job_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let recycle_pool = pool.clone();
-    tokio::spawn(async move {
+    job_handles.push(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 3600));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -68,9 +91,9 @@ async fn run() -> anyhow::Result<()> {
                 tracing::info!(purged, "recycle expiry purged items");
             }
         }
-    });
+    }));
     let zombie_pool = pool.clone();
-    tokio::spawn(async move {
+    job_handles.push(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -81,9 +104,9 @@ async fn run() -> anyhow::Result<()> {
                 _ => {}
             }
         }
-    });
+    }));
     let idem_pool = pool.clone();
-    tokio::spawn(async move {
+    job_handles.push(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(600));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -93,7 +116,7 @@ async fn run() -> anyhow::Result<()> {
                 tracing::info!(removed, "idempotency records expired");
             }
         }
-    });
+    }));
 
     let listener = TcpListener::bind((addr.host.as_str(), addr.port)).await?;
     tracing::info!(address = %format!("{}:{}", addr.host, addr.port), "listening");
@@ -118,34 +141,28 @@ async fn run() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // 关停序列：停后台任务 -> checkpoint -> 关闭连接池 -> 清 unclean 标记。
+    for handle in job_handles {
+        handle.abort();
+    }
+    if tokio::time::timeout(std::time::Duration::from_secs(5), db::close(pool))
+        .await
+        .is_err()
+    {
+        tracing::warn!("关闭连接池超时，交由强制退出兜底");
+    }
+    if let Err(e) = db::mark_clean(&data_dir_str) {
+        tracing::warn!(error = %e, "清理 unclean 标记失败");
+    }
     tracing::info!("shutdown complete");
     Ok(())
 }
 
-/// "" = 平台默认数据目录（§3.3）。
+/// "" = 平台默认数据目录（§3.3）。实现委托给 `config::effective_data_dir`，
+/// 保证配置层查找 `.env`/`config.toml` 的目录与数据写入目录始终一致。
 pub fn effective_data_dir(configured: &str) -> PathBuf {
-    if !configured.trim().is_empty() {
-        return PathBuf::from(configured);
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            return PathBuf::from(appdata).join("StoryArchitect");
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join("Library/Application Support/StoryArchitect");
-        }
-    }
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        return PathBuf::from(xdg).join("story-architect");
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".local/share/story-architect");
-    }
-    PathBuf::from("./story-architect-data")
+    config::effective_data_dir(configured)
 }
 
 /// 非回环绑定生成 32 hex 令牌并写入 0600 文件（D-29）。
@@ -182,4 +199,11 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutdown signal received");
+    // SSE 长连接可能让 graceful shutdown 无限等待：兜底强制退出，避免进程卡死后再被启动
+    // 第二个实例（历史上正是这样出现了同一数据目录的双进程）。
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        tracing::warn!("graceful shutdown timed out; forcing exit");
+        std::process::exit(0);
+    });
 }

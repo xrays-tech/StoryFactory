@@ -202,6 +202,83 @@ struct HitRow {
     body: String,
 }
 
+#[derive(Clone, Copy)]
+enum SearchMode {
+    Match,
+    Like,
+}
+
+/// 将用户输入转换为合法的 FTS5 短语。
+/// 控制字符（尤其是 NUL）会让 MATCH 解析失败；双引号按 FTS5 规则加倍转义。
+/// 清洗后为空白时返回 None，调用方直接返回空结果。
+fn fts_phrase(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("\"{}\"", trimmed.replace('"', "\"\"")))
+}
+
+async fn run_query(
+    pool: &SqlitePool,
+    mode: SearchMode,
+    term: &str,
+    entity_type: Option<&str>,
+    novel_id: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<(i64, Vec<HitRow>), sqlx::Error> {
+    let mut filters = String::new();
+    if entity_type.is_some() {
+        filters.push_str(" AND entity_type = ?");
+    }
+    if novel_id.is_some() {
+        filters.push_str(" AND novel_id = ?");
+    }
+    let (condition, order) = match mode {
+        SearchMode::Match => ("search_index MATCH ?", "bm25(search_index)"),
+        SearchMode::Like => (
+            "(title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\')",
+            "title",
+        ),
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM search_index WHERE {condition}{filters}");
+    let mut count_stmt = sqlx::query_scalar::<_, i64>(&count_sql);
+    if matches!(mode, SearchMode::Like) {
+        count_stmt = count_stmt.bind(term);
+    }
+    count_stmt = count_stmt.bind(term);
+    if let Some(v) = entity_type {
+        count_stmt = count_stmt.bind(v);
+    }
+    if let Some(v) = novel_id {
+        count_stmt = count_stmt.bind(v);
+    }
+    let total = count_stmt.fetch_one(pool).await?;
+
+    let rows_sql = format!(
+        "SELECT entity_type, entity_id, title, body FROM search_index WHERE {condition}{filters} ORDER BY {order} LIMIT ? OFFSET ?"
+    );
+    let mut rows_stmt = sqlx::query_as::<_, HitRow>(&rows_sql);
+    if matches!(mode, SearchMode::Like) {
+        rows_stmt = rows_stmt.bind(term);
+    }
+    rows_stmt = rows_stmt.bind(term);
+    if let Some(v) = entity_type {
+        rows_stmt = rows_stmt.bind(v);
+    }
+    if let Some(v) = novel_id {
+        rows_stmt = rows_stmt.bind(v);
+    }
+    let rows = rows_stmt.bind(limit).bind(offset).fetch_all(pool).await?;
+    Ok((total, rows))
+}
+
 pub async fn search(
     pool: &SqlitePool,
     q: &str,
@@ -212,6 +289,15 @@ pub async fn search(
     min_len: usize,
 ) -> Result<Page<SearchItemDto>, AppError> {
     let query = q.trim();
+    let (p, ps, limit, offset) = resolve_page(page, page_size);
+    if query.is_empty() {
+        return Ok(Page {
+            items: Vec::new(),
+            total: 0,
+            page: p,
+            page_size: ps,
+        });
+    }
     if query.chars().count() < min_len {
         return Err(AppError::validation(
             "搜索词过短",
@@ -221,80 +307,58 @@ pub async fn search(
             )]),
         ));
     }
-    let (p, ps, limit, offset) = resolve_page(page, page_size);
 
-    let mut filters = String::new();
-    if entity_type.is_some() {
-        filters.push_str(" AND entity_type = ?");
-    }
-    if novel_id.is_some() {
-        filters.push_str(" AND novel_id = ?");
-    }
-
-    let use_match = query.chars().count() >= 3;
-    let like_pattern = format!("%{}%", escape_like(query));
-    let phrase = format!("\"{}\"", query.replace('"', "\"\""));
-
-    let total: i64 = if use_match {
-        let sql = format!("SELECT COUNT(*) FROM search_index WHERE search_index MATCH ?{filters}");
-        let mut stmt = sqlx::query_scalar::<_, i64>(&sql).bind(&phrase);
-        if let Some(v) = entity_type {
-            stmt = stmt.bind(v);
-        }
-        if let Some(v) = novel_id {
-            stmt = stmt.bind(v);
-        }
-        stmt.fetch_one(pool).await.map_err(db_err)?
-    } else {
-        let sql = format!(
-            "SELECT COUNT(*) FROM search_index WHERE (title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\'){filters}"
-        );
-        let mut stmt = sqlx::query_scalar::<_, i64>(&sql)
-            .bind(&like_pattern)
-            .bind(&like_pattern);
-        if let Some(v) = entity_type {
-            stmt = stmt.bind(v);
-        }
-        if let Some(v) = novel_id {
-            stmt = stmt.bind(v);
-        }
-        stmt.fetch_one(pool).await.map_err(db_err)?
+    let Some(phrase) = fts_phrase(query) else {
+        return Ok(Page {
+            items: Vec::new(),
+            total: 0,
+            page: p,
+            page_size: ps,
+        });
     };
+    let like_pattern = format!("%{}%", escape_like(query));
 
-    let rows: Vec<HitRow> = if use_match {
-        let sql = format!(
-            "SELECT entity_type, entity_id, title, body FROM search_index WHERE search_index MATCH ?{filters} ORDER BY bm25(search_index) LIMIT ? OFFSET ?"
-        );
-        let mut stmt = sqlx::query_as::<_, HitRow>(&sql).bind(&phrase);
-        if let Some(v) = entity_type {
-            stmt = stmt.bind(v);
+    let (total, rows) = if query.chars().count() >= 3 {
+        match run_query(
+            pool,
+            SearchMode::Match,
+            &phrase,
+            entity_type,
+            novel_id,
+            limit,
+            offset,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                // FTS5 查询语法由用户输入驱动，任何解析/执行失败都降级为 LIKE，绝不冒泡成 500。
+                tracing::warn!(error = %e, "FTS5 MATCH 失败，回退 LIKE 检索");
+                run_query(
+                    pool,
+                    SearchMode::Like,
+                    &like_pattern,
+                    entity_type,
+                    novel_id,
+                    limit,
+                    offset,
+                )
+                .await
+                .map_err(db_err)?
+            }
         }
-        if let Some(v) = novel_id {
-            stmt = stmt.bind(v);
-        }
-        stmt.bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await
-            .map_err(db_err)?
     } else {
-        let sql = format!(
-            "SELECT entity_type, entity_id, title, body FROM search_index WHERE (title LIKE ? ESCAPE '\\' OR body LIKE ? ESCAPE '\\'){filters} ORDER BY title LIMIT ? OFFSET ?"
-        );
-        let mut stmt = sqlx::query_as::<_, HitRow>(&sql)
-            .bind(&like_pattern)
-            .bind(&like_pattern);
-        if let Some(v) = entity_type {
-            stmt = stmt.bind(v);
-        }
-        if let Some(v) = novel_id {
-            stmt = stmt.bind(v);
-        }
-        stmt.bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await
-            .map_err(db_err)?
+        run_query(
+            pool,
+            SearchMode::Like,
+            &like_pattern,
+            entity_type,
+            novel_id,
+            limit,
+            offset,
+        )
+        .await
+        .map_err(db_err)?
     };
 
     let items = rows

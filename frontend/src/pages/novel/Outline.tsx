@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import type { LoaderFunctionArgs } from "react-router-dom";
 import { useNavigate, useParams } from "react-router-dom";
 import {
@@ -194,16 +194,22 @@ export function OutlinePage() {
     }
   };
 
+  // 监听器只安装一次；通过 ref 读取最新草稿/选中状态，避免闭包读到旧值。
+  const saveShortcutRef = useRef<() => void>(() => {});
+  saveShortcutRef.current = () => {
+    if (selected && dirty && !saving) void submitChapterEdit();
+  };
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "s") {
         event.preventDefault();
-        if (selected && dirty && !saving) void submitChapterEdit();
+        saveShortcutRef.current();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  });
+  }, []);
 
   const removeVolume = async (volume: Volume) => {
     const ok = await askConfirm({

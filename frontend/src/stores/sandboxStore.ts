@@ -29,10 +29,12 @@ type SandboxState = {
   sessionsLoading: boolean;
   sessionsError: string | null;
   sessionFilter: SessionStatus | "";
+  sessionsPage: number;
   session: Session | null;
   snapshotLoading: boolean;
   snapshotError: string | null;
   events: SandboxEvent[];
+  lastEventSeq: number;
   connection: StreamState;
   reconnectAttempt: number;
   autoScroll: boolean;
@@ -82,10 +84,12 @@ export const useSandboxStore = create<SandboxState>()(
       sessionsLoading: false,
       sessionsError: null,
       sessionFilter: "",
+      sessionsPage: 1,
       session: null,
       snapshotLoading: false,
       snapshotError: null,
       events: [],
+      lastEventSeq: 0,
       connection: "idle",
       reconnectAttempt: 0,
       autoScroll: true,
@@ -98,6 +102,7 @@ export const useSandboxStore = create<SandboxState>()(
         set((state) => {
           state.novelId = novelId;
           if (options.status !== undefined) state.sessionFilter = options.status;
+          state.sessionsPage = options.page ?? 1;
           if (!options.silent) {
             state.sessionsLoading = true;
             state.sessionsError = null;
@@ -113,6 +118,7 @@ export const useSandboxStore = create<SandboxState>()(
           set((state) => {
             state.sessions = page.items;
             state.sessionsTotal = page.total;
+            state.sessionsPage = page.page;
             state.sessionsLoading = false;
           });
         } catch (error) {
@@ -126,10 +132,23 @@ export const useSandboxStore = create<SandboxState>()(
 
       createSession: async (novelId, chapterId, req, idempotencyKey) => {
         const session = await api.createSession(novelId, chapterId, req, idempotencyKey);
-        set((state) => {
-          state.sessions.unshift(session);
-          state.sessionsTotal += 1;
-          state.novelId = novelId;
+        const state = get();
+        const belongsToCurrentList = state.novelId === novelId;
+        const matchesQuery = !state.sessionFilter || session.status === state.sessionFilter;
+        const canInsert = belongsToCurrentList && state.sessionsPage === 1 && matchesQuery;
+
+        if (canInsert) {
+          set((draft) => {
+            draft.sessions.unshift(session);
+            draft.sessionsTotal += 1;
+          });
+          return session;
+        }
+
+        // 筛选/分页/其他小说视图下不猜测列表位置，静默回到服务端当前查询。
+        void state.loadSessions(state.novelId ?? novelId, {
+          silent: true,
+          page: state.sessionsPage,
         });
         return session;
       },
@@ -139,6 +158,7 @@ export const useSandboxStore = create<SandboxState>()(
         set((state) => {
           if (state.session && state.session.id !== sid) {
             state.events = [];
+            state.lastEventSeq = 0;
             state.outline = null;
             state.outlineChapterId = null;
           }
@@ -174,6 +194,7 @@ export const useSandboxStore = create<SandboxState>()(
           state.connection = "connecting";
           state.reconnectAttempt = 0;
           state.streamError = null;
+          state.lastEventSeq = Math.max(state.lastEventSeq, afterSeq);
         });
         stream = new SandboxEventStream(
           sid,
@@ -253,6 +274,7 @@ export const useSandboxStore = create<SandboxState>()(
       clearEvents: () =>
         set((state) => {
           state.events = [];
+          state.lastEventSeq = 0;
           state.outline = null;
           state.outlineChapterId = null;
           state.streamError = null;
@@ -260,10 +282,12 @@ export const useSandboxStore = create<SandboxState>()(
 
       ingestEvent: (event) => {
         const current = get().session;
-        const isDuplicate = get().events.some((e) => e.seq === event.seq && event.seq > 0);
-        if (isDuplicate) return;
+        // 事件按 seq 单调递增；重放/重连只需和已见最大序号比较，
+        // 不能依赖被 EVENT_LIMIT 裁剪过的事件数组。
+        if (event.seq > 0 && event.seq <= get().lastEventSeq) return;
 
         set((state) => {
+          if (event.seq > state.lastEventSeq) state.lastEventSeq = event.seq;
           state.events.push(event);
           if (state.events.length > EVENT_LIMIT) {
             state.events.splice(0, state.events.length - EVENT_LIMIT);
@@ -347,8 +371,10 @@ export const useSandboxStore = create<SandboxState>()(
         set((state) => {
           state.sessions = [];
           state.sessionsTotal = 0;
+          state.sessionsPage = 1;
           state.session = null;
           state.events = [];
+          state.lastEventSeq = 0;
           state.outline = null;
           state.outlineChapterId = null;
           state.connection = "idle";

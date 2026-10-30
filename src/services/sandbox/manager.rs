@@ -513,7 +513,8 @@ impl SessionManager {
                 if !status.is_active() {
                     return Err(AppError::new(ErrorCode::SessionConflict, "会话已终结"));
                 }
-                self.cancel(session_id);
+                // 先落库 aborted 再取消令牌：让 commit_step 的状态守卫成为最终裁决，
+                // 避免“取消已触发但状态仍为 running”的窗口内提交在途步骤。
                 self.transition(
                     session_id,
                     &[
@@ -529,6 +530,7 @@ impl SessionManager {
                     json!({"by":"user"}),
                 )
                 .await?;
+                self.cancel(session_id);
             }
             _ => {
                 return Err(AppError::new(

@@ -36,8 +36,10 @@ export function formatRelative(unix?: number | null): string {
 export function formatCost(value?: number | null): string {
   if (value == null || Number.isNaN(value)) return "$0.00";
   const normalized = Object.is(value, -0) ? 0 : value;
-  if (normalized > 0 && normalized < 0.01) return `$${normalized.toFixed(4)}`;
-  return `$${normalized.toFixed(2)}`;
+  const sign = normalized < 0 ? "-" : "";
+  const absolute = Math.abs(normalized);
+  const digits = absolute > 0 && absolute < 0.01 ? 4 : 2;
+  return `${sign}$${absolute.toFixed(digits)}`;
 }
 
 export function formatNumber(value?: number | null): string {

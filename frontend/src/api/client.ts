@@ -79,14 +79,6 @@ export function authHeaders(extra: Record<string, string> = {}): Record<string, 
   return token ? { ...extra, [APP_TOKEN_HEADER]: token } : extra;
 }
 
-/** SSE 无法（在原生 EventSource 下）设置请求头，因此把令牌放进查询串。 */
-export function withTokenInQuery(url: string): string {
-  const token = getAppToken();
-  if (!token) return url;
-  const separator = url.includes("?") ? "&" : "?";
-  return `${url}${separator}token=${encodeURIComponent(token)}`;
-}
-
 export type RequestOptions = {
   query?: Record<string, QueryValue>;
   body?: unknown;

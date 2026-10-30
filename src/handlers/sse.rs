@@ -22,6 +22,15 @@ pub struct SseQ {
     pub after_seq: Option<u64>,
 }
 
+const IDLE_POLL_BASE_SECS: u64 = 2;
+const IDLE_POLL_MAX_SECS: u64 = 15;
+
+/// 无活跃引擎时的空闲轮询退避：2s → 4s → 8s → 15s 封顶。
+fn idle_poll_delay(attempt: u32) -> Duration {
+    let secs = IDLE_POLL_BASE_SECS.saturating_mul(1u64 << attempt.min(3));
+    Duration::from_secs(secs.min(IDLE_POLL_MAX_SECS))
+}
+
 pub async fn stream_events(
     state: State<AppState>,
     path: Path<String>,
@@ -44,6 +53,8 @@ pub async fn stream_events(
 
     tokio::spawn(async move {
         let mut last_sent = after;
+        let mut idle_attempt = 0u32;
+        let mut idle_observed: Option<(String, i64)> = None;
         // D-20：先订阅再回放，避免订阅空窗丢事件。
         let mut live = sessions.subscribe(&session_id);
         match replay(&pool, &session_id, after, &tx, &mut last_sent).await {
@@ -99,12 +110,25 @@ pub async fn stream_events(
                 }
                 if closed {
                     live = None;
+                    idle_attempt = 0;
+                    idle_observed = None;
                 }
             } else {
-                // 无活跃任务：短轮询终态，并持续尝试重新订阅（resume/recover 会产生新 hub）。
-                tokio::time::sleep(Duration::from_secs(heartbeat.min(2))).await;
+                // 无活跃任务：指数退避轮询终态，并持续尝试重新订阅（resume/recover 会产生新 hub）。
+                let delay = idle_poll_delay(idle_attempt);
+                idle_attempt = idle_attempt.saturating_add(1);
+                tokio::time::sleep(delay).await;
                 match load_row(&pool, &session_id).await {
                     Ok(row) => {
+                        let observed = (row.status.clone(), row.current_step);
+                        let changed = idle_observed
+                            .as_ref()
+                            .is_some_and(|previous| previous != &observed);
+                        idle_observed = Some(observed);
+                        if changed {
+                            // 状态/进度有变化：回到 2s 快路径重新观察。
+                            idle_attempt = 0;
+                        }
                         if let Some(status) = SessionStatus::from_db(&row.status) {
                             if status.is_terminal() {
                                 let _ = send_done(&tx).await;
@@ -115,6 +139,8 @@ pub async fn stream_events(
                     Err(_) => return,
                 }
                 if let Some(receiver) = sessions.subscribe(&session_id) {
+                    idle_attempt = 0;
+                    idle_observed = None;
                     let since = last_sent;
                     match replay(&pool, &session_id, since, &tx, &mut last_sent).await {
                         Ok(true) => {
@@ -210,4 +236,20 @@ fn is_terminal(event_type: SandboxEventType) -> bool {
             | SandboxEventType::SessionFailed
             | SandboxEventType::SessionAborted
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::idle_poll_delay;
+
+    #[test]
+    fn idle_poll_delay_backs_off_and_caps() {
+        let secs: Vec<u64> = (0..=5)
+            .map(|attempt| idle_poll_delay(attempt).as_secs())
+            .collect();
+        assert_eq!(secs, vec![2, 4, 8, 15, 15, 15]);
+        assert_eq!(idle_poll_delay(0), Duration::from_secs(2));
+    }
 }

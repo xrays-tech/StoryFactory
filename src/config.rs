@@ -3,7 +3,7 @@
 // dotenvy 注入 .env 时不覆盖已有 env => 两者均走 APP_* 层, 优先级自动正确.
 // D-28: http.dev_cors=true => CORS 仅放行 http://localhost:5173; 默认 false = 生产 deny-all.
 // 密钥仅 env: APP_LLM_API_KEY / APP_LLM_FALLBACK_API_KEY_<N>; 文件层不可写入(serde skip); 展示掩码.
-use std::path::Path;
+use std::path::PathBuf;
 
 use config::{Config, File, FileFormat};
 use serde::{Deserialize, Serialize};
@@ -227,14 +227,14 @@ const ENV_MAP: [(&str, &str); 27] = [
 
 pub fn load() -> Result<AppConfig, ConfigError> {
     // (1) .env -> env：优先数据目录（D-08），回退 CWD
-    let data_env = Path::new(&data_dir_from_env_or_default()).join(".env");
+    let data_dir_for_file = data_dir_from_env_or_default();
+    let data_env = data_dir_for_file.join(".env");
     if dotenvy::from_path(&data_env).is_err() {
         let _ = dotenvy::from_path(".env");
     }
 
     // (2) config.toml 在数据目录（APP_DATA_DIR env 时确定）
-    let data_dir_for_file = data_dir_from_env_or_default();
-    let cfg_path = Path::new(data_dir_for_file.as_str()).join("config.toml");
+    let cfg_path = data_dir_for_file.join("config.toml");
 
     // (3) 默认层 -> 文件层
     let builder = Config::builder();
@@ -271,21 +271,46 @@ pub fn load() -> Result<AppConfig, ConfigError> {
     Ok(app)
 }
 
-fn data_dir_from_env_or_default() -> String {
+fn data_dir_from_env_or_default() -> PathBuf {
     if let Ok(v) = std::env::var("APP_DATA_DIR") {
-        return v;
+        if !v.trim().is_empty() {
+            return PathBuf::from(v);
+        }
     }
     default_data_dir()
 }
 
-fn default_data_dir() -> String {
-    if let Ok(v) = std::env::var("XDG_DATA_HOME") {
-        return format!("{v}/story-architect", v = v);
+fn default_data_dir() -> PathBuf {
+    effective_data_dir("")
+}
+
+/// 数据目录唯一解析入口（§3.3）：显式配置 > 平台默认。
+///
+/// 配置层（`.env` / `config.toml` 查找）与 main（日志 / DB / 令牌）必须共用本函数，
+/// 否则 macOS 上会出现「配置读 A 目录、数据写 B 目录」的静默错配。
+pub fn effective_data_dir(configured: &str) -> PathBuf {
+    if !configured.trim().is_empty() {
+        return PathBuf::from(configured);
     }
-    if let Ok(v) = std::env::var("HOME") {
-        return format!("{v}/.local/share/story-architect", v = v);
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            return PathBuf::from(appdata).join("StoryArchitect");
+        }
     }
-    "./story-architect-data".to_string()
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join("Library/Application Support/StoryArchitect");
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        return PathBuf::from(xdg).join("story-architect");
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local/share/story-architect");
+    }
+    PathBuf::from("./story-architect-data")
 }
 
 fn apply_env_overrides(app: &mut AppConfig) {

@@ -399,6 +399,22 @@ pub async fn put_relations(
     }
 
     let mut tx = db::begin_immediate(pool).await.map_err(db_err)?;
+    // 全量替换会抹掉沙盒在运行期累积的 affinity/trust；存在非终态会话时在写锁内拒绝，
+    // 避免检查与删除之间的竞态。
+    let active_session: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM sandbox_sessions WHERE novel_id = ? AND status NOT IN ('completed','failed','aborted') LIMIT 1",
+    )
+    .bind(novel_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    if active_session.is_some() {
+        tx.rollback().await.map_err(db_err)?;
+        return Err(AppError::new(
+            ErrorCode::SessionConflict,
+            "存在活跃沙盒会话，禁止全量替换角色关系（会覆盖沙盒累积的 affinity/trust）",
+        ));
+    }
     for rel in &normalized {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM characters WHERE novel_id = ? AND deleted_at IS NULL AND id IN (?, ?)",

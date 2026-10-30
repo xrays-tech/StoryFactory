@@ -14,6 +14,9 @@ use crate::services::util::{
     db_err, invalid, next_chapter_index, next_volume_index, not_found, novel_alive, push_len,
 };
 
+/// 章节序号上界：与两阶段重排的偏移量（100000）拉开安全距离，避免加法溢出。
+const MAX_CHAPTER_INDEX: i64 = 1_000_000;
+
 const VOL_COLS: &str = "id, novel_id, volume_index, title, summary, created_at, updated_at";
 const CH_COLS: &str = "id, novel_id, volume_id, chapter_index, title, scene_prompt, final_outline, status, created_at, updated_at";
 
@@ -76,6 +79,36 @@ fn chapter_body(d: &ChapterDto) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 在调用方事务内重建章节全文索引。
+/// 供 finalize 等绕过 CRUD 直接改表的路径复用，确保标题/正文口径与大纲服务一致。
+pub async fn reindex_chapter(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    novel_id: &str,
+    chapter_id: &str,
+) -> Result<(), AppError> {
+    let row = sqlx::query_as::<_, ChapterRow>(&format!(
+        "SELECT {CH_COLS} FROM chapters WHERE id = ? AND novel_id = ? AND deleted_at IS NULL"
+    ))
+    .bind(chapter_id)
+    .bind(novel_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    let d = ch_dto(row);
+    search::index_entity(
+        tx,
+        "chapter",
+        &d.id,
+        &d.novel_id,
+        &d.title,
+        &chapter_body(&d),
+    )
+    .await
 }
 
 async fn volume_alive_in_novel(
@@ -471,8 +504,13 @@ pub async fn update_chapter(
         req.final_outline.as_deref(),
         200000,
     );
-    if req.chapter_index.is_some_and(|v| v < 1) {
-        errs.push(("chapter_index", "chapter_index 必须 >= 1".to_string()));
+    if let Some(v) = req.chapter_index {
+        if !(1..=MAX_CHAPTER_INDEX).contains(&v) {
+            errs.push((
+                "chapter_index",
+                format!("chapter_index 必须为 1..={MAX_CHAPTER_INDEX}"),
+            ));
+        }
     }
     if !errs.is_empty() {
         return Err(invalid(errs));
@@ -509,7 +547,8 @@ pub async fn update_chapter(
     let moved_index = target_index != current.chapter_index || moved_volume;
 
     if moved_index {
-        // 目标位置被占用时，后续章节整体后移一位（两阶段避免唯一索引冲突）。
+        // 目标位置被占用时，后续章节整体后移一位。先把待移动章节停放到两卷最大序号之外：
+        // 否则其旧位置会在第二阶段与后移章节撞唯一索引（同卷向下移动场景）。
         let occupied: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM chapters WHERE volume_id = ? AND chapter_index = ? AND deleted_at IS NULL AND id <> ?",
         )
@@ -520,6 +559,21 @@ pub async fn update_chapter(
         .await
         .map_err(db_err)?;
         if occupied.is_some() {
+            let max_index: Option<i64> = sqlx::query_scalar(
+                "SELECT MAX(chapter_index) FROM chapters WHERE deleted_at IS NULL AND volume_id IN (?, ?)",
+            )
+            .bind(&current.volume_id)
+            .bind(&target_volume)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            let parking_index = max_index.unwrap_or(0).saturating_add(1_000_000);
+            sqlx::query("UPDATE chapters SET chapter_index = ? WHERE id = ?")
+                .bind(parking_index)
+                .bind(cid)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
             sqlx::query(
                 "UPDATE chapters SET chapter_index = chapter_index + 100000 WHERE volume_id = ? AND chapter_index >= ? AND deleted_at IS NULL AND id <> ?",
             )
@@ -530,10 +584,11 @@ pub async fn update_chapter(
             .await
             .map_err(db_err)?;
             sqlx::query(
-                "UPDATE chapters SET chapter_index = chapter_index - 99999 WHERE volume_id = ? AND chapter_index >= ? AND deleted_at IS NULL",
+                "UPDATE chapters SET chapter_index = chapter_index - 99999 WHERE volume_id = ? AND chapter_index >= ? AND deleted_at IS NULL AND id <> ?",
             )
             .bind(&target_volume)
-            .bind(target_index + 100000)
+            .bind(target_index.saturating_add(100000))
+            .bind(cid)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;

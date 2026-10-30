@@ -99,11 +99,62 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
+/// 客户端上报日志只保留的字符上限（不再落原始 body）。
+const CLIENT_ERROR_LOG_LIMIT: usize = 256;
+/// 提取出的 code 字段长度上限，避免日志被超长字段污染。
+const CLIENT_ERROR_CODE_LIMIT: usize = 64;
+
+fn sanitize_log_field(raw: &str) -> String {
+    raw.chars()
+        .take(CLIENT_ERROR_CODE_LIMIT)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
+/// 仅返回可安全落日志的 (code, 截断后字符数)，永不返回原始 body。
+/// code 优先取 JSON 的字符串字段 `code`，缺失/非法时使用固定值 `client_error`。
+fn client_error_log_fields(body: &[u8]) -> (String, usize) {
+    let raw = String::from_utf8_lossy(body);
+    let truncated_len = raw.chars().take(CLIENT_ERROR_LOG_LIMIT).count();
+    let code = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("code")
+                .and_then(|v| v.as_str())
+                .map(sanitize_log_field)
+        })
+        .filter(|code| !code.trim().is_empty())
+        .unwrap_or_else(|| "client_error".to_string());
+    (code, truncated_len)
+}
+
 pub async fn client_error(body: Bytes) -> Response {
     if body.len() > 32 * 1024 {
         return AppError::too_large().into_response();
     }
-    let text = String::from_utf8_lossy(&body);
-    tracing::warn!(payload = %text.chars().take(2000).collect::<String>(), "client error report");
+    let (code, truncated_len) = client_error_log_fields(&body);
+    tracing::warn!(code = %code, truncated_len, "client error report");
     axum::http::StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{client_error_log_fields, CLIENT_ERROR_LOG_LIMIT};
+
+    #[test]
+    fn client_error_log_fields_keeps_only_sanitized_code_and_length() {
+        let long = format!(r#"{{"code":"E\u0000VIL","message":"{}"}}"#, "x".repeat(400));
+        let (code, truncated_len) = client_error_log_fields(long.as_bytes());
+        assert_eq!(truncated_len, CLIENT_ERROR_LOG_LIMIT);
+        assert_eq!(code, "E VIL");
+        assert!(!code.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn client_error_log_fields_falls_back_to_constant_code() {
+        let (code, truncated_len) = client_error_log_fields(br#"{"message":"boom"}"#);
+        assert_eq!(code, "client_error");
+        assert_eq!(truncated_len, 18);
+    }
 }

@@ -14,6 +14,12 @@ describe("format", () => {
     expect(formatCost(1.5)).toBe("$1.50");
   });
 
+  it("places the minus sign before the currency symbol", () => {
+    expect(formatCost(-0.5)).toBe("-$0.50");
+    expect(formatCost(-0.0023)).toBe("-$0.0023");
+    expect(formatCost(-0)).toBe("$0.00");
+  });
+
   it("truncates long text", () => {
     expect(truncate("一二三四五", 3)).toBe("一二三…");
     expect(truncate("短", 3)).toBe("短");

@@ -227,14 +227,40 @@ export function SandboxConsole() {
     return () => window.removeEventListener("beforeunload", handler);
   }, [session?.status]);
 
+  const connectedSessionRef = useRef<string | null>(null);
+
   useEffect(() => {
-    if (!session?.id) return;
-    const maxSeq = useSandboxStore
-      .getState()
-      .events.reduce((max, event) => Math.max(max, event.seq), 0);
-    connect(session.id, maxSeq);
-    return () => disconnect();
-  }, [session?.id, connect, disconnect]);
+    const sid = session?.id;
+    if (!sid) return;
+
+    const { connection, lastEventSeq } = useSandboxStore.getState();
+
+    // 首次进入（含已终结会话）必须连一次，服务端会按 after_seq 回放历史事件。
+    if (connectedSessionRef.current !== sid) {
+      connectedSessionRef.current = sid;
+      connect(sid, lastEventSeq);
+      return;
+    }
+
+    if (isSessionTerminal(session.status)) {
+      disconnect();
+      return;
+    }
+
+    // interrupted -> running（recover）时 id 不变，但流可能已被 sandbox.done 关闭；
+    // 只在非终态且当前没有活跃流时重连，connect() 自身负责关闭旧流。
+    if (connection === "idle" || connection === "closed") {
+      connect(sid, lastEventSeq);
+    }
+  }, [session?.id, session?.status, connect, disconnect]);
+
+  useEffect(
+    () => () => {
+      connectedSessionRef.current = null;
+      disconnect();
+    },
+    [disconnect],
+  );
 
   useEffect(() => {
     if (!session?.id || isSessionTerminal(session.status)) return;
