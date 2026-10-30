@@ -1,11 +1,12 @@
 import { NavLink } from "react-router-dom";
-import { Feather, LibraryBig, Settings, Trash2, X } from "lucide-react";
+import { Feather, FileUp, LibraryBig, Settings, Trash2, X } from "lucide-react";
 import { cn } from "../../lib/cn";
 import { zh } from "../../copy/zh";
 import { useUiStore } from "../../stores/uiStore";
 
 const navItems = [
   { to: "/", label: zh.nav.dashboard, icon: LibraryBig, end: true },
+  { to: "/novels/new", label: zh.nav.importNovel, icon: FileUp, end: false },
   { to: "/recycle", label: zh.nav.recycle, icon: Trash2, end: false },
   { to: "/settings", label: zh.nav.settings, icon: Settings, end: false },
 ];

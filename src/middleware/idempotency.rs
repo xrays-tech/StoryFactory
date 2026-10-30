@@ -29,6 +29,12 @@ fn scope_for(method: &Method, path: &str) -> Option<(&'static str, bool)> {
     if path == "/api/v1/import" {
         return Some(("import", false));
     }
+    if path == "/api/v1/novel-imports" {
+        return Some(("novel_import", false));
+    }
+    if path.starts_with("/api/v1/novel-imports/") && path.ends_with("/project") {
+        return Some(("novel_import_project", true));
+    }
     None
 }
 

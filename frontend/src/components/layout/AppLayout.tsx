@@ -9,6 +9,7 @@ import { ToastViewport } from "../common/Toast";
 import { zh } from "../../copy/zh";
 
 function pageTitle(pathname: string): string {
+  if (pathname.startsWith("/novels/new")) return zh.nav.importNovel;
   if (pathname.startsWith("/settings")) return zh.nav.settings;
   if (pathname.startsWith("/recycle")) return zh.nav.recycle;
   if (pathname.startsWith("/sandbox")) return "沙盒控制台";

@@ -5,6 +5,11 @@ use story_architect::models::dto::{
     UpdateChapterReq, UpdateCharacterReq, UpdateItemReq, UpdateNovelReq, UpdateVolumeReq,
     VolumeDto,
 };
+use story_architect::models::import::{
+    CreateNovelFromImportReq, NovelImportJob, NovelImportPreview, NovelImportStage,
+    NovelImportStatus, PreviewChapter, PreviewCharacter, PreviewItem, PreviewRelation,
+    PreviewVolume,
+};
 use story_architect::models::sandbox::{
     ActorName, ControlReq, CreateSessionReq, DirectorMode, InputReq, SandboxEventType, ScriptStep,
     ScriptedPlan, SessionSnapshot, SessionStatus,
@@ -44,4 +49,14 @@ fn export_all_bindings() {
     ScriptedPlan::export_all_to(out).expect("ScriptedPlan");
     ScriptStep::export_all_to(out).expect("ScriptStep");
     ActorName::export_all_to(out).expect("ActorName");
+    NovelImportStatus::export_all_to(out).expect("NovelImportStatus");
+    NovelImportStage::export_all_to(out).expect("NovelImportStage");
+    NovelImportJob::export_all_to(out).expect("NovelImportJob");
+    PreviewVolume::export_all_to(out).expect("PreviewVolume");
+    PreviewChapter::export_all_to(out).expect("PreviewChapter");
+    PreviewCharacter::export_all_to(out).expect("PreviewCharacter");
+    PreviewRelation::export_all_to(out).expect("PreviewRelation");
+    PreviewItem::export_all_to(out).expect("PreviewItem");
+    NovelImportPreview::export_all_to(out).expect("NovelImportPreview");
+    CreateNovelFromImportReq::export_all_to(out).expect("CreateNovelFromImportReq");
 }

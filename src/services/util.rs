@@ -1,8 +1,14 @@
 // src/services/util.rs — 服务层共用校验/错误辅助
+use serde_json::json;
 use sqlx::sqlite::SqlitePool;
 
 use crate::error::{AppError, ErrorCode};
 use crate::models::common::validation_details;
+
+/// 生成业务实体 ID（32 位无连字符 hex）。
+pub fn new_id() -> String {
+    uuid::Uuid::new_v4().to_string().replace('-', "")
+}
 
 pub fn db_err(e: sqlx::Error) -> AppError {
     tracing::error!(error = %e, "database error");
@@ -103,4 +109,45 @@ pub async fn next_chapter_index(
     .await
     .map_err(db_err)?;
     Ok(max.unwrap_or(0) + 1)
+}
+
+/// 名称去重：同名（大小写不敏感、软删过滤）时追加「（导入N）」后缀。
+pub async fn import_name(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    table: &str,
+    novel_id: &str,
+    name: &str,
+) -> Result<String, AppError> {
+    let sql = format!(
+        "SELECT 1 FROM {table} WHERE novel_id = ? AND lower(name) = lower(?) AND deleted_at IS NULL"
+    );
+    let existing: Option<i64> = sqlx::query_scalar(&sql)
+        .bind(novel_id)
+        .bind(name)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    if existing.is_none() {
+        return Ok(name.to_string());
+    }
+    for n in 1..=100 {
+        let candidate = if n == 1 {
+            format!("{name}（导入）")
+        } else {
+            format!("{name}（导入{n}）")
+        };
+        let taken: Option<i64> = sqlx::query_scalar(&sql)
+            .bind(novel_id)
+            .bind(&candidate)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(db_err)?;
+        if taken.is_none() {
+            return Ok(candidate);
+        }
+    }
+    Err(AppError::validation(
+        "导入重命名失败",
+        json!([{"field":"name","message":"重命名次数超限"}]),
+    ))
 }

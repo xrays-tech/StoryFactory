@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Feather,
+  FileUp,
   Plus,
   Search,
   Sparkles,
@@ -121,6 +122,14 @@ export function Dashboard() {
           <div className="flex shrink-0 flex-wrap items-center gap-2">
             <Button variant="primary" size="lg" leftIcon={<Plus className="h-4 w-4" />} onClick={openCreate}>
               {zh.dashboard.newNovel}
+            </Button>
+            <Button
+              variant="secondary"
+              size="lg"
+              leftIcon={<FileUp className="h-4 w-4" />}
+              onClick={() => navigate("/novels/new")}
+            >
+              {zh.dashboard.importTxt}
             </Button>
             <Button
               variant="outline"

@@ -3,6 +3,7 @@ import { AppLayout } from "./components/layout/AppLayout";
 import { Dashboard } from "./pages/Dashboard";
 import { NovelDetail } from "./pages/NovelDetail";
 import { NovelOverview, overviewLoader } from "./pages/novel/Overview";
+import { ImportNovel } from "./pages/novel/ImportNovel";
 import { CharactersPage, charactersLoader } from "./pages/novel/Characters";
 import { RelationsPage, relationsLoader } from "./pages/novel/Relations";
 import { OutlinePage, outlineLoader } from "./pages/novel/Outline";
@@ -32,6 +33,7 @@ export const router = createBrowserRouter([
     errorElement: <RouteErrorPage />,
     children: [
       { index: true, element: <Dashboard />, loader: dashboardLoader },
+      { path: "novels/new", element: <ImportNovel /> },
       {
         path: "novel/:novelId",
         element: <NovelDetail />,

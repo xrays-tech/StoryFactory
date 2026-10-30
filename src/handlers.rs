@@ -4,6 +4,7 @@ pub mod config;
 pub mod export_import;
 pub mod health;
 pub mod items;
+pub mod novel_import;
 pub mod novels;
 pub mod outline;
 pub mod recycle;

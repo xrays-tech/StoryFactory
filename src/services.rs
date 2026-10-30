@@ -3,6 +3,7 @@ pub mod character;
 pub mod export;
 pub mod item;
 pub mod novel;
+pub mod novel_import;
 pub mod outline;
 pub mod recycle;
 pub mod sandbox;

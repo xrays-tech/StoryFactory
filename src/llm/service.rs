@@ -17,6 +17,9 @@ pub struct LlmService {
     pub session_id: Option<String>,
 }
 
+/// 结构化输出的默认 max_tokens（沿用 v4.0 行为）。
+pub const DEFAULT_STRUCTURED_MAX_TOKENS: u32 = 1500;
+
 impl LlmService {
     pub fn new(chain: ProviderChain, pool: SqlitePool, session_id: Option<String>) -> Self {
         Self {
@@ -34,7 +37,32 @@ impl LlmService {
         schema: Value,
         max_repairs: u32,
     ) -> Result<(Value, Vec<AttemptRecord>), LlmError> {
+        self.complete_structured_with_tokens(
+            budget,
+            purpose,
+            messages,
+            schema,
+            max_repairs,
+            DEFAULT_STRUCTURED_MAX_TOKENS,
+        )
+        .await
+    }
+
+    /// 结构化输出，可指定单次响应的 `max_tokens`。
+    ///
+    /// 推理模型（DeepSeek-V4.1 等）的 reasoning tokens 与正文共享这一预算，
+    /// 长输任务必须显式放大，否则会以 `finish_reason = length` 截断。
+    pub async fn complete_structured_with_tokens(
+        &self,
+        budget: &Budget,
+        purpose: Purpose,
+        messages: Vec<Message>,
+        schema: Value,
+        max_repairs: u32,
+        max_tokens: u32,
+    ) -> Result<(Value, Vec<AttemptRecord>), LlmError> {
         let mut req = CompletionReq::new(messages, budget.hard_deadline(), purpose);
+        req.max_tokens = max_tokens;
         req.response_format = Some(ResponseFormat::JsonObject);
         req.messages.push(Message::system(format!(
             "输出必须严格满足以下 JSON Schema（只输出 JSON 对象）：\n{}",

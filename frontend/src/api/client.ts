@@ -249,13 +249,13 @@ export async function requestBlob(
 export async function uploadFile<T>(
   path: string,
   file: File,
-  opts: { idempotencyKey?: string; timeoutMs?: number } = {},
+  opts: { idempotencyKey?: string; timeoutMs?: number; headers?: Record<string, string> } = {},
 ): Promise<T> {
   let response: Response;
   try {
     response = await execute("POST", path, {
       body: file,
-      headers: { "Content-Type": file.type || "application/zip" },
+      headers: { "Content-Type": file.type || "application/zip", ...(opts.headers ?? {}) },
       idempotencyKey: opts.idempotencyKey,
       timeoutMs: opts.timeoutMs ?? 180_000,
     });

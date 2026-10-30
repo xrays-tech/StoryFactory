@@ -178,7 +178,7 @@ async fn prompt_seed_is_idempotent() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(count, 5);
+    assert_eq!(count, prompts::TEMPLATES.len() as i64);
     let versions = prompts::snapshot_versions(&pool).await.unwrap();
     assert_eq!(versions["actor_step"], 1);
 }

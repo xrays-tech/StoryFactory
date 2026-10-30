@@ -38,3 +38,15 @@ export type { UpdateNovelReq } from "./generated/UpdateNovelReq";
 export type { UpdateVolumeReq } from "./generated/UpdateVolumeReq";
 export type { UsageSummary } from "./generated/UsageSummary";
 export type { VolumeDto } from "./generated/VolumeDto";
+
+// 小说 txt 逆向分析
+export type { CreateNovelFromImportReq } from "./generated/CreateNovelFromImportReq";
+export type { NovelImportJob } from "./generated/NovelImportJob";
+export type { NovelImportPreview } from "./generated/NovelImportPreview";
+export type { NovelImportStage } from "./generated/NovelImportStage";
+export type { NovelImportStatus } from "./generated/NovelImportStatus";
+export type { PreviewChapter } from "./generated/PreviewChapter";
+export type { PreviewCharacter } from "./generated/PreviewCharacter";
+export type { PreviewItem } from "./generated/PreviewItem";
+export type { PreviewRelation } from "./generated/PreviewRelation";
+export type { PreviewVolume } from "./generated/PreviewVolume";

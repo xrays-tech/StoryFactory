@@ -32,4 +32,5 @@ logs/
 # Test output
 test-results/
 playwright-report/
+.playwright-mcp/
 coverage/

@@ -36,6 +36,11 @@ async fn test_state() -> AppState {
         app_token: String::new(),
         origins: vec!["http://127.0.0.1:8080".to_string()],
         dev_cors: false,
+        imports: std::sync::Arc::new(
+            story_architect::services::novel_import::ImportRegistry::new(
+                story_architect::services::novel_import::IMPORT_SEMAPHORE,
+            ),
+        ),
     }
 }
 

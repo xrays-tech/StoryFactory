@@ -62,6 +62,105 @@ pub fn director_schema() -> Value {
     })
 }
 
+/// 小说分块分析输出（保持精简，便于 JsonObject 模式注入完整 Schema）。
+pub fn novel_chunk_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary", "characters", "items", "relations"],
+        "properties": {
+            "summary": { "type": "string" },
+            "characters": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name", "role_type"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "role_type": { "enum": ["protagonist", "deuteragonist", "antagonist", "support"] },
+                        "appearance": { "type": "string" },
+                        "personality": { "type": "string" },
+                        "hidden_personality": { "type": "string" },
+                        "biography": { "type": "string" },
+                        "current_goal": { "type": "string" },
+                        "speaking_style": { "type": "string" }
+                    }
+                }
+            },
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["name"],
+                    "properties": {
+                        "name": { "type": "string" },
+                        "description": { "type": "string" },
+                        "features": { "type": "string" },
+                        "owner": { "type": "string" },
+                        "importance": { "type": "integer", "minimum": 0, "maximum": 5 }
+                    }
+                }
+            },
+            "relations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["a", "b"],
+                    "properties": {
+                        "a": { "type": "string" },
+                        "b": { "type": "string" },
+                        "conflict_desc": { "type": "string" },
+                        "affinity": { "type": "integer", "minimum": -100, "maximum": 100 },
+                        "trust": { "type": "integer", "minimum": 0, "maximum": 100 }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// 小说整体结构生成输出。
+pub fn novel_structure_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "volumes"],
+        "properties": {
+            "title": { "type": "string" },
+            "world_view": { "type": "string" },
+            "background": { "type": "string" },
+            "summary": { "type": "string" },
+            "volumes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["title", "chapters"],
+                    "properties": {
+                        "title": { "type": "string" },
+                        "summary": { "type": "string" },
+                        "chapters": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "required": ["title", "outline"],
+                                "properties": {
+                                    "title": { "type": "string" },
+                                    "outline": { "type": "string" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// JsonObject 模式的 Schema 摘要（注入 system prompt 末尾，≤800 token 的近似上限）。
 pub fn compact_schema(schema: &Value) -> String {
     let mut text = serde_json::to_string(schema).unwrap_or_else(|_| "{}".to_string());

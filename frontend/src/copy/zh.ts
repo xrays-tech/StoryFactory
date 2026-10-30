@@ -1,10 +1,19 @@
-import type { ChapterStatus, DirectorMode, NovelStatus, RoleType, SessionStatus } from "../types/domain";
+import type {
+  ChapterStatus,
+  DirectorMode,
+  NovelImportStage,
+  NovelImportStatus,
+  NovelStatus,
+  RoleType,
+  SessionStatus,
+} from "../types/domain";
 
 export const zh = {
   appName: "故事建筑师",
   appSubtitle: "长篇小说创作工作台",
   nav: {
     dashboard: "项目",
+    importNovel: "导入小说",
     recycle: "回收站",
     settings: "设置",
     backHome: "返回项目",
@@ -41,6 +50,7 @@ export const zh = {
     subtitle: "管理长篇项目，推演人物关系，让沙盒把灵感走成一条可写的路。",
     searchPlaceholder: "搜索项目标题、世界观或摘要…",
     newNovel: "新建项目",
+    importTxt: "上传 txt 小说",
     recycle: "回收站",
     active: "进行中",
     archived: "已归档",
@@ -49,6 +59,59 @@ export const zh = {
     emptyTitle: "还没有项目",
     emptyHint: "先建立一个世界，再放进人物、卷章与沙盒推演。",
     count: (n: number) => `共 ${n} 个项目`,
+  },
+  importNovel: {
+    eyebrow: "从原文开始",
+    title: "把已有的故事带进来",
+    subtitle: "上传 txt 原文，系统会分段分析，抽出世界观、卷章、人物、羁绊与道具，先看预览再决定生成。",
+    stepUpload: "上传原文",
+    stepAnalyzing: "分析中",
+    stepPreview: "预览生成",
+    dropTitle: "拖入 txt 文件，或点击选择",
+    dropHint: "单个 .txt，不超过 32MB。建议整本或按卷上传。",
+    chooseFile: "选择文件",
+    startAnalyze: "开始分析",
+    uploading: "正在上传…",
+    fileSelected: "已选择",
+    fileInvalid: "文件不符合要求",
+    analyzingTitle: "正在分析原文",
+    analyzingHint: "分析在服务端进行。离开页面会断开进度推送，任务本身仍会继续。",
+    connection: "连接状态",
+    connected: "已连接",
+    connecting: "连接中",
+    reconnecting: "重连中",
+    disconnected: "未连接",
+    chunks: (done: number, total: number) =>
+      total > 0 ? `已分析 ${done}/${total} 段` : "正在准备分段",
+    cancelAnalyze: "取消分析",
+    cancelTitle: "取消本次分析？",
+    cancelConfirm: "分析会立即停止，当前进度不会保留。",
+    cancelDone: "已取消分析",
+    failedTitle: "分析未完成",
+    reupload: "重新上传",
+    retryPreview: "重新读取预览",
+    previewTitle: "分析结果预览",
+    previewHint: "生成前可以修改书名，其余内容由原文分析得出，生成后仍可在项目里编辑。",
+    titleLabel: "项目书名",
+    volumes: "卷章",
+    characters: "人物",
+    relations: "羁绊",
+    items: "道具",
+    volumeFallback: "未命名卷",
+    chapterCount: (n: number) => `${n} 章`,
+    noChapters: "这一卷还没有章节",
+    noCharacters: "没有识别到人物",
+    noRelations: "没有识别到羁绊",
+    noItems: "没有识别到道具",
+    generate: "生成项目",
+    generating: "正在生成…",
+    generated: "项目已生成",
+    importance: "重要度",
+    owner: "持有者",
+    affinity: "亲密度",
+    trust: "信任度",
+    expand: "展开",
+    collapse: "收起",
   },
   novel: {
     overview: "概览",
@@ -311,6 +374,24 @@ export const roleLabel: Record<RoleType, string> = {
 export const novelStatusLabel: Record<NovelStatus, string> = {
   active: "进行中",
   archived: "已归档",
+};
+
+export const importStatusLabel: Record<NovelImportStatus, string> = {
+  queued: "排队中",
+  analyzing: "分析中",
+  ready: "分析完成",
+  failed: "失败",
+  cancelled: "已取消",
+};
+
+export const importStageLabel: Record<NovelImportStage, string> = {
+  parsed: "解析原文",
+  chunking: "切分段落",
+  analyzing_chunks: "逐段分析",
+  merging: "合并结果",
+  structuring: "整理结构",
+  ready: "分析完成",
+  failed: "分析失败",
 };
 
 export const chapterStatusLabel: Record<ChapterStatus, string> = {

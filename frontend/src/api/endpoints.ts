@@ -10,6 +10,9 @@ import type {
   ItemDto,
   MoveReq,
   NovelDto,
+  NovelImportJob,
+  NovelImportPreview,
+  CreateNovelFromImportReq,
   PutRelationsReq,
   RelationDto,
   RestoreReq,
@@ -75,6 +78,11 @@ export const paths = {
   events: (sid: string) => `/sandbox-sessions/${sid}/events`,
   exportNovel: (nid: string) => `/novels/${nid}/export`,
   importPackage: "/import",
+  novelImports: "/novel-imports",
+  novelImport: (id: string) => `/novel-imports/${id}`,
+  novelImportPreview: (id: string) => `/novel-imports/${id}/preview`,
+  novelImportEvents: (id: string) => `/novel-imports/${id}/events`,
+  novelImportProject: (id: string) => `/novel-imports/${id}/project`,
   config: "/config",
   usage: "/usage",
   search: "/search",
@@ -299,6 +307,49 @@ export async function exportNovel(
 
 export async function importPackage(file: File, idempotencyKey = newIdempotencyKey("import")): Promise<ImportReport> {
   return uploadFile<ImportReport>(paths.importPackage, file, { idempotencyKey });
+}
+
+/**
+ * 上传 txt 原文。请求体是文件原始字节，文件名通过 X-Filename 传递。
+ * 非 ASCII 文件名先 percent-encode：fetch 的 Header 值受 ByteString 限制，
+ * 直接放中文会抛 TypeError。
+ */
+export async function createNovelImport(
+  file: File,
+  idempotencyKey = newIdempotencyKey("novel-import"),
+): Promise<Wire<NovelImportJob>> {
+  const headerName = /[^\x20-\x7e]/.test(file.name) ? encodeURIComponent(file.name) : file.name;
+  return uploadFile<Wire<NovelImportJob>>(paths.novelImports, file, {
+    idempotencyKey,
+    timeoutMs: 120_000,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "X-Filename": headerName,
+    },
+  });
+}
+
+export async function getNovelImport(id: string): Promise<Wire<NovelImportJob>> {
+  return request<Wire<NovelImportJob>>("GET", paths.novelImport(id));
+}
+
+export async function getNovelImportPreview(id: string): Promise<Wire<NovelImportPreview>> {
+  return request<Wire<NovelImportPreview>>("GET", paths.novelImportPreview(id));
+}
+
+export async function createNovelFromImport(
+  id: string,
+  body: Wire<CreateNovelFromImportReq>,
+  idempotencyKey = newIdempotencyKey("novel-from-import"),
+): Promise<Wire<NovelDto>> {
+  return request<Wire<NovelDto>>("POST", paths.novelImportProject(id), {
+    body,
+    idempotencyKey,
+  });
+}
+
+export async function cancelNovelImport(id: string): Promise<void> {
+  await request<void>("DELETE", paths.novelImport(id));
 }
 
 export async function getConfig(): Promise<AppConfig> {

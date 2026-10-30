@@ -10,8 +10,8 @@ use crate::assets;
 use crate::error::AppError;
 use crate::handlers::health;
 use crate::handlers::{
-    characters, config as config_handler, export_import, items, novels, outline, recycle, sandbox,
-    search, sse,
+    characters, config as config_handler, export_import, items, novel_import, novels, outline,
+    recycle, sandbox, search, sse,
 };
 use crate::middleware::{body_limit, host_guard, idempotency, request_log};
 use crate::state::AppState;
@@ -138,11 +138,22 @@ pub fn build_router(state: AppState) -> Router {
             idempotency::idempotency,
         ));
 
+    let novel_import_router = novel_import::routes()
+        .with_state(state.clone())
+        .layer(body_limit::import_layer(
+            body_limit::NOVEL_IMPORT_BODY_LIMIT_BYTES,
+        ))
+        .layer(axum_mw::from_fn_with_state(
+            state.clone(),
+            idempotency::idempotency,
+        ));
+
     let api = Router::new()
         .route("/healthz", get(health::healthz))
         .route("/health", get(health::health))
         .nest("/v1", v1)
         .merge(import_router)
+        .merge(novel_import_router)
         .fallback(api_not_found)
         .with_state(state.clone());
 

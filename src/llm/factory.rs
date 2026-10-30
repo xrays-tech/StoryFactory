@@ -41,6 +41,19 @@ fn parse_fallback(spec: &str) -> (String, String) {
 
 /// 无 API Key 时返回空链（会话创建时应报 LlmConfigMissing）。
 pub fn build_chain(cfg: &AppConfig) -> ProviderChain {
+    build_chain_with_attempt_timeout(
+        cfg,
+        Duration::from_secs(cfg.llm.attempt_timeout_seconds.max(1) as u64),
+    )
+}
+
+/// 与 [`build_chain`] 相同，但可覆盖单次尝试的墙钟上限。
+///
+/// 逆向分析这类长输任务在推理模型上单次生成远超 45s，需要更宽的 hop 窗口。
+pub fn build_chain_with_attempt_timeout(
+    cfg: &AppConfig,
+    attempt_timeout: Duration,
+) -> ProviderChain {
     let mut providers: Vec<Arc<dyn LlmProvider>> = Vec::new();
 
     if let Some(key) = cfg.llm.api_key.clone() {
@@ -70,9 +83,5 @@ pub fn build_chain(cfg: &AppConfig) -> ProviderChain {
         )));
     }
 
-    ProviderChain::new(
-        providers,
-        cfg.llm.max_retries,
-        Duration::from_secs(cfg.llm.attempt_timeout_seconds.max(1) as u64),
-    )
+    ProviderChain::new(providers, cfg.llm.max_retries, attempt_timeout)
 }

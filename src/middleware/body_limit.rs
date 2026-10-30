@@ -3,6 +3,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 pub const DEFAULT_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 pub const DEFAULT_IMPORT_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+pub const NOVEL_IMPORT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
 pub fn global_layer(limit_bytes: usize) -> RequestBodyLimitLayer {
     RequestBodyLimitLayer::new(limit_bytes)

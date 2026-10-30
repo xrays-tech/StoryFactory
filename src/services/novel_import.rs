@@ -1,0 +1,1321 @@
+// src/services/novel_import.rs — txt 小说逆向分析任务（分块 → 合并 → 结构 → 落库）
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use dashmap::DashMap;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sqlx::sqlite::SqlitePool;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
+
+use crate::config::AppConfig;
+use crate::db;
+use crate::error::{AppError, ErrorCode};
+use crate::llm::budget::Budget;
+use crate::llm::factory;
+use crate::llm::failover::ProviderChain;
+use crate::llm::prompts;
+use crate::llm::schemas;
+use crate::llm::service::LlmService;
+use crate::llm::{LlmError, Message, Purpose};
+use crate::models::import::{
+    AnalysisData, CreateNovelFromImportReq, NovelImportJob, NovelImportPreview, NovelImportStage,
+    NovelImportStatus, PreviewCharacter, PreviewItem, PreviewRelation, PreviewVolume,
+};
+use crate::services::util::{db_err, import_name, invalid, new_id, not_found};
+use crate::services::{novel, search};
+
+pub const IMPORT_SEMAPHORE: usize = 2;
+pub const MAX_IMPORT_BYTES: usize = 32 * 1024 * 1024;
+pub const MIN_IMPORT_CHARS: usize = 200;
+pub const CHUNK_CHARS: usize = 6000;
+pub const CHUNK_OVERLAP: usize = 200;
+pub const MAX_CHUNKS: usize = 200;
+
+const SUMMARY_ITEM_LIMIT: usize = 300;
+const SUMMARY_JOIN_LIMIT: usize = 12000;
+const SUMMARY_MERGE_GROUP: usize = 20;
+const ANALYSIS_RETRIES: usize = 1;
+
+/// 单次分析调用的输出预算。推理模型的 reasoning tokens 与正文共享预算，
+/// 必须显著高于普通沙盒调用的 1500，否则会以 finish_reason=length 截断。
+const CHUNK_MAX_TOKENS: u32 = 6_000;
+const STRUCTURE_MAX_TOKENS: u32 = 16_000;
+/// 单次 LLM 尝试的墙钟上限；16k tokens 在推理模型上约需 100s+。
+const IMPORT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(180);
+/// 单次结构化调用的整体预算（含 repair 轮）。
+const IMPORT_STEP_TIMEOUT_SECS: u64 = 240;
+const IMPORT_SESSION_TIMEOUT_SECS: u64 = 3_600;
+
+/// 后台任务注册表：取消令牌 + 并发闸（容量 2）。
+pub struct ImportRegistry {
+    handles: DashMap<String, CancellationToken>,
+    sem: Semaphore,
+    chain_override: Option<ProviderChain>,
+}
+
+impl ImportRegistry {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            handles: DashMap::new(),
+            sem: Semaphore::new(max_concurrent.max(1)),
+            chain_override: None,
+        }
+    }
+
+    pub fn with_chain(max_concurrent: usize, chain: ProviderChain) -> Self {
+        let mut registry = Self::new(max_concurrent);
+        registry.chain_override = Some(chain);
+        registry
+    }
+
+    pub fn register(&self, id: &str) -> CancellationToken {
+        let token = CancellationToken::new();
+        self.handles.insert(id.to_string(), token.clone());
+        token
+    }
+
+    /// 返回 false 表示当前进程没有该任务的 runner。
+    pub fn cancel(&self, id: &str) -> bool {
+        match self.handles.get(id) {
+            Some(token) => {
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn remove(&self, id: &str) {
+        self.handles.remove(id);
+    }
+
+    fn build_chain(&self, cfg: &AppConfig) -> ProviderChain {
+        match &self.chain_override {
+            Some(chain) => chain.clone(),
+            None => factory::build_chain_with_attempt_timeout(cfg, IMPORT_ATTEMPT_TIMEOUT),
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct JobRow {
+    id: String,
+    filename: String,
+    size_bytes: i64,
+    status: String,
+    stage: String,
+    progress: i64,
+    chunks_total: i64,
+    chunks_done: i64,
+    message: Option<String>,
+    error: Option<String>,
+    novel_id: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl JobRow {
+    fn into_dto(self) -> NovelImportJob {
+        NovelImportJob {
+            id: self.id,
+            filename: self.filename,
+            size_bytes: self.size_bytes,
+            status: NovelImportStatus::from_db_or_default(&self.status),
+            stage: NovelImportStage::from_db_or_default(&self.stage),
+            progress: self.progress,
+            chunks_total: self.chunks_total,
+            chunks_done: self.chunks_done,
+            message: self.message,
+            error: self.error,
+            novel_id: self.novel_id,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+const JOB_COLS: &str = "id, filename, size_bytes, status, stage, progress, chunks_total, \
+                        chunks_done, message, error, novel_id, created_at, updated_at";
+
+pub async fn load_job(pool: &SqlitePool, id: &str) -> Result<Option<NovelImportJob>, AppError> {
+    let sql = format!("SELECT {JOB_COLS} FROM novel_imports WHERE id = ?");
+    let row = sqlx::query_as::<_, JobRow>(&sql)
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?;
+    Ok(row.map(JobRow::into_dto))
+}
+
+pub async fn get_job(pool: &SqlitePool, id: &str) -> Result<NovelImportJob, AppError> {
+    load_job(pool, id)
+        .await?
+        .ok_or_else(|| not_found(ErrorCode::ImportNotFound, "导入任务不存在"))
+}
+
+/// 创建任务并启动后台 runner（不阻塞请求）。
+pub async fn create_job(
+    pool: &SqlitePool,
+    filename: &str,
+    raw: Vec<u8>,
+    registry: Arc<ImportRegistry>,
+    cfg: AppConfig,
+) -> Result<NovelImportJob, AppError> {
+    let size_bytes = raw.len();
+    if size_bytes > MAX_IMPORT_BYTES {
+        return Err(AppError::too_large());
+    }
+    let text = String::from_utf8(raw)
+        .map_err(|_| invalid(vec![("file", "必须是 UTF-8 文本".to_string())]))?;
+    if text.trim().is_empty() {
+        return Err(invalid(vec![("file", "文件不能为空".to_string())]));
+    }
+    let char_count = text.chars().count();
+    if char_count < MIN_IMPORT_CHARS {
+        return Err(invalid(vec![(
+            "file",
+            format!("文本至少需要 {MIN_IMPORT_CHARS} 个字符"),
+        )]));
+    }
+
+    let filename = filename.trim();
+    let filename = if filename.is_empty() {
+        "novel.txt"
+    } else {
+        filename
+    };
+    let id: String = sqlx::query_scalar(
+        "INSERT INTO novel_imports(filename, size_bytes, raw_text, status, stage, progress) \
+         VALUES(?, ?, ?, 'queued', 'parsed', 0) RETURNING id",
+    )
+    .bind(filename)
+    .bind(size_bytes as i64)
+    .bind(&text)
+    .fetch_one(pool)
+    .await
+    .map_err(db_err)?;
+
+    let job = load_job(pool, &id)
+        .await?
+        .ok_or_else(|| AppError::internal("导入任务创建后读取失败"))?;
+    let token = registry.register(&id);
+    let pool_bg = pool.clone();
+    let registry_bg = registry.clone();
+    let id_bg = id.clone();
+    tokio::spawn(async move {
+        run_job(pool_bg, id_bg, text, registry_bg, cfg, token).await;
+    });
+    Ok(job)
+}
+
+pub async fn cancel_job(
+    pool: &SqlitePool,
+    id: &str,
+    registry: &ImportRegistry,
+) -> Result<(), AppError> {
+    let job = get_job(pool, id).await?;
+    if job.status.is_terminal() {
+        return Err(AppError::new(
+            ErrorCode::ImportConflict,
+            "任务已结束，无法取消",
+        ));
+    }
+    if registry.cancel(id) {
+        return Ok(());
+    }
+    // 没有活跃 runner（例如崩溃恢复窗口）：直接落终态，避免任务永久挂起。
+    sqlx::query(
+        "UPDATE novel_imports SET status = 'cancelled', stage = 'failed', message = '用户已取消', \
+         updated_at = strftime('%s','now') WHERE id = ? AND status IN ('queued','analyzing')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(())
+}
+
+pub async fn get_preview(pool: &SqlitePool, id: &str) -> Result<NovelImportPreview, AppError> {
+    let job = get_job(pool, id).await?;
+    if job.status != NovelImportStatus::Ready {
+        return Err(AppError::new(
+            ErrorCode::ImportNotReady,
+            "分析尚未完成，请稍后再试",
+        ));
+    }
+    let raw: Option<String> =
+        sqlx::query_scalar("SELECT analysis_json FROM novel_imports WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?
+            .flatten();
+    let raw = raw.ok_or_else(|| AppError::internal("分析结果缺失"))?;
+    let data: AnalysisData = serde_json::from_str(&raw)
+        .map_err(|e| AppError::internal(format!("分析结果解析失败: {e}")))?;
+    Ok(NovelImportPreview {
+        job_id: job.id,
+        title: data.title,
+        world_view: data.world_view,
+        background: data.background,
+        summary: data.summary,
+        volumes: data.volumes,
+        characters: data.characters,
+        relations: data.relations,
+        items: data.items,
+    })
+}
+
+// ============================================================
+// 后台 runner
+// ============================================================
+
+enum RunError {
+    Cancelled,
+    Failed(String),
+}
+
+fn db_failure(err: sqlx::Error) -> RunError {
+    RunError::Failed(db_err(err).message)
+}
+
+fn ensure_active(token: &CancellationToken) -> Result<(), RunError> {
+    if token.is_cancelled() {
+        Err(RunError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+async fn run_job(
+    pool: SqlitePool,
+    id: String,
+    text: String,
+    registry: Arc<ImportRegistry>,
+    cfg: AppConfig,
+    token: CancellationToken,
+) {
+    let outcome = run_job_inner(&pool, &id, &text, &registry, &cfg, &token).await;
+    registry.remove(&id);
+    let result = match outcome {
+        Ok(()) => return,
+        Err(RunError::Cancelled) => mark_cancelled(&pool, &id).await,
+        Err(RunError::Failed(message)) => {
+            if token.is_cancelled() {
+                mark_cancelled(&pool, &id).await
+            } else {
+                mark_failed(&pool, &id, &message).await
+            }
+        }
+    };
+    if let Err(e) = result {
+        tracing::warn!(import_id = %id, error = %e, "novel import terminal status write failed");
+    }
+}
+
+async fn mark_cancelled(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE novel_imports SET status = 'cancelled', stage = 'failed', message = '用户已取消', \
+         updated_at = strftime('%s','now') WHERE id = ? AND status IN ('queued','analyzing')",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+async fn mark_failed(pool: &SqlitePool, id: &str, message: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE novel_imports SET status = 'failed', stage = 'failed', error = ?, \
+         updated_at = strftime('%s','now') WHERE id = ? AND status = 'analyzing'",
+    )
+    .bind(message)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+async fn run_job_inner(
+    pool: &SqlitePool,
+    id: &str,
+    text: &str,
+    registry: &ImportRegistry,
+    cfg: &AppConfig,
+    token: &CancellationToken,
+) -> Result<(), RunError> {
+    let permit = tokio::select! {
+        permit = registry.sem.acquire() => permit.map_err(|_| RunError::Failed("分析并发闸已关闭".to_string()))?,
+        _ = token.cancelled() => return Err(RunError::Cancelled),
+    };
+    let _permit = permit;
+
+    let affected = sqlx::query(
+        "UPDATE novel_imports SET status = 'analyzing', stage = 'chunking', progress = 5, \
+         error = NULL, updated_at = strftime('%s','now') WHERE id = ? AND status = 'queued'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(db_failure)?
+    .rows_affected();
+    if affected == 0 {
+        // 已被其它路径取消/接管：不触碰任务状态。
+        return Ok(());
+    }
+
+    ensure_active(token)?;
+    let chain = registry.build_chain(cfg);
+    if chain.is_empty() {
+        return Err(RunError::Failed(
+            "未配置 LLM API Key，无法分析小说".to_string(),
+        ));
+    }
+    let llm = LlmService::new(chain, pool.clone(), None);
+
+    analyze(pool, id, text, &llm, token).await
+}
+
+async fn analyze(
+    pool: &SqlitePool,
+    id: &str,
+    text: &str,
+    llm: &LlmService,
+    token: &CancellationToken,
+) -> Result<(), RunError> {
+    let (chunks, truncated) = split_into_chunks(text);
+    if chunks.is_empty() {
+        return Err(RunError::Failed("文本无法分块".to_string()));
+    }
+    let total = chunks.len() as i64;
+    let mut note = if truncated {
+        Some(format!("文本过长，仅分析前 {MAX_CHUNKS} 个分块"))
+    } else {
+        None
+    };
+
+    sqlx::query(
+        "UPDATE novel_imports SET chunks_total = ?, stage = 'analyzing_chunks', progress = 10, \
+         message = ?, updated_at = strftime('%s','now') WHERE id = ? AND status = 'analyzing'",
+    )
+    .bind(total)
+    .bind(&note)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(db_failure)?;
+
+    let mut chunk_characters: Vec<PreviewCharacter> = Vec::new();
+    let mut chunk_items: Vec<PreviewItem> = Vec::new();
+    let mut chunk_relations: Vec<PreviewRelation> = Vec::new();
+    let mut summaries: Vec<String> = Vec::new();
+
+    for (index, chunk) in chunks.iter().enumerate() {
+        ensure_active(token)?;
+        let system = prompts::render(
+            prompts::NOVEL_ANALYZE_CHUNK,
+            &json!({ "chunk_index": index + 1, "chunk_total": total }),
+        )
+        .map_err(|e| RunError::Failed(e.message))?;
+        let messages = vec![Message::system(system), Message::user(chunk.clone())];
+        let value = structured_with_retry(
+            llm,
+            Purpose::Analyze,
+            messages,
+            schemas::novel_chunk_schema(),
+            CHUNK_MAX_TOKENS,
+            token,
+        )
+        .await?;
+        let parsed: ChunkOutput = serde_json::from_value(value)
+            .map_err(|e| RunError::Failed(format!("分块结果解析失败: {e}")))?;
+        chunk_characters.extend(parsed.characters);
+        chunk_items.extend(parsed.items);
+        chunk_relations.extend(parsed.relations);
+        summaries.push(parsed.summary);
+
+        let done = (index + 1) as i64;
+        // 进度始终为 0..100 的整数百分比（10% 起步，分块阶段最多到 80%）。
+        let progress = (10 + (70 * done) / total).clamp(0, 100);
+        sqlx::query(
+            "UPDATE novel_imports SET chunks_done = ?, progress = ?, \
+             updated_at = strftime('%s','now') WHERE id = ? AND status = 'analyzing'",
+        )
+        .bind(done)
+        .bind(progress)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(db_failure)?;
+    }
+
+    ensure_active(token)?;
+    sqlx::query(
+        "UPDATE novel_imports SET stage = 'merging', progress = 85, updated_at = strftime('%s','now') \
+         WHERE id = ? AND status = 'analyzing'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(db_failure)?;
+
+    let characters = merge_characters(chunk_characters);
+    let items = merge_items(chunk_items);
+    let relations = merge_relations(chunk_relations);
+
+    ensure_active(token)?;
+    sqlx::query(
+        "UPDATE novel_imports SET stage = 'structuring', progress = 90, \
+         updated_at = strftime('%s','now') WHERE id = ? AND status = 'analyzing'",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(db_failure)?;
+
+    let structure_summaries = prepare_summaries(&summaries);
+    let numbered = numbered_summaries(&structure_summaries);
+    let system = prompts::render(
+        prompts::NOVEL_ANALYZE_STRUCTURE,
+        &json!({ "summaries": numbered, "chunk_count": summaries.len() }),
+    )
+    .map_err(|e| RunError::Failed(e.message))?;
+    let value = structured_with_retry(
+        llm,
+        Purpose::Structure,
+        vec![Message::system(system)],
+        schemas::novel_structure_schema(),
+        STRUCTURE_MAX_TOKENS,
+        token,
+    )
+    .await?;
+    let structure: StructureOutput = serde_json::from_value(value)
+        .map_err(|e| RunError::Failed(format!("结构结果解析失败: {e}")))?;
+
+    ensure_active(token)?;
+    let data = AnalysisData {
+        title: fallback_title(&structure.title, id, pool).await?,
+        world_view: structure.world_view,
+        background: structure.background,
+        summary: structure.summary,
+        volumes: structure.volumes,
+        characters,
+        relations,
+        items,
+    };
+    let analysis_json = serde_json::to_string(&data)
+        .map_err(|e| RunError::Failed(format!("分析结果序列化失败: {e}")))?;
+
+    if note.is_none() {
+        note = truncation_note(&data);
+    }
+    sqlx::query(
+        "UPDATE novel_imports SET status = 'ready', stage = 'ready', progress = 100, \
+         chunks_done = chunks_total, analysis_json = ?, message = COALESCE(?, message), \
+         error = NULL, updated_at = strftime('%s','now') WHERE id = ? AND status = 'analyzing'",
+    )
+    .bind(&analysis_json)
+    .bind(&note)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(db_failure)?;
+    Ok(())
+}
+
+async fn fallback_title(
+    generated: &str,
+    job_id: &str,
+    pool: &SqlitePool,
+) -> Result<String, RunError> {
+    let title = generated.trim();
+    if !title.is_empty() {
+        return Ok(title.to_string());
+    }
+    let filename: Option<String> =
+        sqlx::query_scalar("SELECT filename FROM novel_imports WHERE id = ?")
+            .bind(job_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_failure)?;
+    Ok(filename
+        .as_deref()
+        .map(file_stem)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "未命名项目".to_string()))
+}
+
+fn truncation_note(data: &AnalysisData) -> Option<String> {
+    let too_long = data.title.chars().count() > 200
+        || data
+            .summary
+            .as_deref()
+            .is_some_and(|v| v.chars().count() > 20000);
+    if too_long {
+        Some("部分字段超长，创建项目时将自动截断".to_string())
+    } else {
+        None
+    }
+}
+
+async fn structured_with_retry(
+    llm: &LlmService,
+    purpose: Purpose,
+    messages: Vec<Message>,
+    schema: Value,
+    max_tokens: u32,
+    token: &CancellationToken,
+) -> Result<Value, RunError> {
+    let mut last_error: Option<LlmError> = None;
+    for attempt in 0..=ANALYSIS_RETRIES {
+        ensure_active(token)?;
+        let budget = Budget::new(
+            IMPORT_SESSION_TIMEOUT_SECS,
+            IMPORT_STEP_TIMEOUT_SECS,
+            IMPORT_ATTEMPT_TIMEOUT.as_secs(),
+        );
+        match llm
+            .complete_structured_with_tokens(
+                &budget,
+                purpose,
+                messages.clone(),
+                schema.clone(),
+                2,
+                max_tokens,
+            )
+            .await
+        {
+            Ok((value, _)) => return Ok(value),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < ANALYSIS_RETRIES {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                        _ = token.cancelled() => return Err(RunError::Cancelled),
+                    }
+                }
+            }
+        }
+    }
+    let error = last_error
+        .map(|e| e.message)
+        .unwrap_or_else(|| "LLM 调用失败".to_string());
+    Err(RunError::Failed(format!("LLM 分析失败: {error}")))
+}
+
+#[derive(Deserialize)]
+struct ChunkOutput {
+    summary: String,
+    #[serde(default)]
+    characters: Vec<PreviewCharacter>,
+    #[serde(default)]
+    items: Vec<PreviewItem>,
+    #[serde(default)]
+    relations: Vec<PreviewRelation>,
+}
+
+#[derive(Deserialize)]
+struct StructureOutput {
+    title: String,
+    #[serde(default)]
+    world_view: Option<String>,
+    #[serde(default)]
+    background: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    volumes: Vec<PreviewVolume>,
+}
+
+// ============================================================
+// 分块（章节标题优先，再按 6000 字符上限 + 200 字符重叠）
+// ============================================================
+
+fn is_chapter_numeral(c: char) -> bool {
+    c.is_ascii_digit()
+        || matches!(
+            c,
+            '零' | '一'
+                | '二'
+                | '三'
+                | '四'
+                | '五'
+                | '六'
+                | '七'
+                | '八'
+                | '九'
+                | '十'
+                | '百'
+                | '千'
+        )
+}
+
+pub fn is_chapter_heading(line: &str) -> bool {
+    let trimmed = line.trim();
+    if let Some(rest) = trimmed.strip_prefix('第') {
+        let mut numerals = 0usize;
+        let mut chars = rest.chars().peekable();
+        while let Some(&c) = chars.peek() {
+            if !is_chapter_numeral(c) || numerals >= 8 {
+                break;
+            }
+            chars.next();
+            numerals += 1;
+        }
+        if numerals == 0 {
+            return false;
+        }
+        return matches!(chars.next(), Some('章' | '回' | '节' | '卷'));
+    }
+    let lowered = trimmed.to_lowercase();
+    if let Some(rest) = lowered.strip_prefix("chapter") {
+        let digits = rest
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        return (1..=8).contains(&digits);
+    }
+    false
+}
+
+fn chapter_segments(text: &str) -> Vec<String> {
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for line in text.split_inclusive('\n') {
+        if is_chapter_heading(line) && !current.trim().is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    if segments.is_empty() && !text.trim().is_empty() {
+        segments.push(text.to_string());
+    }
+    segments
+}
+
+fn char_boundary_after(text: &str, start: usize, count: usize) -> usize {
+    let mut boundary = text.len();
+    for (taken, (index, c)) in text[start..].char_indices().enumerate() {
+        if taken + 1 == count {
+            boundary = start + index + c.len_utf8();
+            break;
+        }
+    }
+    boundary
+}
+
+fn backtrack_chars(text: &str, start: usize, end: usize, overlap: usize) -> usize {
+    if overlap == 0 {
+        return end;
+    }
+    text[start..end]
+        .char_indices()
+        .rev()
+        .nth(overlap - 1)
+        .map(|(index, _)| start + index)
+        .unwrap_or(start)
+}
+
+fn chunk_segment(segment: &str, limit: usize) -> (Vec<String>, bool) {
+    let mut chunks = Vec::new();
+    if limit == 0 {
+        return (chunks, !segment.is_empty());
+    }
+    let mut start = 0usize;
+    loop {
+        if start >= segment.len() {
+            break;
+        }
+        let has_more = segment[start..].chars().nth(CHUNK_CHARS).is_some();
+        let end = if has_more {
+            char_boundary_after(segment, start, CHUNK_CHARS)
+        } else {
+            segment.len()
+        };
+        let more_after = end < segment.len();
+        chunks.push(segment[start..end].to_string());
+        if !more_after {
+            break;
+        }
+        if chunks.len() >= limit {
+            return (chunks, true);
+        }
+        let next = backtrack_chars(segment, start, end, CHUNK_OVERLAP);
+        start = if next <= start { end } else { next };
+    }
+    (chunks, false)
+}
+
+/// 按章节标题切段，再按字符上限切块；返回 (chunks, 是否因 MAX_CHUNKS 截断)。
+pub fn split_into_chunks(text: &str) -> (Vec<String>, bool) {
+    let mut chunks = Vec::new();
+    let mut truncated = false;
+    for segment in chapter_segments(text) {
+        let remaining = MAX_CHUNKS.saturating_sub(chunks.len());
+        if remaining == 0 {
+            truncated = true;
+            break;
+        }
+        let (mut part, cut) = chunk_segment(&segment, remaining);
+        truncated |= cut;
+        chunks.append(&mut part);
+        if truncated {
+            break;
+        }
+    }
+    (chunks, truncated)
+}
+
+// ============================================================
+// 合并（人物/道具/关系）
+// ============================================================
+
+fn filled(value: &Option<String>) -> bool {
+    value.as_deref().is_some_and(|text| !text.trim().is_empty())
+}
+
+fn fill_option(target: &mut Option<String>, source: &Option<String>) {
+    if !filled(target) && filled(source) {
+        *target = source.clone();
+    }
+}
+
+fn role_rank(role: &str) -> u8 {
+    match role {
+        "protagonist" => 3,
+        "deuteragonist" => 2,
+        "antagonist" => 1,
+        _ => 0,
+    }
+}
+
+pub fn merge_characters(input: Vec<PreviewCharacter>) -> Vec<PreviewCharacter> {
+    let mut merged: Vec<PreviewCharacter> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for mut character in input {
+        character.name = character.name.trim().to_string();
+        if character.name.is_empty() {
+            continue;
+        }
+        let key = character.name.to_lowercase();
+        let Some(&position) = index.get(&key) else {
+            index.insert(key, merged.len());
+            merged.push(character);
+            continue;
+        };
+        let existing = &mut merged[position];
+        let incoming_biography = character.biography.as_deref().unwrap_or("").chars().count();
+        let existing_biography = existing.biography.as_deref().unwrap_or("").chars().count();
+        if filled(&character.biography) && incoming_biography > existing_biography {
+            existing.biography = character.biography.clone();
+        }
+        fill_option(&mut existing.appearance, &character.appearance);
+        fill_option(&mut existing.personality, &character.personality);
+        fill_option(
+            &mut existing.hidden_personality,
+            &character.hidden_personality,
+        );
+        fill_option(&mut existing.current_goal, &character.current_goal);
+        fill_option(&mut existing.speaking_style, &character.speaking_style);
+        if role_rank(&character.role_type) > role_rank(&existing.role_type) {
+            existing.role_type = character.role_type;
+        }
+    }
+    merged
+}
+
+pub fn merge_items(input: Vec<PreviewItem>) -> Vec<PreviewItem> {
+    let mut merged: Vec<PreviewItem> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for mut item in input {
+        item.name = item.name.trim().to_string();
+        if item.name.is_empty() {
+            continue;
+        }
+        let key = item.name.to_lowercase();
+        let Some(&position) = index.get(&key) else {
+            index.insert(key, merged.len());
+            merged.push(item);
+            continue;
+        };
+        let existing = &mut merged[position];
+        fill_option(&mut existing.description, &item.description);
+        fill_option(&mut existing.features, &item.features);
+        fill_option(&mut existing.owner, &item.owner);
+        existing.importance = existing.importance.max(item.importance);
+    }
+    merged
+}
+
+pub fn merge_relations(input: Vec<PreviewRelation>) -> Vec<PreviewRelation> {
+    let mut merged: Vec<PreviewRelation> = Vec::new();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    for mut relation in input {
+        let a = relation.a.trim().to_string();
+        let b = relation.b.trim().to_string();
+        if a.is_empty() || b.is_empty() || a.to_lowercase() == b.to_lowercase() {
+            continue;
+        }
+        relation.a = a;
+        relation.b = b;
+        let mut key = (relation.a.to_lowercase(), relation.b.to_lowercase());
+        if key.0 > key.1 {
+            key = (key.1, key.0);
+        }
+        let Some(&position) = index.get(&key) else {
+            index.insert(key, merged.len());
+            merged.push(relation);
+            continue;
+        };
+        let existing = &mut merged[position];
+        let first_conflict = if filled(&existing.conflict_desc) {
+            existing.conflict_desc.clone()
+        } else {
+            relation.conflict_desc.clone()
+        };
+        if relation.affinity.abs() > existing.affinity.abs() {
+            let mut replacement = relation;
+            replacement.conflict_desc = first_conflict;
+            *existing = replacement;
+        } else if !filled(&existing.conflict_desc) {
+            existing.conflict_desc = relation.conflict_desc;
+        }
+    }
+    merged
+}
+
+// ============================================================
+// 摘要归并
+// ============================================================
+
+fn clip_text(raw: &str, max: usize) -> String {
+    if raw.chars().count() <= max {
+        return raw.to_string();
+    }
+    raw.chars().take(max).collect()
+}
+
+fn joined_summary_len(items: &[String]) -> usize {
+    items.iter().map(|item| item.chars().count() + 8).sum()
+}
+
+/// 每 20 条摘要合并为 1 条（截断至 300 字），递归直到拼接长度 ≤ 12000。
+pub fn layer_summaries(input: &[String]) -> Vec<String> {
+    let mut current: Vec<String> = input
+        .iter()
+        .map(|summary| clip_text(summary, SUMMARY_ITEM_LIMIT))
+        .collect();
+    while joined_summary_len(&current) > SUMMARY_JOIN_LIMIT && current.len() > 1 {
+        let next: Vec<String> = current
+            .chunks(SUMMARY_MERGE_GROUP)
+            .map(|group| clip_text(&group.join("；"), SUMMARY_ITEM_LIMIT))
+            .collect();
+        if next.len() >= current.len() {
+            break;
+        }
+        current = next;
+    }
+    current
+}
+
+fn prepare_summaries(input: &[String]) -> Vec<String> {
+    let clipped: Vec<String> = input
+        .iter()
+        .map(|summary| clip_text(summary, SUMMARY_ITEM_LIMIT))
+        .collect();
+    if joined_summary_len(&clipped) > SUMMARY_JOIN_LIMIT {
+        layer_summaries(&clipped)
+    } else {
+        clipped
+    }
+}
+
+fn numbered_summaries(items: &[String]) -> String {
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, summary)| format!("{}. {}", index + 1, summary))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// ============================================================
+// 创建项目（单事务）
+// ============================================================
+
+fn clip_field(value: &str, max: usize) -> (String, bool) {
+    if value.chars().count() <= max {
+        (value.to_string(), false)
+    } else {
+        (value.chars().take(max).collect(), true)
+    }
+}
+
+fn clip_optional(value: &Option<String>, max: usize) -> (Option<String>, bool) {
+    match value {
+        Some(raw) => {
+            let (clipped, truncated) = clip_field(raw, max);
+            (Some(clipped), truncated)
+        }
+        None => (None, false),
+    }
+}
+
+fn file_stem(filename: &str) -> String {
+    Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+pub async fn create_project(
+    pool: &SqlitePool,
+    job_id: &str,
+    req: CreateNovelFromImportReq,
+) -> Result<crate::models::dto::NovelDto, AppError> {
+    let job = get_job(pool, job_id).await?;
+    if job.status != NovelImportStatus::Ready || job.novel_id.is_some() {
+        return Err(AppError::new(
+            ErrorCode::ImportConflict,
+            "任务未就绪或已生成项目",
+        ));
+    }
+
+    let mut tx = db::begin_immediate(pool).await.map_err(db_err)?;
+    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT status, filename, analysis_json, novel_id FROM novel_imports WHERE id = ?",
+    )
+    .bind(job_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let Some((status, filename, analysis_json, novel_id)) = row else {
+        tx.rollback().await.map_err(db_err)?;
+        return Err(not_found(ErrorCode::ImportNotFound, "导入任务不存在"));
+    };
+    if NovelImportStatus::from_db_or_default(&status) != NovelImportStatus::Ready
+        || novel_id.is_some()
+    {
+        tx.rollback().await.map_err(db_err)?;
+        return Err(AppError::new(
+            ErrorCode::ImportConflict,
+            "任务未就绪或已生成项目",
+        ));
+    }
+    let raw = analysis_json.ok_or_else(|| AppError::internal("分析结果缺失"))?;
+    let data: AnalysisData = serde_json::from_str(&raw)
+        .map_err(|e| AppError::internal(format!("分析结果解析失败: {e}")))?;
+
+    let mut truncated: Vec<&'static str> = Vec::new();
+    let (title, was_truncated) = clip_field(
+        req.title.as_deref().unwrap_or(data.title.as_str()).trim(),
+        200,
+    );
+    if was_truncated {
+        truncated.push("title");
+    }
+    let title = if title.trim().is_empty() {
+        let stem = file_stem(&filename);
+        if stem.trim().is_empty() {
+            "未命名项目".to_string()
+        } else {
+            clip_field(&stem, 200).0
+        }
+    } else {
+        title
+    };
+    let (background, t) = clip_optional(&data.background, 20000);
+    if t {
+        truncated.push("background");
+    }
+    let (world_view, t) = clip_optional(&data.world_view, 20000);
+    if t {
+        truncated.push("world_view");
+    }
+    let (summary, t) = clip_optional(&data.summary, 20000);
+    if t {
+        truncated.push("summary");
+    }
+
+    let novel_id = new_id();
+    sqlx::query(
+        "INSERT INTO novels(id, title, background, world_view, summary, status) \
+         VALUES(?, ?, ?, ?, ?, 'active')",
+    )
+    .bind(&novel_id)
+    .bind(&title)
+    .bind(&background)
+    .bind(&world_view)
+    .bind(&summary)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?;
+    let novel_body = [
+        summary.as_deref(),
+        background.as_deref(),
+        world_view.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("\n");
+    search::index_entity(&mut tx, "novel", &novel_id, &novel_id, &title, &novel_body).await?;
+
+    for (volume_index, volume) in data.volumes.iter().enumerate() {
+        let (volume_title, t) = clip_field(&volume.title, 200);
+        if t {
+            truncated.push("volume.title");
+        }
+        let (volume_summary, t) = clip_optional(&volume.summary, 20000);
+        if t {
+            truncated.push("volume.summary");
+        }
+        let volume_id = new_id();
+        sqlx::query(
+            "INSERT INTO volumes(id, novel_id, volume_index, title, summary) VALUES(?, ?, ?, ?, ?)",
+        )
+        .bind(&volume_id)
+        .bind(&novel_id)
+        .bind((volume_index + 1) as i64)
+        .bind(&volume_title)
+        .bind(&volume_summary)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        search::index_entity(
+            &mut tx,
+            "volume",
+            &volume_id,
+            &novel_id,
+            &volume_title,
+            volume_summary.as_deref().unwrap_or(""),
+        )
+        .await?;
+
+        for (chapter_index, chapter) in volume.chapters.iter().enumerate() {
+            let (chapter_title, t) = clip_field(&chapter.title, 200);
+            if t {
+                truncated.push("chapter.title");
+            }
+            let (outline, t) = clip_field(&chapter.outline, 200000);
+            if t {
+                truncated.push("chapter.outline");
+            }
+            let chapter_id = new_id();
+            sqlx::query(
+                "INSERT INTO chapters(id, novel_id, volume_id, chapter_index, title, final_outline, status) \
+                 VALUES(?, ?, ?, ?, ?, ?, 'outlined')",
+            )
+            .bind(&chapter_id)
+            .bind(&novel_id)
+            .bind(&volume_id)
+            .bind((chapter_index + 1) as i64)
+            .bind(&chapter_title)
+            .bind(&outline)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            search::index_entity(
+                &mut tx,
+                "chapter",
+                &chapter_id,
+                &novel_id,
+                &chapter_title,
+                &outline,
+            )
+            .await?;
+        }
+    }
+
+    let mut character_ids: HashMap<String, String> = HashMap::new();
+    for character in &data.characters {
+        let (raw_name, t) = clip_field(character.name.trim(), 50);
+        if t {
+            truncated.push("character.name");
+        }
+        if raw_name.trim().is_empty() {
+            continue;
+        }
+        let name = import_name(&mut tx, "characters", &novel_id, &raw_name).await?;
+        let (appearance, t) = clip_optional(&character.appearance, 20000);
+        if t {
+            truncated.push("character.appearance");
+        }
+        let (personality, t) = clip_optional(&character.personality, 20000);
+        if t {
+            truncated.push("character.personality");
+        }
+        let (hidden_personality, t) = clip_optional(&character.hidden_personality, 20000);
+        if t {
+            truncated.push("character.hidden_personality");
+        }
+        let (biography, t) = clip_optional(&character.biography, 20000);
+        if t {
+            truncated.push("character.biography");
+        }
+        let (current_goal, t) = clip_optional(&character.current_goal, 20000);
+        if t {
+            truncated.push("character.current_goal");
+        }
+        let (speaking_style, t) = clip_optional(&character.speaking_style, 20000);
+        if t {
+            truncated.push("character.speaking_style");
+        }
+        let role = crate::models::enums::RoleType::from_db_or_default(character.role_type.clone());
+        let character_id = new_id();
+        sqlx::query(
+            "INSERT INTO characters(id, novel_id, name, role_type, appearance, personality, \
+             hidden_personality, biography, current_goal, speaking_style) \
+             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&character_id)
+        .bind(&novel_id)
+        .bind(&name)
+        .bind(crate::models::enums::RoleType::to_db(role))
+        .bind(&appearance)
+        .bind(&personality)
+        .bind(&hidden_personality)
+        .bind(&biography)
+        .bind(&current_goal)
+        .bind(&speaking_style)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+        character_ids.insert(raw_name.to_lowercase(), character_id.clone());
+        let body = [
+            personality.as_deref(),
+            biography.as_deref(),
+            current_goal.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n");
+        search::index_entity(&mut tx, "character", &character_id, &novel_id, &name, &body).await?;
+    }
+
+    for relation in &data.relations {
+        let Some(a) = character_ids.get(&relation.a.trim().to_lowercase()) else {
+            continue;
+        };
+        let Some(b) = character_ids.get(&relation.b.trim().to_lowercase()) else {
+            continue;
+        };
+        let (a, b) = if a < b {
+            (a.clone(), b.clone())
+        } else {
+            (b.clone(), a.clone())
+        };
+        if a == b {
+            continue;
+        }
+        let (conflict_desc, t) = clip_optional(&relation.conflict_desc, 20000);
+        if t {
+            truncated.push("relation.conflict_desc");
+        }
+        sqlx::query(
+            "INSERT OR REPLACE INTO character_relations(novel_id, char_a_id, char_b_id, affinity, trust, conflict_desc) \
+             VALUES(?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&novel_id)
+        .bind(&a)
+        .bind(&b)
+        .bind(relation.affinity.clamp(-100, 100))
+        .bind(relation.trust.clamp(0, 100))
+        .bind(&conflict_desc)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    }
+
+    for item in &data.items {
+        let (raw_name, t) = clip_field(item.name.trim(), 100);
+        if t {
+            truncated.push("item.name");
+        }
+        if raw_name.trim().is_empty() {
+            continue;
+        }
+        let name = import_name(&mut tx, "items", &novel_id, &raw_name).await?;
+        let (description, t) = clip_optional(&item.description, 20000);
+        if t {
+            truncated.push("item.description");
+        }
+        let (features, t) = clip_optional(&item.features, 20000);
+        if t {
+            truncated.push("item.features");
+        }
+        let owner_id = item
+            .owner
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_lowercase)
+            .and_then(|owner| character_ids.get(&owner).cloned());
+        let item_id = new_id();
+        sqlx::query(
+            "INSERT INTO items(id, novel_id, name, features, description, owner_id, importance) \
+             VALUES(?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&item_id)
+        .bind(&novel_id)
+        .bind(&name)
+        .bind(&features)
+        .bind(&description)
+        .bind(&owner_id)
+        .bind(item.importance.clamp(0, 5))
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?;
+    }
+
+    truncated.sort_unstable();
+    truncated.dedup();
+    let truncation = if truncated.is_empty() {
+        None
+    } else {
+        Some(format!("部分字段超长已截断: {}", truncated.join(", ")))
+    };
+    let previous_message: Option<String> =
+        sqlx::query_scalar("SELECT message FROM novel_imports WHERE id = ?")
+            .bind(job_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    let message = match (previous_message, truncation) {
+        (Some(previous), Some(next)) if !previous.is_empty() => Some(format!("{previous}；{next}")),
+        (Some(previous), Some(next)) => Some(format!("{previous}{next}")),
+        (Some(previous), None) => Some(previous),
+        (None, Some(next)) => Some(next),
+        (None, None) => None,
+    };
+    let claimed = sqlx::query(
+        "UPDATE novel_imports SET novel_id = ?, message = ?, updated_at = strftime('%s','now') \
+         WHERE id = ? AND novel_id IS NULL",
+    )
+    .bind(&novel_id)
+    .bind(&message)
+    .bind(job_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(db_err)?
+    .rows_affected();
+    if claimed == 0 {
+        tx.rollback().await.map_err(db_err)?;
+        return Err(AppError::new(
+            ErrorCode::ImportConflict,
+            "项目已被创建，请勿重复提交",
+        ));
+    }
+    tx.commit().await.map_err(db_err)?;
+
+    novel::get(pool, &novel_id).await
+}

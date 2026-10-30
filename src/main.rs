@@ -36,6 +36,13 @@ async fn run() -> anyhow::Result<()> {
     if recovered > 0 {
         tracing::warn!(recovered, "sessions marked interrupted after restart");
     }
+    let interrupted_imports = jobs::novel_import_recovery::run_startup(&pool).await?;
+    if interrupted_imports > 0 {
+        tracing::warn!(
+            interrupted_imports,
+            "novel import jobs marked failed after restart"
+        );
+    }
     tracing::info!(db = %db::db_path(&data_dir.display().to_string()), "database ready");
 
     let addr = config::parse_bind(cfg.bind.clone()).map_err(anyhow::Error::msg)?;

@@ -5,6 +5,7 @@ use arc_swap::ArcSwap;
 use sqlx::sqlite::SqlitePool;
 
 use crate::config::{parse_bind, AppConfig};
+use crate::services::novel_import::{ImportRegistry, IMPORT_SEMAPHORE};
 use crate::services::sandbox::SessionManager;
 
 #[derive(Clone)]
@@ -18,6 +19,7 @@ pub struct AppState {
     pub origins: Vec<String>,
     pub dev_cors: bool,
     pub sessions: std::sync::Arc<SessionManager>,
+    pub imports: Arc<ImportRegistry>,
 }
 
 pub fn new_state(config: AppConfig, pool: SqlitePool, token: String) -> Result<AppState, String> {
@@ -38,6 +40,7 @@ pub fn new_state(config: AppConfig, pool: SqlitePool, token: String) -> Result<A
         config_arc.clone(),
         config.sandbox.max_concurrent as usize,
     ));
+    let imports = Arc::new(ImportRegistry::new(IMPORT_SEMAPHORE));
     Ok(AppState {
         config: config_arc,
         pool,
@@ -48,6 +51,7 @@ pub fn new_state(config: AppConfig, pool: SqlitePool, token: String) -> Result<A
         origins,
         dev_cors: config.http.dev_cors,
         sessions,
+        imports,
     })
 }
 

@@ -11,7 +11,7 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 use crate::db;
 use crate::error::{AppError, ErrorCode};
 use crate::services::search;
-use crate::services::util::{db_err, novel_alive};
+use crate::services::util::{db_err, import_name, new_id, novel_alive};
 
 pub const FORMAT_VERSION: u32 = 2;
 
@@ -316,10 +316,6 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn new_id() -> String {
-    uuid::Uuid::new_v4().to_string().replace('-', "")
-}
-
 fn read_zip_entry(
     archive: &mut ZipArchive<Cursor<Vec<u8>>>,
     name: &str,
@@ -355,46 +351,6 @@ fn remap_value(value: &mut Value, map: &std::collections::HashMap<String, String
         }
         _ => {}
     }
-}
-
-async fn import_name(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    table: &str,
-    novel_id: &str,
-    name: &str,
-) -> Result<String, AppError> {
-    let sql = format!(
-        "SELECT 1 FROM {table} WHERE novel_id = ? AND lower(name) = lower(?) AND deleted_at IS NULL"
-    );
-    let free: Option<i64> = sqlx::query_scalar(&sql)
-        .bind(novel_id)
-        .bind(name)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(db_err)?;
-    if free.is_none() {
-        return Ok(name.to_string());
-    }
-    for n in 1..=100 {
-        let candidate = if n == 1 {
-            format!("{name}（导入）")
-        } else {
-            format!("{name}（导入{n}）")
-        };
-        let taken: Option<i64> = sqlx::query_scalar(&sql)
-            .bind(novel_id)
-            .bind(&candidate)
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(db_err)?;
-        if taken.is_none() {
-            return Ok(candidate);
-        }
-    }
-    Err(AppError::validation(
-        "导入重命名失败",
-        json!([{"field":"name","message":"重命名次数超限"}]),
-    ))
 }
 
 pub async fn import_package(pool: &SqlitePool, bytes: &[u8]) -> Result<ImportReport, AppError> {
