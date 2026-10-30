@@ -454,11 +454,13 @@ impl SessionManager {
         handle: SessionHandle,
     ) {
         let pool = self.pool.clone();
+        let fail_pool = self.pool.clone();
         let config = self.config.clone();
         let registry = self.registry.clone();
         let token = handle.token.clone();
         let cancel = handle.cancel.clone();
         let hub = handle.hub.clone();
+        let fail_hub = handle.hub.clone();
         let input_notify = handle.input_notify.clone();
         tokio::spawn(async move {
             let result = engine::run_engine(
@@ -475,6 +477,7 @@ impl SessionManager {
             .await;
             if let Err(e) = result {
                 tracing::warn!(session_id = %session_id, error = %e, "sandbox engine exited with error");
+                mark_engine_failure(&fail_pool, &session_id, &fail_hub, &e).await;
             }
             registry.remove_if(&session_id, |_, h| h.token == token);
         });
@@ -632,6 +635,42 @@ impl SessionManager {
         }
         self.snapshot(session_id).await
     }
+}
+
+async fn mark_engine_failure(
+    pool: &SqlitePool,
+    session_id: &str,
+    hub: &broadcast::Sender<SandboxEvent>,
+    error: &AppError,
+) {
+    let mut tx = match db::begin_immediate(pool).await {
+        Ok(tx) => tx,
+        Err(_) => return,
+    };
+    let affected = sqlx::query(
+        "UPDATE sandbox_sessions SET status = 'failed', error_code = 'ENGINE_ERROR', error_message = ?, finished_at = strftime('%s','now'), updated_at = strftime('%s','now') WHERE id = ? AND status IN ('running','paused','waiting_input','finalizing')",
+    )
+    .bind(error.message.chars().take(500).collect::<String>())
+    .bind(session_id)
+    .execute(&mut *tx)
+    .await
+    .map(|r| r.rows_affected())
+    .unwrap_or(0);
+    if affected > 0 {
+        if let Ok(event) = persist_event(
+            &mut tx,
+            session_id,
+            SandboxEventType::SessionFailed,
+            json!({ "error_code": "ENGINE_ERROR", "message": error.message }),
+        )
+        .await
+        {
+            let _ = tx.commit().await;
+            let _ = hub.send(event);
+            return;
+        }
+    }
+    let _ = tx.rollback().await;
 }
 
 pub async fn load_row(pool: &SqlitePool, session_id: &str) -> Result<SessionRow, AppError> {

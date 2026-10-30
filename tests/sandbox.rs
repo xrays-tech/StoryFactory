@@ -536,3 +536,67 @@ async fn scripted_plan_exhaustion_finalizes() {
     .unwrap();
     assert_eq!(cause, "scripted_done");
 }
+
+#[tokio::test]
+async fn negative_emotion_delta_on_new_pair_is_clamped() {
+    let state = test_state_with_chain(Some(mock_chain(vec![
+        json!({
+            "actor_action": { "type": "dialogue", "content": "试探" },
+            "emotion_delta": { "target_actor_id": "TARGET", "affinity_delta": -5, "trust_delta": -10 }
+        }).to_string(),
+        outline_text(),
+    ])))
+    .await;
+    let app = test_app(state.clone());
+    let nid = create_novel(&app, "情感夹紧测试").await;
+    let a = create_character(&app, &nid, "角色A").await;
+    let b = create_character(&app, &nid, "角色B").await;
+    let vid = create_volume(&app, &nid, "卷一").await;
+    let cid = create_chapter(&app, &nid, &vid, "第一章").await;
+
+    // 重写 mock 响应中的目标角色 id
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    provider.push_ok(
+        json!({
+            "actor_action": { "type": "dialogue", "content": "试探" },
+            "emotion_delta": { "target_actor_id": b, "affinity_delta": -5, "trust_delta": -10 }
+        })
+        .to_string(),
+    );
+    provider.push_ok(outline_text());
+    let mut state = state;
+    state.sessions = Arc::new(
+        story_architect::services::sandbox::SessionManager::with_chain(
+            state.pool.clone(),
+            state.config.clone(),
+            4,
+            ProviderChain::new(vec![provider], 0, Duration::from_secs(2)),
+        ),
+    );
+    let req = CreateSessionReq {
+        actor_ids: vec![a.clone(), b.clone()],
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+    let done = wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+    assert_eq!(done.status, SessionStatus::Completed);
+    let (affinity, trust): (i64, i64) = sqlx::query_as(
+        "SELECT affinity, trust FROM character_relations WHERE novel_id = ? AND char_a_id = ? AND char_b_id = ?",
+    )
+    .bind(&nid)
+    .bind(if a < b { &a } else { &b })
+    .bind(if a < b { &b } else { &a })
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(affinity, -5);
+    assert_eq!(trust, 0, "negative trust must clamp to 0 on insert");
+}

@@ -329,21 +329,35 @@ async fn commit_step(
             } else {
                 (target.clone(), outcome.actor_id.clone())
             };
-            sqlx::query(
-                "INSERT INTO character_relations(novel_id, char_a_id, char_b_id, affinity, trust) VALUES(?, ?, ?, ?, ?)
-                 ON CONFLICT(novel_id, char_a_id, char_b_id) DO UPDATE SET
-                   affinity = MAX(-100, MIN(100, character_relations.affinity + excluded.affinity)),
-                   trust = MAX(0, MIN(100, character_relations.trust + excluded.trust)),
-                   updated_at = strftime('%s','now')",
+            let affected = sqlx::query(
+                "UPDATE character_relations SET
+                   affinity = MAX(-100, MIN(100, affinity + ?)),
+                   trust = MAX(0, MIN(100, trust + ?)),
+                   updated_at = strftime('%s','now')
+                 WHERE novel_id = ? AND char_a_id = ? AND char_b_id = ?",
             )
+            .bind(outcome.affinity_delta)
+            .bind(outcome.trust_delta)
             .bind(&row.novel_id)
             .bind(&a)
             .bind(&b)
-            .bind(outcome.affinity_delta)
-            .bind(outcome.trust_delta)
             .execute(&mut *tx)
             .await
-            .map_err(db_err)?;
+            .map_err(db_err)?
+            .rows_affected();
+            if affected == 0 {
+                sqlx::query(
+                    "INSERT INTO character_relations(novel_id, char_a_id, char_b_id, affinity, trust) VALUES(?, ?, ?, ?, ?)",
+                )
+                .bind(&row.novel_id)
+                .bind(&a)
+                .bind(&b)
+                .bind(outcome.affinity_delta.clamp(-100, 100))
+                .bind(outcome.trust_delta.clamp(0, 100))
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+            }
             persist_event(
                 &mut tx,
                 session_id,
