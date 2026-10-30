@@ -1,0 +1,40 @@
+# StoryArchitect AI v4.0 配置示例（复制为 <data_dir>/config.toml）
+bind = "127.0.0.1:8080"
+data_dir = ""
+fts_min_query_length = 2
+
+[llm]
+provider = "deepseek"
+base_url = "https://api.deepseek.com/v1"
+model = "deepseek-chat"
+fallbacks = []
+connect_timeout_seconds = 5
+attempt_timeout_seconds = 45
+max_retries = 2
+
+[sandbox]
+max_concurrent = 4
+max_steps = 20
+step_timeout_seconds = 90
+session_timeout_seconds = 1800
+history_max_tokens = 6000
+context_hard_cap_tokens = 12000
+rolling_summary_max_tokens = 500
+director_repeat_limit = 3
+waiting_input_timeout_seconds = 300
+
+[http]
+body_limit_bytes = 2097152
+import_body_limit_bytes = 67108864
+sse_heartbeat_seconds = 15
+dev_cors = false
+
+[recycle]
+retention_days = 30
+
+[cost]
+monthly_budget_usd = 0.0
+
+[log]
+level = "info"
+trace_prompt = false

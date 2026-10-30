@@ -1,0 +1,35 @@
+# deepwork local state
+.slim/deepwork/
+
+# Rust
+bindings/
+/target/
+**/*.rs.bk
+
+# Frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# Local runtime data
+dev-data/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.db.bak
+logs/
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Test output
+test-results/
+playwright-report/
+coverage/

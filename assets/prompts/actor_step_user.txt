@@ -1,0 +1,12 @@
+【前情摘要】
+{{ rolling_summary }}
+
+【剧情记录】
+{% for step in recent_history %}
+第{{ step.no }}步 · {{ step.actor_name }}（{{ step.action_type }}）：{{ step.content }}
+{% endfor %}
+
+【本步指示】
+{{ directive }}
+
+现在轮到你了，只输出 JSON。

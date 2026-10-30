@@ -1,0 +1,270 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --paper: 245 240 231;
+  --surface: 250 247 241;
+  --raised: 255 253 249;
+  --ink: 38 34 29;
+  --muted: 108 100 90;
+  --faint: 150 142 130;
+  --line: 219 211 199;
+  --accent: 176 85 53;
+  --accent-strong: 143 62 35;
+  --accent-soft: 244 224 212;
+  --danger: 174 55 55;
+  --danger-soft: 248 226 224;
+  --success: 52 116 88;
+  --success-soft: 222 240 231;
+  --warning: 157 105 20;
+  --warning-soft: 249 237 207;
+  --info: 56 98 138;
+  --info-soft: 225 236 247;
+  --shadow: 58 46 34;
+  --grain: 0.035;
+}
+
+.dark {
+  color-scheme: dark;
+  --paper: 24 22 20;
+  --surface: 31 28 25;
+  --raised: 40 36 31;
+  --ink: 236 229 218;
+  --muted: 175 165 151;
+  --faint: 130 120 108;
+  --line: 62 56 48;
+  --accent: 216 132 100;
+  --accent-strong: 234 158 128;
+  --accent-soft: 71 45 34;
+  --danger: 227 125 125;
+  --danger-soft: 70 38 37;
+  --success: 123 202 166;
+  --success-soft: 31 55 45;
+  --warning: 226 178 91;
+  --warning-soft: 61 49 26;
+  --info: 133 178 223;
+  --info-soft: 31 48 65;
+  --shadow: 0 0 0;
+  --grain: 0.055;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-paper text-ink font-sans;
+    background-image:
+      radial-gradient(1100px 600px at 92% -12%, rgb(var(--accent) / 0.07), transparent 60%),
+      radial-gradient(800px 500px at -8% 20%, rgb(var(--info) / 0.04), transparent 65%);
+    background-attachment: fixed;
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    z-index: 0;
+    opacity: var(--grain);
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.6'/%3E%3C/svg%3E");
+  }
+
+  ::selection {
+    background: rgb(var(--accent) / 0.22);
+  }
+
+  :focus-visible {
+    outline: 2px solid rgb(var(--accent) / 0.7);
+    outline-offset: 2px;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(var(--line)) transparent;
+  }
+
+  *::-webkit-scrollbar {
+    width: 9px;
+    height: 9px;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background: rgb(var(--line));
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer components {
+  .surface-card {
+    @apply rounded-2xl border border-line/80 bg-surface shadow-card;
+  }
+
+  .surface-raised {
+    @apply rounded-xl border border-line/70 bg-raised;
+  }
+
+  .field-label {
+    @apply mb-1.5 block text-xs font-medium tracking-wide text-muted;
+  }
+
+  .input-base {
+    @apply w-full rounded-lg border border-line bg-raised px-3 py-2 text-sm text-ink placeholder:text-faint/80 shadow-sm transition-colors duration-150 hover:border-faint/70 focus:border-accent focus:outline-none focus:ring-2 focus:ring-accent/20 disabled:cursor-not-allowed disabled:opacity-60;
+  }
+
+  .input-invalid {
+    @apply border-danger/70 focus:border-danger focus:ring-danger/20;
+  }
+
+  .hairline {
+    @apply border-line/70;
+  }
+
+  .eyebrow {
+    @apply text-[11px] font-semibold uppercase tracking-[0.18em] text-muted;
+  }
+
+  .skeleton {
+    @apply rounded-lg bg-line/50;
+    background-image: linear-gradient(
+      90deg,
+      rgb(var(--line) / 0.28) 20%,
+      rgb(var(--line) / 0.62) 38%,
+      rgb(var(--line) / 0.28) 56%
+    );
+    background-size: 200% 100%;
+    @apply animate-shimmer;
+  }
+
+  .prose-story {
+    @apply text-sm leading-7 text-ink;
+  }
+
+  .prose-story h1,
+  .prose-story h2,
+  .prose-story h3,
+  .prose-story h4 {
+    @apply mt-6 mb-2 font-display font-semibold tracking-tight text-ink;
+  }
+
+  .prose-story h1 {
+    @apply text-2xl;
+  }
+
+  .prose-story h2 {
+    @apply border-b border-line/70 pb-1 text-xl;
+  }
+
+  .prose-story h3 {
+    @apply text-base text-accent-strong;
+  }
+
+  .prose-story p {
+    @apply my-2.5;
+  }
+
+  .prose-story ul,
+  .prose-story ol {
+    @apply my-3 ml-5 space-y-1;
+  }
+
+  .prose-story ul {
+    @apply list-disc;
+  }
+
+  .prose-story ol {
+    @apply list-decimal;
+  }
+
+  .prose-story blockquote {
+    @apply my-4 border-l-2 border-accent/50 bg-accent-soft/40 py-2 pl-4 text-muted;
+  }
+
+  .prose-story code {
+    @apply rounded bg-line/40 px-1.5 py-0.5 font-mono text-[0.82em];
+  }
+
+  .prose-story pre {
+    @apply my-4 overflow-x-auto rounded-lg border border-line/70 bg-paper p-3 font-mono text-xs;
+  }
+
+  .prose-story a {
+    @apply text-accent-strong underline decoration-accent/40 underline-offset-2 hover:decoration-accent;
+  }
+
+  .prose-story hr {
+    @apply my-6 border-line/70;
+  }
+
+  .prose-story table {
+    @apply my-4 w-full border-collapse text-sm;
+  }
+
+  .prose-story th,
+  .prose-story td {
+    @apply border border-line/70 px-2.5 py-1.5 text-left;
+  }
+
+  .prose-story th {
+    @apply bg-line/20 font-semibold;
+  }
+
+  .scroll-fade-top {
+    mask-image: linear-gradient(to bottom, transparent 0, black 18px);
+  }
+
+  .event-rail {
+    background-image: linear-gradient(
+      to bottom,
+      rgb(var(--line) / 0.2) 0,
+      rgb(var(--line) / 0.2) 100%
+    );
+  }
+
+  .focus-ring {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60 focus-visible:ring-offset-2 focus-visible:ring-offset-paper;
+  }
+
+  .kk-shortcut {
+    @apply rounded border border-line bg-paper px-1.5 py-0.5 font-mono text-[10px] text-muted;
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .text-pretty {
+    text-wrap: pretty;
+  }
+
+  .no-scrollbar {
+    scrollbar-width: none;
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
