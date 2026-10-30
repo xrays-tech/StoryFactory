@@ -10,12 +10,14 @@ use axum::Router;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+use story_architect::jobs::novel_import_cleanup::run_once as cleanup_imports;
 use story_architect::llm::failover::ProviderChain;
 use story_architect::llm::mock::MockProvider;
-use story_architect::llm::StructuredMode;
+use story_architect::llm::{LlmError, LlmErrorKind, StructuredMode};
 use story_architect::models::import::{NovelImportStatus, PreviewCharacter, PreviewRelation};
 use story_architect::services::novel_import::{
-    layer_summaries, merge_characters, merge_relations, split_into_chunks, ImportRegistry,
+    chinese_numeral, layer_summaries, merge_characters, merge_relations, split_half_at_boundary,
+    split_into_batches, split_into_chunks, strip_ordinal_prefix, ImportRegistry,
 };
 use story_architect::state::AppState;
 
@@ -73,6 +75,120 @@ const STRUCTURE: &str = r#"{
   ]
 }"#;
 
+const SUBCHUNK_LEFT: &str = r#"{
+  "summary": "左半摘要",
+  "characters": [
+    {"name":"林默","role_type":"protagonist","biography":"山村少年"},
+    {"name":"苏晚","role_type":"support"}
+  ],
+  "items": [],
+  "relations": [
+    {"a":"林默","b":"苏晚","conflict_desc":"并肩退敌","affinity":40,"trust":60}
+  ]
+}"#;
+
+const SUBCHUNK_RIGHT: &str = r#"{
+  "summary": "右半摘要",
+  "characters": [
+    {"name":"苏晚","role_type":"deuteragonist"},
+    {"name":"顾寒","role_type":"antagonist"}
+  ],
+  "items": [
+    {"name":"断剑","description":"折断的长剑","importance":4}
+  ],
+  "relations": [
+    {"a":"苏晚","b":"顾寒","conflict_desc":"旧日宿敌","affinity":-70,"trust":10}
+  ]
+}"#;
+
+const SURVIVOR_CHUNK: &str = r#"{
+  "summary": "可解析片段",
+  "characters": [
+    {"name":"留存角色","role_type":"support"}
+  ],
+  "items": [],
+  "relations": []
+}"#;
+
+const STRUCTURE_BATCH_A: &str = r#"{
+  "title": "",
+  "world_view": "",
+  "background": "",
+  "summary": "",
+  "volumes": [
+    {"title":"卷甲","summary":"","chapters":[
+      {"title":"章甲一","outline":"甲一剧情推进"},
+      {"title":"章甲二","outline":"甲二剧情推进"}
+    ]}
+  ]
+}"#;
+
+const STRUCTURE_BATCH_B: &str = r#"{
+  "title": "",
+  "volumes": [
+    {"title":"卷乙","summary":"","chapters":[
+      {"title":"章乙一","outline":"乙一剧情推进"}
+    ]}
+  ]
+}"#;
+
+const STRUCTURE_BATCH_C: &str = r#"{
+  "title": "全书标题",
+  "world_view": "武道世界",
+  "background": "少年复仇",
+  "summary": "全书简介",
+  "volumes": [
+    {"title":"卷丙","summary":"","chapters":[
+      {"title":"章丙一","outline":"丙一剧情推进"},
+      {"title":"章丙二","outline":"丙二剧情推进"},
+      {"title":"章丙三","outline":"丙三剧情推进"}
+    ]}
+  ]
+}"#;
+
+const STRUCTURE_RENUMBER_A: &str = r#"{
+  "title": "书名",
+  "volumes": [
+    {"title":"第一卷 甲部","chapters":[
+      {"title":"第一章 开端","outline":"甲部开端"},
+      {"title":"第二章 发展","outline":"甲部发展"}
+    ]},
+    {"title":"第二卷 乙部","chapters":[
+      {"title":"第一章 转折","outline":"乙部转折"},
+      {"title":"第二章 高潮","outline":"乙部高潮"}
+    ]}
+  ]
+}"#;
+
+const STRUCTURE_RENUMBER_B: &str = r#"{
+  "title": "书名",
+  "volumes": [
+    {"title":"第一卷 丙部","chapters":[
+      {"title":"第一章 收束","outline":"丙部收束"}
+    ]},
+    {"title":"第二卷 丁部","chapters":[
+      {"title":"第一章 尾声","outline":"丁部尾声"}
+    ]}
+  ]
+}"#;
+
+fn truncation_error() -> LlmError {
+    LlmError::new(
+        LlmErrorKind::InvalidOutput,
+        "输出在 max_tokens 处被截断，未返回正文内容",
+    )
+}
+
+fn text_with_chapters(count: usize, body_chars: usize) -> String {
+    let mut text = String::new();
+    for index in 1..=count {
+        text.push_str(&format!("第{index}章 测试\n"));
+        text.push_str(&"事".repeat(body_chars));
+        text.push('\n');
+    }
+    text
+}
+
 fn novel_text() -> String {
     let mut text = String::new();
     for (heading, body) in [
@@ -97,16 +213,34 @@ fn novel_text() -> String {
     text
 }
 
+async fn build_mock_state(mock: Arc<MockProvider>) -> (AppState, Router) {
+    let chain = ProviderChain::new(vec![mock], 0, Duration::from_secs(5));
+    let mut state = common::test_state_with_chain(Some(chain.clone())).await;
+    state.imports = Arc::new(ImportRegistry::with_chain(2, chain));
+    let app = common::test_app(state.clone());
+    (state, app)
+}
+
 async fn build_ready_state() -> (AppState, Router, Arc<MockProvider>) {
     let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
     for step in [CHUNK_ONE, CHUNK_TWO, CHUNK_THREE, STRUCTURE] {
         mock.push_ok(step);
     }
-    let chain = ProviderChain::new(vec![mock.clone()], 0, Duration::from_secs(5));
-    let mut state = common::test_state_with_chain(Some(chain.clone())).await;
-    state.imports = Arc::new(ImportRegistry::with_chain(2, chain));
-    let app = common::test_app(state.clone());
+    let (state, app) = build_mock_state(mock.clone()).await;
     (state, app, mock)
+}
+
+async fn insert_import_row(state: &AppState, status: &str, stage: &str, age_secs: i64) -> String {
+    sqlx::query_scalar(
+        "INSERT INTO novel_imports(filename, size_bytes, raw_text, status, stage, progress, updated_at) \
+         VALUES('test.txt', 4, 'test', ?, ?, 10, strftime('%s','now') - ?) RETURNING id",
+    )
+    .bind(status)
+    .bind(stage)
+    .bind(age_secs)
+    .fetch_one(&state.pool)
+    .await
+    .expect("insert import row")
 }
 
 async fn upload(app: &Router, text: &str, filename: &str) -> (StatusCode, Value) {
@@ -278,15 +412,285 @@ async fn novel_import_end_to_end() {
     assert_eq!(status, StatusCode::CONFLICT, "duplicate: {conflict}");
     assert_eq!(conflict["error"]["code"], "import_conflict");
 
-    // 终态任务不可取消。
-    let (status, cancel) = common::call(
+    // 终态任务 DELETE 视为丢弃：删除导入行，但不影响已生成的小说。
+    let (status, body) = common::call(
         &app,
         Method::DELETE,
         &format!("/api/v1/novel-imports/{job_id}"),
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::CONFLICT, "cancel: {cancel}");
+    assert_eq!(status, StatusCode::NO_CONTENT, "delete: {body}");
+    let novel_still_exists: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM novels WHERE id = ?")
+        .bind(&novel_id)
+        .fetch_one(&state.pool)
+        .await
+        .expect("novel count");
+    assert_eq!(novel_still_exists, 1, "删除导入行不能删除小说");
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novel-imports/{job_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "get after delete: {body}");
+}
+
+#[tokio::test]
+async fn delete_terminal_import_removes_row() {
+    let state = common::test_state().await;
+    let app = common::test_app(state.clone());
+    let job_id = insert_import_row(&state, "failed", "failed", 0).await;
+
+    let (status, body) = common::call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/novel-imports/{job_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "delete: {body}");
+
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novel-imports/{job_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "get after delete: {body}");
+    assert_eq!(body["error"]["code"], "import_not_found");
+
+    // 重复 DELETE 仍然幂等。
+    let (status, body) = common::call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/novel-imports/{job_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "repeat delete: {body}");
+}
+
+#[tokio::test]
+async fn delete_active_import_cancels_then_removes() {
+    let state = common::test_state().await;
+    let app = common::test_app(state.clone());
+    let job_id = insert_import_row(&state, "analyzing", "analyzing_chunks", 0).await;
+
+    let (status, body) = common::call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/novel-imports/{job_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "first delete: {body}");
+    let status_in_db: String = sqlx::query_scalar("SELECT status FROM novel_imports WHERE id = ?")
+        .bind(&job_id)
+        .fetch_one(&state.pool)
+        .await
+        .expect("status after cancel");
+    assert_eq!(status_in_db, "cancelled");
+
+    let (status, body) = common::call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/novel-imports/{job_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "second delete: {body}");
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM novel_imports WHERE id = ?")
+        .bind(&job_id)
+        .fetch_one(&state.pool)
+        .await
+        .expect("row count");
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn cleanup_removes_only_old_terminal_jobs() {
+    let state = common::test_state().await;
+    let old_failed = insert_import_row(&state, "failed", "failed", 8 * 86_400).await;
+    let new_failed = insert_import_row(&state, "failed", "failed", 0).await;
+    let old_queued = insert_import_row(&state, "queued", "parsed", 8 * 86_400).await;
+
+    let removed = cleanup_imports(&state.pool, 7).await.expect("cleanup");
+    assert_eq!(removed, 1);
+
+    let remaining: Vec<String> = sqlx::query_scalar("SELECT id FROM novel_imports")
+        .fetch_all(&state.pool)
+        .await
+        .expect("remaining rows");
+    assert!(
+        !remaining.contains(&old_failed),
+        "old failed must be removed"
+    );
+    assert!(remaining.contains(&new_failed), "new failed must remain");
+    assert!(remaining.contains(&old_queued), "old queued must remain");
+}
+
+#[tokio::test]
+async fn chunk_truncation_bisects_and_merges_subchunks() {
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    mock.push_err(truncation_error());
+    mock.push_ok(SUBCHUNK_LEFT);
+    mock.push_ok(SUBCHUNK_RIGHT);
+    mock.push_ok(STRUCTURE);
+    let (state, app) = build_mock_state(mock.clone()).await;
+
+    let (status, created) = upload(&app, &"剧".repeat(2_000), "bisect.txt").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "upload: {created}");
+    let job_id = created["id"].as_str().expect("job id").to_string();
+    let job = wait_terminal(&state, &job_id).await;
+    assert_eq!(job["status"], "ready", "job: {job}");
+    assert_eq!(job["chunks_total"], 1);
+    assert_eq!(job["chunks_done"], 1);
+    assert_eq!(mock.call_count(), 4, "1 次超限 + 2 个子块 + 1 次结构");
+
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novel-imports/{job_id}/preview"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preview: {body}");
+    assert_eq!(body["characters"].as_array().expect("characters").len(), 3);
+    assert_eq!(body["relations"].as_array().expect("relations").len(), 2);
+    assert_eq!(body["items"].as_array().expect("items").len(), 1);
+    assert!(body["characters"]
+        .as_array()
+        .expect("characters")
+        .iter()
+        .any(|c| c["name"] == "顾寒"));
+}
+
+#[tokio::test]
+async fn dense_chunk_is_skipped_without_failing_job() {
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    mock.push_err(truncation_error());
+    mock.push_ok(SURVIVOR_CHUNK);
+    mock.push_ok(STRUCTURE);
+    let (state, app) = build_mock_state(mock.clone()).await;
+
+    let text = text_with_chapters(2, 300);
+    let (status, created) = upload(&app, &text, "dense.txt").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "upload: {created}");
+    let job_id = created["id"].as_str().expect("job id").to_string();
+    let job = wait_terminal(&state, &job_id).await;
+    assert_eq!(job["status"], "ready", "job: {job}");
+    assert_eq!(job["chunks_total"], 2);
+    assert_eq!(job["chunks_done"], 2);
+    let message = job["message"].as_str().unwrap_or("");
+    assert!(message.contains("未能解析"), "message: {message}");
+    assert!(message.contains("1 段"), "message: {message}");
+
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novel-imports/{job_id}/preview"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preview: {body}");
+    let characters = body["characters"].as_array().expect("characters");
+    assert_eq!(characters.len(), 1, "成功分块的结果必须保留: {body}");
+    assert_eq!(characters[0]["name"], "留存角色");
+}
+
+#[tokio::test]
+async fn structure_truncation_splits_batches_and_merges_volumes() {
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..11 {
+        mock.push_ok(SURVIVOR_CHUNK);
+    }
+    mock.push_err(truncation_error());
+    mock.push_ok(STRUCTURE_BATCH_A);
+    mock.push_ok(STRUCTURE_BATCH_B);
+    mock.push_ok(STRUCTURE_BATCH_C);
+    let (state, app) = build_mock_state(mock.clone()).await;
+
+    let text = text_with_chapters(11, 300);
+    let (status, created) = upload(&app, &text, "structure-batches.txt").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "upload: {created}");
+    let job_id = created["id"].as_str().expect("job id").to_string();
+    let job = wait_terminal(&state, &job_id).await;
+    assert_eq!(job["status"], "ready", "job: {job}");
+    assert_eq!(job["chunks_total"], 11);
+    assert_eq!(job["chunks_done"], 11);
+    assert_eq!(mock.call_count(), 15, "11 分块 + 1 超限 + 2 子批 + 1 尾批");
+
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novel-imports/{job_id}/preview"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preview: {body}");
+    assert_eq!(body["title"], "全书标题");
+    let volumes = body["volumes"].as_array().expect("volumes");
+    assert_eq!(volumes.len(), 3, "分批结果必须按顺序拼接: {body}");
+    let chapter_counts: Vec<usize> = volumes
+        .iter()
+        .map(|volume| volume["chapters"].as_array().expect("chapters").len())
+        .collect();
+    assert_eq!(chapter_counts, vec![2, 1, 3]);
+}
+
+#[tokio::test]
+async fn structure_batches_are_renumbered_without_duplicate_ordinals() {
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..11 {
+        mock.push_ok(SURVIVOR_CHUNK);
+    }
+    mock.push_ok(STRUCTURE_RENUMBER_A);
+    mock.push_ok(STRUCTURE_RENUMBER_B);
+    let (state, app) = build_mock_state(mock.clone()).await;
+
+    let text = text_with_chapters(11, 300);
+    let (status, created) = upload(&app, &text, "renumber.txt").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "upload: {created}");
+    let job_id = created["id"].as_str().expect("job id").to_string();
+    let job = wait_terminal(&state, &job_id).await;
+    assert_eq!(job["status"], "ready", "job: {job}");
+
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novel-imports/{job_id}/preview"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preview: {body}");
+    let volumes = body["volumes"].as_array().expect("volumes");
+    assert_eq!(volumes.len(), 4, "两个批次各 2 卷: {body}");
+    let titles: Vec<&str> = volumes
+        .iter()
+        .map(|volume| volume["title"].as_str().expect("volume title"))
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["第一卷 甲部", "第二卷 乙部", "第三卷 丙部", "第四卷 丁部"]
+    );
+    let expected_chapters = [
+        vec!["第一章 开端", "第二章 发展"],
+        vec!["第一章 转折", "第二章 高潮"],
+        vec!["第一章 收束"],
+        vec!["第一章 尾声"],
+    ];
+    for (volume, expected) in volumes.iter().zip(expected_chapters) {
+        let chapters: Vec<&str> = volume["chapters"]
+            .as_array()
+            .expect("chapters")
+            .iter()
+            .map(|chapter| chapter["title"].as_str().expect("chapter title"))
+            .collect();
+        assert_eq!(chapters, expected);
+    }
 }
 
 #[tokio::test]
@@ -380,6 +784,61 @@ fn chunking_respects_max_chunks() {
     let (chunks, truncated) = split_into_chunks(&text);
     assert!(truncated);
     assert_eq!(chunks.len(), 200);
+}
+
+#[test]
+fn split_half_at_boundary_handles_utf8_and_short_inputs() {
+    let (left, right) = split_half_at_boundary("abcdef").expect("ascii split");
+    assert_eq!(left, "abc");
+    assert_eq!(right, "def");
+
+    let (left, right) = split_half_at_boundary("中文测试").expect("chinese split");
+    assert_eq!(left, "中文");
+    assert_eq!(right, "测试");
+
+    let (left, right) = split_half_at_boundary("中文字").expect("odd split");
+    assert_eq!(left.chars().count() + right.chars().count(), 3);
+    assert!(!left.is_empty() && !right.is_empty());
+
+    assert!(split_half_at_boundary("中").is_none());
+    assert!(split_half_at_boundary("").is_none());
+}
+
+#[test]
+fn strip_ordinal_prefix_removes_volume_and_chapter_numbers() {
+    assert_eq!(strip_ordinal_prefix("第一卷 楚家风波"), "楚家风波");
+    assert_eq!(strip_ordinal_prefix("第12章：开局"), "开局");
+    assert_eq!(strip_ordinal_prefix("第 三 回 — 风波"), "风波");
+    assert_eq!(strip_ordinal_prefix("楚家风波"), "楚家风波");
+    assert_eq!(strip_ordinal_prefix("第十卷"), "");
+    assert_eq!(strip_ordinal_prefix("第12卷、余波"), "余波");
+}
+
+#[test]
+fn chinese_numerals_cover_1_to_99() {
+    assert_eq!(chinese_numeral(1), "一");
+    assert_eq!(chinese_numeral(10), "十");
+    assert_eq!(chinese_numeral(11), "十一");
+    assert_eq!(chinese_numeral(20), "二十");
+    assert_eq!(chinese_numeral(21), "二十一");
+    assert_eq!(chinese_numeral(99), "九十九");
+}
+
+#[test]
+fn summaries_split_into_batches_of_ten() {
+    let summaries: Vec<String> = (0..40).map(|index| format!("摘要{index}")).collect();
+    let batches = split_into_batches(&summaries, 10);
+    assert_eq!(batches.len(), 4);
+    assert!(batches.iter().all(|batch| batch.len() == 10));
+    assert_eq!(batches[0][0], "摘要0");
+    assert_eq!(batches[3][9], "摘要39");
+
+    let short: Vec<String> = (0..23).map(|index| format!("s{index}")).collect();
+    let batches = split_into_batches(&short, 10);
+    assert_eq!(
+        batches.iter().map(Vec::len).collect::<Vec<_>>(),
+        vec![10, 10, 3]
+    );
 }
 
 #[test]

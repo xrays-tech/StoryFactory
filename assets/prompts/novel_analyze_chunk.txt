@@ -2,14 +2,22 @@
 
 请阅读当前片段（第 {{ chunk_index }} 段，共 {{ chunk_total }} 段），完成四件事：
 1. summary：用不超过 200 字概括本片段发生了什么。
-2. characters：提取本片段中出现的所有人物。
-3. items：提取本片段中出现的重要物品/道具。
-4. relations：提取本片段中人物之间的关系。
+2. characters：提取本片段中最重要的人物。
+3. items：提取本片段中最重要的物品/道具。
+4. relations：提取本片段中关键人物之间的关系。
 
 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释，不要任何多余文本。
 
 JSON 输出格式示例：
 {"summary":"片段摘要","characters":[{"name":"人物姓名","role_type":"protagonist","appearance":"外貌","personality":"性格","hidden_personality":"隐藏性格","biography":"生平经历","current_goal":"当前目标","speaking_style":"说话风格"}],"items":[{"name":"物品名","description":"描述","features":"特征","owner":"拥有者姓名","importance":3}],"relations":[{"a":"人物甲","b":"人物乙","conflict_desc":"冲突描述","affinity":0,"trust":50}]}
+
+硬性上限（必须遵守，宁可少列，也不要凑数）：
+- summary 不超过 200 字。
+- characters 最多 12 个：按重要性取前 12 个，其余人物直接忽略。
+- items 最多 10 个：只保留对剧情有影响的物品，其余忽略。
+- relations 最多 15 条：只保留关键关系，其余忽略。
+- 每个字段最多 50 字（name 也不超过 50 字）；宁可精简，也不要长篇描述。
+- 不要为了凑数而列出次要人物、无关物品或重复关系。
 
 硬性约束：
 - role_type 只能是 protagonist、deuteragonist、antagonist、support 之一。

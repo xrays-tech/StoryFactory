@@ -1,6 +1,7 @@
 // src/services/novel_import.rs — txt 小说逆向分析任务（分块 → 合并 → 结构 → 落库）
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::sqlite::SqlitePool;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AppConfig;
@@ -20,7 +22,7 @@ use crate::llm::failover::ProviderChain;
 use crate::llm::prompts;
 use crate::llm::schemas;
 use crate::llm::service::LlmService;
-use crate::llm::{LlmError, Message, Purpose};
+use crate::llm::{LlmError, LlmErrorKind, Message, Purpose};
 use crate::models::import::{
     AnalysisData, CreateNovelFromImportReq, NovelImportJob, NovelImportPreview, NovelImportStage,
     NovelImportStatus, PreviewCharacter, PreviewItem, PreviewRelation, PreviewVolume,
@@ -34,17 +36,26 @@ pub const MIN_IMPORT_CHARS: usize = 200;
 pub const CHUNK_CHARS: usize = 6000;
 pub const CHUNK_OVERLAP: usize = 200;
 pub const MAX_CHUNKS: usize = 200;
+/// 分块阶段同时进行的 LLM 调用上限。
+pub const IMPORT_CHUNK_CONCURRENCY: usize = 3;
 
 const SUMMARY_ITEM_LIMIT: usize = 300;
 const SUMMARY_JOIN_LIMIT: usize = 12000;
 const SUMMARY_MERGE_GROUP: usize = 20;
 const ANALYSIS_RETRIES: usize = 1;
 
+/// 截断二分的最小粒度：低于该字符数不再拆分，直接记为跳过。
+const MIN_SUBCHUNK_CHARS: usize = 800;
+/// 截断二分递归深度上限。
+const MAX_SUBCHUNK_DEPTH: usize = 3;
+/// 结构生成每批 summary 数量。
+const STRUCTURE_BATCH_SIZE: usize = 10;
+
 /// 单次分析调用的输出预算。推理模型的 reasoning tokens 与正文共享预算，
 /// 必须显著高于普通沙盒调用的 1500，否则会以 finish_reason=length 截断。
-const CHUNK_MAX_TOKENS: u32 = 6_000;
-const STRUCTURE_MAX_TOKENS: u32 = 16_000;
-/// 单次 LLM 尝试的墙钟上限；16k tokens 在推理模型上约需 100s+。
+const CHUNK_MAX_TOKENS: u32 = 12_000;
+const STRUCTURE_MAX_TOKENS: u32 = 12_000;
+/// 单次 LLM 尝试的墙钟上限；12k tokens 在推理模型上可能需要 100s+。
 const IMPORT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(180);
 /// 单次结构化调用的整体预算（含 repair 轮）。
 const IMPORT_STEP_TIMEOUT_SECS: u64 = 240;
@@ -217,12 +228,21 @@ pub async fn cancel_job(
     id: &str,
     registry: &ImportRegistry,
 ) -> Result<(), AppError> {
-    let job = get_job(pool, id).await?;
+    // 行已不存在时同样视为「已丢弃」，DELETE 保持幂等。
+    let Some(job) = load_job(pool, id).await? else {
+        return Ok(());
+    };
     if job.status.is_terminal() {
-        return Err(AppError::new(
-            ErrorCode::ImportConflict,
-            "任务已结束，无法取消",
-        ));
+        // 终态任务视为「丢弃」：删除导入行（含 raw_text），幂等返回。
+        // novel_id 是导入行指向小说的外键（ON DELETE SET NULL），删除子行不影响小说。
+        sqlx::query(
+            "DELETE FROM novel_imports WHERE id = ? AND status IN ('ready','failed','cancelled')",
+        )
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(db_err)?;
+        return Ok(());
     }
     if registry.cancel(id) {
         return Ok(());
@@ -277,6 +297,8 @@ pub async fn get_preview(pool: &SqlitePool, id: &str) -> Result<NovelImportPrevi
 enum RunError {
     Cancelled,
     Failed(String),
+    /// 保留错误类型，供截断二分判断 InvalidOutput。
+    Llm(LlmError),
 }
 
 fn db_failure(err: sqlx::Error) -> RunError {
@@ -309,6 +331,13 @@ async fn run_job(
                 mark_cancelled(&pool, &id).await
             } else {
                 mark_failed(&pool, &id, &message).await
+            }
+        }
+        Err(RunError::Llm(error)) => {
+            if token.is_cancelled() {
+                mark_cancelled(&pool, &id).await
+            } else {
+                mark_failed(&pool, &id, &format!("LLM 分析失败: {}", error.message)).await
             }
         }
     };
@@ -375,16 +404,16 @@ async fn run_job_inner(
             "未配置 LLM API Key，无法分析小说".to_string(),
         ));
     }
-    let llm = LlmService::new(chain, pool.clone(), None);
+    let llm = Arc::new(LlmService::new(chain, pool.clone(), None));
 
-    analyze(pool, id, text, &llm, token).await
+    analyze(pool, id, text, llm, token).await
 }
 
 async fn analyze(
     pool: &SqlitePool,
     id: &str,
     text: &str,
-    llm: &LlmService,
+    llm: Arc<LlmService>,
     token: &CancellationToken,
 ) -> Result<(), RunError> {
     let (chunks, truncated) = split_into_chunks(text);
@@ -409,48 +438,15 @@ async fn analyze(
     .await
     .map_err(db_failure)?;
 
-    let mut chunk_characters: Vec<PreviewCharacter> = Vec::new();
-    let mut chunk_items: Vec<PreviewItem> = Vec::new();
-    let mut chunk_relations: Vec<PreviewRelation> = Vec::new();
-    let mut summaries: Vec<String> = Vec::new();
+    let outcomes = analyze_chunks(pool, id, llm.clone(), &chunks, total, token).await?;
+    let (chunk_characters, chunk_items, chunk_relations, summaries, skipped_segments) =
+        collect_chunk_outcomes(outcomes);
 
-    for (index, chunk) in chunks.iter().enumerate() {
-        ensure_active(token)?;
-        let system = prompts::render(
-            prompts::NOVEL_ANALYZE_CHUNK,
-            &json!({ "chunk_index": index + 1, "chunk_total": total }),
-        )
-        .map_err(|e| RunError::Failed(e.message))?;
-        let messages = vec![Message::system(system), Message::user(chunk.clone())];
-        let value = structured_with_retry(
-            llm,
-            Purpose::Analyze,
-            messages,
-            schemas::novel_chunk_schema(),
-            CHUNK_MAX_TOKENS,
-            token,
-        )
-        .await?;
-        let parsed: ChunkOutput = serde_json::from_value(value)
-            .map_err(|e| RunError::Failed(format!("分块结果解析失败: {e}")))?;
-        chunk_characters.extend(parsed.characters);
-        chunk_items.extend(parsed.items);
-        chunk_relations.extend(parsed.relations);
-        summaries.push(parsed.summary);
-
-        let done = (index + 1) as i64;
-        // 进度始终为 0..100 的整数百分比（10% 起步，分块阶段最多到 80%）。
-        let progress = (10 + (70 * done) / total).clamp(0, 100);
-        sqlx::query(
-            "UPDATE novel_imports SET chunks_done = ?, progress = ?, \
-             updated_at = strftime('%s','now') WHERE id = ? AND status = 'analyzing'",
-        )
-        .bind(done)
-        .bind(progress)
-        .bind(id)
-        .execute(pool)
-        .await
-        .map_err(db_failure)?;
+    if skipped_segments > 0 {
+        append_note(
+            &mut note,
+            format!("其中 {skipped_segments} 段未能解析（内容过于密集）"),
+        );
     }
 
     ensure_active(token)?;
@@ -477,28 +473,12 @@ async fn analyze(
     .await
     .map_err(db_failure)?;
 
-    let structure_summaries = prepare_summaries(&summaries);
-    let numbered = numbered_summaries(&structure_summaries);
-    let system = prompts::render(
-        prompts::NOVEL_ANALYZE_STRUCTURE,
-        &json!({ "summaries": numbered, "chunk_count": summaries.len() }),
-    )
-    .map_err(|e| RunError::Failed(e.message))?;
-    let value = structured_with_retry(
-        llm,
-        Purpose::Structure,
-        vec![Message::system(system)],
-        schemas::novel_structure_schema(),
-        STRUCTURE_MAX_TOKENS,
-        token,
-    )
-    .await?;
-    let structure: StructureOutput = serde_json::from_value(value)
-        .map_err(|e| RunError::Failed(format!("结构结果解析失败: {e}")))?;
+    let mut structure = generate_structure(llm.as_ref(), &summaries, token).await?;
+    renumber_volumes(&mut structure.volumes);
 
     ensure_active(token)?;
     let data = AnalysisData {
-        title: fallback_title(&structure.title, id, pool).await?,
+        title: structure.title,
         world_view: structure.world_view,
         background: structure.background,
         summary: structure.summary,
@@ -527,26 +507,340 @@ async fn analyze(
     Ok(())
 }
 
-async fn fallback_title(
-    generated: &str,
-    job_id: &str,
-    pool: &SqlitePool,
-) -> Result<String, RunError> {
-    let title = generated.trim();
-    if !title.is_empty() {
-        return Ok(title.to_string());
+fn append_note(note: &mut Option<String>, extra: String) {
+    match note {
+        Some(existing) if !existing.trim().is_empty() => {
+            existing.push('；');
+            existing.push_str(&extra);
+        }
+        _ => *note = Some(extra),
     }
-    let filename: Option<String> =
-        sqlx::query_scalar("SELECT filename FROM novel_imports WHERE id = ?")
-            .bind(job_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(db_failure)?;
-    Ok(filename
-        .as_deref()
-        .map(file_stem)
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| "未命名项目".to_string()))
+}
+
+enum ChunkOutcome {
+    Parsed(ChunkOutput),
+    Skipped,
+}
+
+/// 并发分析所有分块，结果按下标回填；任一分块出现非截断错误时立即中止。
+async fn analyze_chunks(
+    pool: &SqlitePool,
+    id: &str,
+    llm: Arc<LlmService>,
+    chunks: &[String],
+    total: i64,
+    token: &CancellationToken,
+) -> Result<Vec<Option<ChunkOutcome>>, RunError> {
+    let semaphore = Arc::new(Semaphore::new(IMPORT_CHUNK_CONCURRENCY));
+    let completed = Arc::new(AtomicUsize::new(0));
+    let mut outcomes: Vec<Option<ChunkOutcome>> = (0..chunks.len()).map(|_| None).collect();
+    let mut tasks: JoinSet<(usize, Result<ChunkOutcome, RunError>)> = JoinSet::new();
+    let mut next_index = 0usize;
+
+    while next_index < chunks.len() || !tasks.is_empty() {
+        if token.is_cancelled() {
+            tasks.abort_all();
+            while tasks.join_next().await.is_some() {}
+            return Err(RunError::Cancelled);
+        }
+
+        while next_index < chunks.len() {
+            if token.is_cancelled() {
+                break;
+            }
+            let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+                break;
+            };
+            let chunk = chunks[next_index].clone();
+            let index = next_index;
+            let llm = llm.clone();
+            let token = token.clone();
+            tasks.spawn(async move {
+                let _permit = permit;
+                let outcome = analyze_chunk_text(&llm, index, total, &chunk, &token, 0).await;
+                (index, outcome)
+            });
+            next_index += 1;
+        }
+
+        let joined = tokio::select! {
+            _ = token.cancelled() => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Err(RunError::Cancelled);
+            }
+            joined = tasks.join_next() => joined,
+        };
+        let Some(joined) = joined else {
+            break;
+        };
+        let (index, outcome) =
+            joined.map_err(|e| RunError::Failed(format!("分块任务异常终止: {e}")))?;
+
+        match outcome {
+            Ok(outcome) => outcomes[index] = Some(outcome),
+            Err(error) => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Err(error);
+            }
+        }
+
+        // 只有协调任务写库；原子计数保证 chunks_done 单调递增。
+        let done = completed.fetch_add(1, Ordering::SeqCst) + 1;
+        let progress = (10 + (70 * done as i64) / total).clamp(10, 80);
+        sqlx::query(
+            "UPDATE novel_imports SET chunks_done = ?, progress = ?, \
+             updated_at = strftime('%s','now') WHERE id = ? AND status = 'analyzing'",
+        )
+        .bind(done as i64)
+        .bind(progress)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map_err(db_failure)?;
+    }
+
+    Ok(outcomes)
+}
+
+/// 对单个分块做分析；输出被截断时二分递归，最小粒度仍失败则跳过该段。
+async fn analyze_chunk_text(
+    llm: &LlmService,
+    index: usize,
+    total: i64,
+    text: &str,
+    token: &CancellationToken,
+    depth: usize,
+) -> Result<ChunkOutcome, RunError> {
+    match call_chunk(llm, index, total, text, token).await {
+        Ok(output) => Ok(ChunkOutcome::Parsed(output)),
+        Err(RunError::Llm(error)) if error.kind == LlmErrorKind::InvalidOutput => {
+            if depth >= MAX_SUBCHUNK_DEPTH || text.chars().count() <= MIN_SUBCHUNK_CHARS {
+                return Ok(ChunkOutcome::Skipped);
+            }
+            let Some((left, right)) = split_half_at_boundary(text) else {
+                return Ok(ChunkOutcome::Skipped);
+            };
+            let left = Box::pin(analyze_chunk_text(
+                llm,
+                index,
+                total,
+                &left,
+                token,
+                depth + 1,
+            ))
+            .await?;
+            let right = Box::pin(analyze_chunk_text(
+                llm,
+                index,
+                total,
+                &right,
+                token,
+                depth + 1,
+            ))
+            .await?;
+            Ok(merge_chunk_outcomes(left, right))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn call_chunk(
+    llm: &LlmService,
+    index: usize,
+    total: i64,
+    text: &str,
+    token: &CancellationToken,
+) -> Result<ChunkOutput, RunError> {
+    let system = prompts::render(
+        prompts::NOVEL_ANALYZE_CHUNK,
+        &json!({ "chunk_index": index + 1, "chunk_total": total }),
+    )
+    .map_err(|e| RunError::Failed(e.message))?;
+    let messages = vec![Message::system(system), Message::user(text.to_string())];
+    let value = structured_with_retry(
+        llm,
+        Purpose::Analyze,
+        messages,
+        schemas::novel_chunk_schema(),
+        CHUNK_MAX_TOKENS,
+        token,
+    )
+    .await?;
+    serde_json::from_value(value).map_err(|e| RunError::Failed(format!("分块结果解析失败: {e}")))
+}
+
+fn merge_chunk_outcomes(left: ChunkOutcome, right: ChunkOutcome) -> ChunkOutcome {
+    match (left, right) {
+        (ChunkOutcome::Skipped, ChunkOutcome::Skipped) => ChunkOutcome::Skipped,
+        (ChunkOutcome::Skipped, ChunkOutcome::Parsed(output))
+        | (ChunkOutcome::Parsed(output), ChunkOutcome::Skipped) => ChunkOutcome::Parsed(output),
+        (ChunkOutcome::Parsed(left), ChunkOutcome::Parsed(right)) => {
+            ChunkOutcome::Parsed(ChunkOutput {
+                summary: format!("{}\n{}", left.summary, right.summary),
+                characters: left
+                    .characters
+                    .into_iter()
+                    .chain(right.characters)
+                    .collect(),
+                items: left.items.into_iter().chain(right.items).collect(),
+                relations: left.relations.into_iter().chain(right.relations).collect(),
+            })
+        }
+    }
+}
+
+type CollectedChunks = (
+    Vec<PreviewCharacter>,
+    Vec<PreviewItem>,
+    Vec<PreviewRelation>,
+    Vec<String>,
+    usize,
+);
+
+fn collect_chunk_outcomes(outcomes: Vec<Option<ChunkOutcome>>) -> CollectedChunks {
+    let mut characters = Vec::new();
+    let mut items = Vec::new();
+    let mut relations = Vec::new();
+    let mut summaries = Vec::new();
+    let mut skipped = 0usize;
+    for outcome in outcomes.into_iter().flatten() {
+        match outcome {
+            ChunkOutcome::Parsed(output) => {
+                characters.extend(output.characters);
+                items.extend(output.items);
+                relations.extend(output.relations);
+                summaries.push(output.summary);
+            }
+            ChunkOutcome::Skipped => skipped += 1,
+        }
+    }
+    (characters, items, relations, summaries, skipped)
+}
+
+#[derive(Default)]
+struct StructureAccumulator {
+    title: Option<String>,
+    world_view: Option<String>,
+    background: Option<String>,
+    summary: Option<String>,
+    volumes: Vec<PreviewVolume>,
+}
+
+impl StructureAccumulator {
+    fn absorb(&mut self, output: StructureOutput) {
+        let title = non_empty(output.title);
+        fill_option(&mut self.title, &title);
+        fill_option(&mut self.world_view, &output.world_view);
+        fill_option(&mut self.background, &output.background);
+        fill_option(&mut self.summary, &output.summary);
+        self.volumes.extend(output.volumes);
+    }
+
+    /// 中间结果：保留空标题，避免回退值污染后续批次的「首个非空值」。
+    fn into_output(self) -> StructureOutput {
+        StructureOutput {
+            title: self.title.unwrap_or_default(),
+            world_view: self.world_view,
+            background: self.background,
+            summary: self.summary,
+            volumes: self.volumes,
+        }
+    }
+
+    fn finish(self) -> StructureOutput {
+        let StructureOutput {
+            mut title,
+            world_view,
+            background,
+            summary,
+            volumes,
+        } = self.into_output();
+        if title.trim().is_empty() {
+            title = "未命名作品".to_string();
+        }
+        StructureOutput {
+            title,
+            world_view: Some(world_view.unwrap_or_default()),
+            background: Some(background.unwrap_or_default()),
+            summary: Some(summary.unwrap_or_default()),
+            volumes,
+        }
+    }
+}
+
+fn non_empty(value: String) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// 分批生成结构；单批截断时二分该批 summary，最终按批次顺序拼接。
+async fn generate_structure(
+    llm: &LlmService,
+    summaries: &[String],
+    token: &CancellationToken,
+) -> Result<StructureOutput, RunError> {
+    let clipped: Vec<String> = summaries
+        .iter()
+        .map(|summary| clip_text(summary, SUMMARY_ITEM_LIMIT))
+        .collect();
+    let batches = split_into_batches(&clipped, STRUCTURE_BATCH_SIZE);
+    let mut accumulator = StructureAccumulator::default();
+    for batch in batches {
+        let output = structure_batch(llm, &batch, token).await?;
+        accumulator.absorb(output);
+    }
+    Ok(accumulator.finish())
+}
+
+async fn structure_batch(
+    llm: &LlmService,
+    summaries: &[String],
+    token: &CancellationToken,
+) -> Result<StructureOutput, RunError> {
+    ensure_active(token)?;
+    let numbered = numbered_summaries(summaries);
+    let system = prompts::render(
+        prompts::NOVEL_ANALYZE_STRUCTURE,
+        &json!({ "summaries": numbered, "chunk_count": summaries.len() }),
+    )
+    .map_err(|e| RunError::Failed(e.message))?;
+    let value = match structured_with_retry(
+        llm,
+        Purpose::Structure,
+        vec![Message::system(system)],
+        schemas::novel_structure_schema(),
+        STRUCTURE_MAX_TOKENS,
+        token,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(RunError::Llm(error)) if error.kind == LlmErrorKind::InvalidOutput => {
+            return split_structure_batch(llm, summaries, token).await;
+        }
+        Err(error) => return Err(error),
+    };
+    serde_json::from_value(value).map_err(|e| RunError::Failed(format!("结构结果解析失败: {e}")))
+}
+
+/// 截断批次的二分处理；单条 summary 仍失败时返回空结构，避免整单失败。
+async fn split_structure_batch(
+    llm: &LlmService,
+    summaries: &[String],
+    token: &CancellationToken,
+) -> Result<StructureOutput, RunError> {
+    let Some((left, right)) = split_slice_half(summaries) else {
+        return Ok(StructureOutput::default());
+    };
+    let mut accumulator = StructureAccumulator::default();
+    accumulator.absorb(Box::pin(structure_batch(llm, left, token)).await?);
+    accumulator.absorb(Box::pin(structure_batch(llm, right, token)).await?);
+    Ok(accumulator.into_output())
 }
 
 fn truncation_note(data: &AnalysisData) -> Option<String> {
@@ -591,6 +885,11 @@ async fn structured_with_retry(
         {
             Ok((value, _)) => return Ok(value),
             Err(error) => {
+                // 截断/解析类错误对相同输入是确定性的，重试无意义；
+                // 认证/请求错误同样不应重试。只对瞬时错误做有限重试。
+                if !error.retryable() {
+                    return Err(RunError::Llm(error));
+                }
                 last_error = Some(error);
                 if attempt < ANALYSIS_RETRIES {
                     tokio::select! {
@@ -601,10 +900,9 @@ async fn structured_with_retry(
             }
         }
     }
-    let error = last_error
-        .map(|e| e.message)
-        .unwrap_or_else(|| "LLM 调用失败".to_string());
-    Err(RunError::Failed(format!("LLM 分析失败: {error}")))
+    let error =
+        last_error.unwrap_or_else(|| LlmError::new(LlmErrorKind::Network, "Provider 链未返回结果"));
+    Err(RunError::Llm(error))
 }
 
 #[derive(Deserialize)]
@@ -618,7 +916,7 @@ struct ChunkOutput {
     relations: Vec<PreviewRelation>,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct StructureOutput {
     title: String,
     #[serde(default)]
@@ -629,6 +927,163 @@ struct StructureOutput {
     summary: Option<String>,
     #[serde(default)]
     volumes: Vec<PreviewVolume>,
+}
+
+// ============================================================
+// 截断二分 / 分批（纯函数，便于单测）
+// ============================================================
+
+/// 按字符数中点把文本切成两半；保证两侧非空且都短于原串。
+pub fn split_half_at_boundary(text: &str) -> Option<(String, String)> {
+    let char_count = text.chars().count();
+    if char_count < 2 {
+        return None;
+    }
+    let split_at = text
+        .char_indices()
+        .nth(char_count / 2)
+        .map(|(index, _)| index)?;
+    let (left, right) = text.split_at(split_at);
+    if left.is_empty() || right.is_empty() {
+        return None;
+    }
+    Some((left.to_string(), right.to_string()))
+}
+
+/// 按固定大小切批；空输入或非法批次大小返回空列表。
+pub fn split_into_batches<T: Clone>(items: &[T], batch_size: usize) -> Vec<Vec<T>> {
+    if batch_size == 0 {
+        return Vec::new();
+    }
+    items.chunks(batch_size).map(<[T]>::to_vec).collect()
+}
+
+fn split_slice_half<T>(items: &[T]) -> Option<(&[T], &[T])> {
+    if items.len() < 2 {
+        return None;
+    }
+    Some(items.split_at(items.len() / 2))
+}
+
+fn is_ordinal_numeral(c: char) -> bool {
+    c.is_ascii_digit()
+        || matches!(
+            c,
+            '一' | '二'
+                | '三'
+                | '四'
+                | '五'
+                | '六'
+                | '七'
+                | '八'
+                | '九'
+                | '十'
+                | '百'
+                | '零'
+                | '〇'
+                | '两'
+        )
+}
+
+/// 去掉标题开头的「第X卷/章/回/节」序号及其后的空白与分隔符。
+pub fn strip_ordinal_prefix(title: &str) -> &str {
+    let trimmed = title.trim_start();
+    let Some(rest) = trimmed.strip_prefix('第') else {
+        return title;
+    };
+
+    let mut cursor = skip_whitespace(rest, 0);
+    let numeral_start = cursor;
+    cursor = skip_while(rest, cursor, is_ordinal_numeral);
+    if cursor == numeral_start {
+        return title;
+    }
+    cursor = skip_whitespace(rest, cursor);
+
+    let Some(suffix) = rest[cursor..].chars().next() else {
+        return title;
+    };
+    if !matches!(suffix, '卷' | '章' | '回' | '节') {
+        return title;
+    }
+    cursor += suffix.len_utf8();
+
+    while let Some(c) = rest[cursor..].chars().next() {
+        if !c.is_whitespace() && !matches!(c, '、' | '：' | ':' | '·' | '-' | '—') {
+            break;
+        }
+        cursor += c.len_utf8();
+    }
+    &rest[cursor..]
+}
+
+fn skip_whitespace(text: &str, mut cursor: usize) -> usize {
+    while let Some(c) = text[cursor..].chars().next() {
+        if !c.is_whitespace() {
+            break;
+        }
+        cursor += c.len_utf8();
+    }
+    cursor
+}
+
+fn skip_while(text: &str, mut cursor: usize, predicate: fn(char) -> bool) -> usize {
+    while let Some(c) = text[cursor..].chars().next() {
+        if !predicate(c) {
+            break;
+        }
+        cursor += c.len_utf8();
+    }
+    cursor
+}
+
+/// 1..=99 的中文数字；超出范围时回退为阿拉伯数字，避免 panic。
+pub fn chinese_numeral(n: usize) -> String {
+    const DIGITS: [&str; 10] = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九"];
+    if n == 0 {
+        return DIGITS[0].to_string();
+    }
+    if n > 99 {
+        return n.to_string();
+    }
+    if n < 10 {
+        return DIGITS[n].to_string();
+    }
+    if n == 10 {
+        return "十".to_string();
+    }
+    let tens = n / 10;
+    let ones = n % 10;
+    if n < 20 {
+        return format!("十{}", DIGITS[ones]);
+    }
+    if ones == 0 {
+        format!("{}十", DIGITS[tens])
+    } else {
+        format!("{}十{}", DIGITS[tens], DIGITS[ones])
+    }
+}
+
+fn ordinal_title(unit: &str, index: usize, description: &str) -> String {
+    let prefix = format!("第{}{}", chinese_numeral(index), unit);
+    if description.is_empty() {
+        prefix
+    } else {
+        format!("{prefix} {description}")
+    }
+}
+
+/// 按合并后的顺序重编卷/章序号，并去除各批次自带的重复序号。
+fn renumber_volumes(volumes: &mut [PreviewVolume]) {
+    for (volume_index, volume) in volumes.iter_mut().enumerate() {
+        let description = strip_ordinal_prefix(volume.title.trim());
+        volume.title = ordinal_title("卷", volume_index + 1, description);
+
+        for (chapter_index, chapter) in volume.chapters.iter_mut().enumerate() {
+            let description = strip_ordinal_prefix(chapter.title.trim());
+            chapter.title = ordinal_title("章", chapter_index + 1, description);
+        }
+    }
 }
 
 // ============================================================
@@ -924,18 +1379,6 @@ pub fn layer_summaries(input: &[String]) -> Vec<String> {
         current = next;
     }
     current
-}
-
-fn prepare_summaries(input: &[String]) -> Vec<String> {
-    let clipped: Vec<String> = input
-        .iter()
-        .map(|summary| clip_text(summary, SUMMARY_ITEM_LIMIT))
-        .collect();
-    if joined_summary_len(&clipped) > SUMMARY_JOIN_LIMIT {
-        layer_summaries(&clipped)
-    } else {
-        clipped
-    }
 }
 
 fn numbered_summaries(items: &[String]) -> String {

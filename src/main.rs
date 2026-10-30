@@ -118,6 +118,21 @@ async fn run() -> anyhow::Result<()> {
         }
     }));
 
+    // 导入任务保留 7 天：raw_text 可能很大，终态任务到期即回收。
+    let import_pool = pool.clone();
+    job_handles.push(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match jobs::novel_import_cleanup::run_once(&import_pool, 7).await {
+                Ok(n) if n > 0 => tracing::info!(removed = n, "expired novel imports cleaned"),
+                Err(e) => tracing::warn!(error = %e, "novel import cleanup failed"),
+                _ => {}
+            }
+        }
+    }));
+
     let listener = TcpListener::bind((addr.host.as_str(), addr.port)).await?;
     tracing::info!(address = %format!("{}:{}", addr.host, addr.port), "listening");
 

@@ -27,6 +27,13 @@ pub fn connect_options(data_dir: &str) -> SqliteConnectOptions {
 pub async fn open_pool(data_dir: &str) -> Result<SqlitePool, sqlx::Error> {
     sqlx::pool::PoolOptions::<Sqlite>::new()
         .max_connections(4)
+        // 常驻至少 1 个连接：SQLite 只允许「最后一个连接」在关闭时 checkpoint 并删除 -wal。
+        // 若连接池把连接全部回收（sqlx 默认 idle_timeout 10 分钟、min_connections 0），
+        // 外部工具/第二个进程就可能成为「最后一个连接」而删掉 -wal，导致池内新旧连接
+        // 指向不同 -wal inode，出现「已提交数据查不到」的幻读与丢数据（历史故障根因）。
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
         .connect_with(connect_options(data_dir))
         .await
 }
