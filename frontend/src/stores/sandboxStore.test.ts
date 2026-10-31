@@ -27,6 +27,8 @@ function session(overrides: Partial<Session> = {}): Session {
     mode: "director",
     current_step: 0,
     step_limit: 10,
+    beats_total: 0,
+    beats_done_count: 0,
     actor_ids: [],
     actor_names: [],
     last_event_seq: 0,

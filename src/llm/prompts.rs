@@ -13,8 +13,11 @@ pub const OUTLINE_FINALIZE: &str = include_str!("../../assets/prompts/outline_fi
 pub const NOVEL_ANALYZE_CHUNK: &str = include_str!("../../assets/prompts/novel_analyze_chunk.txt");
 pub const NOVEL_ANALYZE_STRUCTURE: &str =
     include_str!("../../assets/prompts/novel_analyze_structure.txt");
+pub const CHAPTER_PROSE_SYSTEM: &str =
+    include_str!("../../assets/prompts/chapter_prose_system.txt");
+pub const CHAPTER_PROSE_SCENE: &str = include_str!("../../assets/prompts/chapter_prose_scene.txt");
 
-pub const TEMPLATES: [(&str, &str); 7] = [
+pub const TEMPLATES: [(&str, &str); 9] = [
     ("actor_step", ACTOR_STEP),
     ("actor_step_user", ACTOR_STEP_USER),
     ("director_decide", DIRECTOR_DECIDE),
@@ -22,6 +25,8 @@ pub const TEMPLATES: [(&str, &str); 7] = [
     ("outline_finalize", OUTLINE_FINALIZE),
     ("novel_analyze_chunk", NOVEL_ANALYZE_CHUNK),
     ("novel_analyze_structure", NOVEL_ANALYZE_STRUCTURE),
+    ("chapter_prose_system", CHAPTER_PROSE_SYSTEM),
+    ("chapter_prose_scene", CHAPTER_PROSE_SCENE),
 ];
 
 pub fn render(body: &str, ctx: &serde_json::Value) -> Result<String, AppError> {

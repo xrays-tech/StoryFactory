@@ -1,4 +1,5 @@
 // src/services.rs — 服务层聚合（§5.5: 业务写 + search_index 同步 + 幂等记录同事务）
+pub mod chapter_draft;
 pub mod character;
 pub mod export;
 pub mod item;

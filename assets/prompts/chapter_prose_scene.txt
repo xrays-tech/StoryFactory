@@ -1,0 +1,32 @@
+# 作品信息
+书名：{{ novel_title }}
+本章：{{ chapter_title }}
+世界观：{{ world_view }}
+背景：{{ background }}
+
+# 本章大纲
+{{ chapter_outline }}
+
+# 叙述人称
+{{ pov }}（全文统一，不得混用；不因文风参考而改变）
+
+# 本场情节（第 {{ scene_index }}/{{ scene_total }} 场）
+{{ scene_beats }}
+
+{% if previous_tail %}
+# 衔接上文（上一场结尾，仅用于自然衔接，不要重复改写）
+{{ previous_tail }}
+{% endif %}
+
+# 出场人物
+{{ characters }}
+
+# 写作要求
+- 本场约 {{ target_words }} 字。
+- 严格使用「{{ pov }}」。
+- 只使用「本章大纲」与「本场情节」里出现过的事实；不得新增大纲没有的具体信息（时间、地点、数字、年龄、价格、亲缘、疾病、职业、道具）。大纲只说“约了时间地点”时，就写“约了个时间”，不要补出几点、哪个地方。
+- 只演本场情节，不提前写后面的场景。
+- 结尾要自然，为下一场留出衔接。
+{% if instruction %}
+- 额外指令：{{ instruction }}
+{% endif %}

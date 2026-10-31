@@ -19,6 +19,7 @@ use crate::models::sandbox::{
     ActorName, CreateSessionReq, DirectorMode, PurposeCount, SandboxEventType, SessionRow,
     SessionSnapshot, SessionStatus, UsageSummary,
 };
+use crate::services::sandbox::context;
 use crate::services::sandbox::engine;
 use crate::services::sandbox::events::{now_secs, persist_event, SandboxEvent};
 use crate::services::util::{db_err, invalid, not_found, novel_alive};
@@ -152,7 +153,19 @@ impl SessionManager {
                 "actor_ids 不能重复".to_string(),
             )]));
         }
-        let step_limit = req.step_limit.unwrap_or(cfg.sandbox.max_steps).clamp(1, 60);
+        let chapter_beats = match bound_chapter_id {
+            Some(chapter_id) => context::load_chapter_beats(&self.pool, chapter_id).await?,
+            None => Vec::new(),
+        };
+        let step_limit = match req.step_limit {
+            Some(limit) if limit > 0 => limit.clamp(1, 60),
+            _ if !chapter_beats.is_empty() => {
+                // ceil(beats * 1.2)：先覆盖全部情节，再留约 20% 收束余量。
+                let scaled = (chapter_beats.len() as u32).saturating_mul(6).div_ceil(5);
+                scaled.clamp(3, 12)
+            }
+            _ => cfg.sandbox.max_steps.clamp(1, 60),
+        };
         if let Some(directive) = &req.user_directive {
             if directive.chars().count() > 500 {
                 return Err(invalid(vec![(
@@ -281,6 +294,13 @@ impl SessionManager {
         let usage = usage_summary(&self.pool, session_id).await?;
         let status = SessionStatus::from_db(&row.status)
             .ok_or_else(|| AppError::internal(format!("非法会话状态: {}", row.status)))?;
+        let beats_total = match row.chapter_id.as_deref() {
+            Some(chapter_id) => context::load_chapter_beats(&self.pool, chapter_id)
+                .await?
+                .len(),
+            None => 0,
+        };
+        let beats_done_count = context::parse_beats_done(row.beats_done.as_deref()).len();
         Ok(SessionSnapshot {
             id: row.id,
             novel_id: row.novel_id,
@@ -289,6 +309,8 @@ impl SessionManager {
             mode: DirectorMode::from_db(&row.mode).unwrap_or(DirectorMode::Roundrobin),
             current_step: row.current_step.max(0) as u32,
             step_limit: row.step_limit.max(1) as u32,
+            beats_total: beats_total as i64,
+            beats_done_count: beats_done_count as i64,
             actor_ids,
             actor_names,
             last_event_seq: row.last_event_seq.max(0) as u64,

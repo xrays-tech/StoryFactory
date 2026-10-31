@@ -184,6 +184,8 @@ pub struct ChapterDto {
     pub title: String,
     pub scene_prompt: Option<String>,
     pub final_outline: Option<String>,
+    #[serde(default)]
+    pub beat_count: i64,
     pub status: ChapterStatus,
     pub created_at: i64,
     pub updated_at: i64,

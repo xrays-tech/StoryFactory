@@ -33,7 +33,8 @@ fn outline_text() -> String {
          ## 剧情梗概\n{} 已推演的行动仅限厅内试探，未发生的门外对手戏与私盐定策不得写成既成事实。\n\
          ## 关键场景\n- 旧城车站：两人雨夜重逢，彼此试探来意与底牌。\n\
          ## 人物变化\n- 角色A：由戒备转为愿意倾听，但尚未交出全部秘密。\n\
-         ## 未覆盖要点\n- 门外对手戏：本场未推演。\n- 私盐定策：本场未推演。\n\
+         ## 差异清单\n### 未演\n- 门外对手戏：本场未推演。\n- 私盐定策：本场未推演。\n\
+         ### 改写\n- 无\n\
          ## 衔接下一章\n两人约定明日再谈，门外来客尚未现身。",
         "这是测试大纲，用于验证收束写入流程与未覆盖情节的区分。".repeat(3)
     )
@@ -46,10 +47,10 @@ fn degraded_outline() -> String {
     )
 }
 
-fn outline_without_uncovered() -> String {
+fn outline_without_diff_section() -> String {
     format!(
-        "## 章节标题\n雨夜\n## 剧情梗概\n{}",
-        "这段大纲长度足够但没有未覆盖要点小节。".repeat(12)
+        "## 章节标题\n雨夜\n## 剧情梗概\n{}\n## 未覆盖要点\n无",
+        "这段大纲长度足够但只有旧版未覆盖小节。".repeat(12)
     )
 }
 
@@ -74,14 +75,17 @@ fn validate_outline_covers_failure_conditions_and_pass_sample() {
         validate_outline(&degraded_outline()),
         Err("输出包含降级或不可用标记")
     );
-    let short = format!("## 剧情梗概\n{}\n## 未覆盖要点\n无", "短".repeat(20));
+    let short = format!(
+        "## 剧情梗概\n{}\n## 差异清单\n### 未演\n无\n### 改写\n无",
+        "短".repeat(20)
+    );
     assert_eq!(validate_outline(&short), Err("大纲正文不足 200 字"));
     assert_eq!(
-        validate_outline(&outline_without_uncovered()),
-        Err("缺少「未覆盖要点」小节")
+        validate_outline(&outline_without_diff_section()),
+        Err("缺少「差异清单」小节")
     );
     let missing_summary = format!(
-        "## 章节标题\n雨夜\n## 未覆盖要点\n无\n{}",
+        "## 章节标题\n雨夜\n## 差异清单\n### 未演\n无\n### 改写\n无\n{}",
         "内容。".repeat(80)
     );
     assert_eq!(
@@ -103,6 +107,31 @@ fn director_prompt(provider: &MockProvider) -> String {
         })
         .map(|message| message.content)
         .expect("应捕获到导演 system prompt")
+}
+
+fn actor_prompt(provider: &MockProvider) -> String {
+    provider
+        .captured_requests()
+        .into_iter()
+        .find(|(purpose, _)| *purpose == Purpose::ActorStep)
+        .map(|(_, messages)| {
+            messages
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .expect("应捕获到演员 prompt")
+}
+
+async fn set_chapter_beats(state: &AppState, chapter_id: &str, beats: &[&str], outline: &str) {
+    sqlx::query("UPDATE chapters SET beats = ?, final_outline = ? WHERE id = ?")
+        .bind(serde_json::to_string(beats).expect("beats json"))
+        .bind(outline)
+        .bind(chapter_id)
+        .execute(&state.pool)
+        .await
+        .expect("update chapter beats");
 }
 
 fn mock_chain(responses: Vec<String>) -> ProviderChain {
@@ -1127,10 +1156,10 @@ async fn finalize_rejects_degraded_output_and_keeps_chapter_outline() {
 }
 
 #[tokio::test]
-async fn finalize_rejects_outline_without_uncovered_section() {
+async fn finalize_rejects_outline_without_diff_section() {
     let state = test_state_with_chain(Some(mock_chain(vec![
         actor_json("厅内试探"),
-        outline_without_uncovered(),
+        outline_without_diff_section(),
     ])))
     .await;
     let (cid, sid) = run_bound_finalize(&state, "原始章节大纲").await;
@@ -1166,7 +1195,7 @@ async fn finalize_rejects_outline_without_uncovered_section() {
 }
 
 #[tokio::test]
-async fn finalize_writes_outline_with_uncovered_section() {
+async fn finalize_writes_outline_with_diff_section() {
     let state = test_state_with_chain(Some(mock_chain(vec![
         actor_json("厅内试探"),
         outline_text(),
@@ -1181,7 +1210,7 @@ async fn finalize_writes_outline_with_uncovered_section() {
             .await
             .unwrap();
     assert!(
-        outline.unwrap_or_default().contains("## 未覆盖要点"),
+        outline.unwrap_or_default().contains("## 差异清单"),
         "合格大纲必须写入章节"
     );
 
@@ -1220,7 +1249,9 @@ async fn finalize_prompt_marks_plan_vs_played() {
     for needle in [
         "既定大纲",
         "已推演",
-        "未覆盖要点",
+        "差异清单",
+        "未演",
+        "改写",
         "门外对手戏",
         "私盐定策",
         "厅内试探",
@@ -1507,4 +1538,221 @@ async fn create_session_with_blank_chapter_id_is_none() {
             .await
             .unwrap();
     assert_eq!(stored, None, "空白 chapter_id 必须按未绑定落库");
+}
+
+#[tokio::test]
+async fn director_prompt_lists_beats_with_indexes() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    let state = test_state_with_chain(Some(ProviderChain::new(
+        vec![provider.clone()],
+        0,
+        Duration::from_secs(2),
+    )))
+    .await;
+    let (nid, actors, cid) = base_novel(&state).await;
+    let first = actors.split(',').next().unwrap().to_string();
+    set_chapter_beats(
+        &state,
+        &cid,
+        &["雨夜重逢", "门外来客"],
+        "## 剧情梗概\n两人在旧城车站重逢。",
+    )
+    .await;
+
+    provider.push_ok(
+        json!({ "next_actor_id": first, "next_beat": 0, "reason": "推进本章情节" }).to_string(),
+    );
+    provider.push_ok(actor_json("旧城车站重逢"));
+    provider.push_ok(outline_text());
+
+    let req = CreateSessionReq {
+        chapter_id: None,
+        actor_ids: actors.split(',').map(str::to_string).collect(),
+        mode: DirectorMode::Director,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let prompt = director_prompt(&provider);
+    assert!(
+        prompt.contains("[0]"),
+        "导演 prompt 缺少情节下标 0: {prompt}"
+    );
+    assert!(
+        prompt.contains("[1]"),
+        "导演 prompt 缺少情节下标 1: {prompt}"
+    );
+    assert!(
+        prompt.contains("雨夜重逢"),
+        "导演 prompt 缺少情节文本: {prompt}"
+    );
+    assert!(
+        prompt.contains("门外来客"),
+        "导演 prompt 缺少情节文本: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn actor_receives_current_beat_and_outline() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    let state = test_state_with_chain(Some(ProviderChain::new(
+        vec![provider.clone()],
+        0,
+        Duration::from_secs(2),
+    )))
+    .await;
+    let (nid, actors, cid) = base_novel(&state).await;
+    set_chapter_beats(
+        &state,
+        &cid,
+        &["雨夜重逢"],
+        "## 剧情梗概\n两人在旧城车站重逢，彼此试探来意。",
+    )
+    .await;
+
+    provider.push_ok(actor_json("旧城车站重逢"));
+    provider.push_ok(outline_text());
+
+    let req = CreateSessionReq {
+        chapter_id: None,
+        actor_ids: actors.split(',').map(str::to_string).collect(),
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let prompt = actor_prompt(&provider);
+    assert!(
+        prompt.contains("# 本步情节"),
+        "演员 prompt 缺少本步情节段: {prompt}"
+    );
+    assert!(
+        prompt.contains("雨夜重逢"),
+        "演员 prompt 缺少当前 beat 文本: {prompt}"
+    );
+    assert!(
+        prompt.contains("# 本章大纲"),
+        "演员 prompt 缺少本章大纲段: {prompt}"
+    );
+    assert!(
+        prompt.contains("彼此试探来意"),
+        "演员 prompt 缺少本章大纲文本: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn step_limit_defaults_from_beat_count() {
+    let state = test_state_with_chain(None).await;
+    let (nid, actors, cid) = base_novel(&state).await;
+    let beats = [
+        "情节一",
+        "情节二",
+        "情节三",
+        "情节四",
+        "情节五",
+        "情节六",
+        "情节七",
+        "情节八",
+    ];
+    set_chapter_beats(&state, &cid, &beats, "## 剧情梗概\n八个情节待演绎。").await;
+
+    let req = CreateSessionReq {
+        chapter_id: None,
+        actor_ids: actors.split(',').map(str::to_string).collect(),
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: None,
+        director_config: None,
+        user_directive: None,
+        autostart: Some(false),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+
+    assert_eq!(created.step_limit, 10, "8 个 beat 应得到 ceil(9.6)=10 步");
+    assert_eq!(created.beats_total, 8);
+    assert_eq!(created.beats_done_count, 0);
+}
+
+#[tokio::test]
+async fn beats_done_accumulates() {
+    let state = test_state_with_chain(Some(mock_chain(vec![
+        actor_json("第一步"),
+        actor_json("第二步"),
+        actor_json("第三步"),
+        outline_text(),
+    ])))
+    .await;
+    let (nid, actors, cid) = base_novel(&state).await;
+    set_chapter_beats(
+        &state,
+        &cid,
+        &["情节一", "情节二", "情节三", "情节四", "情节五", "情节六"],
+        "## 剧情梗概\n六个情节待演绎。",
+    )
+    .await;
+
+    let req = CreateSessionReq {
+        chapter_id: None,
+        actor_ids: actors.split(',').map(str::to_string).collect(),
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(3),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+    let done = wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+    assert_eq!(done.current_step, 3);
+
+    let raw: Option<String> =
+        sqlx::query_scalar("SELECT beats_done FROM sandbox_sessions WHERE id = ?")
+            .bind(&created.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    let indices: Vec<usize> = serde_json::from_str(raw.as_deref().unwrap_or("[]")).unwrap();
+    assert_eq!(indices.len(), 3, "三步应消费三个情节: {indices:?}");
+    let mut unique = indices.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 3, "情节下标不得重复: {indices:?}");
+    assert!(unique.iter().all(|index| *index < 6));
+}
+
+#[test]
+fn validate_outline_accepts_diff_section() {
+    let text = format!(
+        "## 剧情梗概\n{}\n## 差异清单\n### 未演\n无\n### 改写\n无",
+        "这一幕已经发生。".repeat(40)
+    );
+    assert!(validate_outline(&text).is_ok());
+}
+
+#[test]
+fn validate_outline_rejects_legacy_uncovered_heading() {
+    let text = format!(
+        "## 剧情梗概\n{}\n## 未覆盖要点\n- 旧版小节不应再被接受。",
+        "这一幕已经发生。".repeat(40)
+    );
+    assert_eq!(validate_outline(&text), Err("缺少「差异清单」小节"));
 }

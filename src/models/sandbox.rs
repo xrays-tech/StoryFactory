@@ -188,6 +188,10 @@ pub struct SessionSnapshot {
     pub mode: DirectorMode,
     pub current_step: u32,
     pub step_limit: u32,
+    #[serde(default)]
+    pub beats_total: i64,
+    #[serde(default)]
+    pub beats_done_count: i64,
     pub actor_ids: Vec<String>,
     pub actor_names: Vec<ActorName>,
     pub last_event_seq: u64,
@@ -262,6 +266,7 @@ pub struct SessionRow {
     pub status: String,
     pub step_limit: i64,
     pub current_step: i64,
+    pub beats_done: Option<String>,
     pub last_event_seq: i64,
     pub summary_until_seq: i64,
     pub rolling_summary: Option<String>,

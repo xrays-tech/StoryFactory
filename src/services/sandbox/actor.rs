@@ -33,6 +33,8 @@ pub async fn execute(
     history: &[HistoryStep],
     emotion_matrix: &str,
     directive: &str,
+    chapter_outline: &str,
+    current_beat: Option<&str>,
     llm: &LlmService,
     budget: &Budget,
     cfg: &AppConfig,
@@ -42,11 +44,17 @@ pub async fn execute(
         .find(|c| c.id == actor_id)
         .ok_or_else(|| AppError::new(ErrorCode::Internal, "角色卡缺失"))?;
 
+    let current_beat = current_beat
+        .map(str::trim)
+        .filter(|beat| !beat.is_empty())
+        .unwrap_or("自由推进");
     let system_ctx = json!({
         "self_card": context::self_card_text(card),
         "scene": scene,
         "user_directive": user_directive,
         "emotion_matrix": emotion_matrix,
+        "chapter_outline": context::truncate_chars(chapter_outline.trim(), 1500),
+        "current_beat": current_beat,
     });
     let user_ctx = json!({
         "rolling_summary": rolling_summary,

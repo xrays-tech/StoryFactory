@@ -5,4 +5,4 @@ import type { SessionError } from "./SessionError";
 import type { SessionStatus } from "./SessionStatus";
 import type { UsageSummary } from "./UsageSummary";
 
-export type SessionSnapshot = { id: string, novel_id: string, chapter_id: string | null, status: SessionStatus, mode: DirectorMode, current_step: number, step_limit: number, actor_ids: Array<string>, actor_names: Array<ActorName>, last_event_seq: bigint, can_recover: boolean, usage: UsageSummary, error: SessionError | null, created_at: bigint, updated_at: bigint, finished_at: bigint | null, session_deadline: bigint | null, };
+export type SessionSnapshot = { id: string, novel_id: string, chapter_id: string | null, status: SessionStatus, mode: DirectorMode, current_step: number, step_limit: number, beats_total: bigint, beats_done_count: bigint, actor_ids: Array<string>, actor_names: Array<ActorName>, last_event_seq: bigint, can_recover: boolean, usage: UsageSummary, error: SessionError | null, created_at: bigint, updated_at: bigint, finished_at: bigint | null, session_deadline: bigint | null, };

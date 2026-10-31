@@ -140,6 +140,11 @@ pub async fn run_engine(
             .as_deref()
             .and_then(|raw| serde_json::from_str(raw).ok());
         let mode = DirectorMode::from_db(&row.mode).unwrap_or(DirectorMode::Roundrobin);
+        let beats = match row.chapter_id.as_deref() {
+            Some(chapter_id) => context::load_chapter_beats(&pool, chapter_id).await?,
+            None => Vec::new(),
+        };
+        let beats_done = context::parse_beats_done(row.beats_done.as_deref());
 
         let remaining_session = row
             .session_deadline
@@ -166,6 +171,8 @@ pub async fn run_engine(
             previous_scene: &story_context.previous_scene,
             last_actor: last_actor.as_deref(),
             consecutive,
+            beats: &beats,
+            beats_done: &beats_done,
         };
         let decision = director::decide(&input, &cfg, &llm, &budget).await;
         let step = (row.current_step.max(0) + 1) as u32;
@@ -242,12 +249,27 @@ pub async fn run_engine(
             continue;
         }
 
+        // 导演给出的下标无效/已消费时，回退到第一个尚未演绎的情节。
+        let remaining = context::remaining_beats(&beats, &beats_done);
+        let selected_beat = decision
+            .beat_index
+            .filter(|index| beats.get(*index).is_some() && !beats_done.contains(index))
+            .map(|index| (index, beats[index].as_str()))
+            .or_else(|| remaining.first().copied());
+        let beat_index = selected_beat.map(|(index, _)| index);
+        let beat = selected_beat.map(|(_, text)| text);
+
         emit(
             &pool,
             &session_id,
             &hub,
             SandboxEventType::StepStarted,
-            json!({ "step": step, "actor_id": decision.actor_id }),
+            json!({
+                "step": step,
+                "actor_id": decision.actor_id,
+                "beat_index": beat_index,
+                "beat": beat,
+            }),
         )
         .await?;
 
@@ -268,6 +290,8 @@ pub async fn run_engine(
             &history,
             &emotion,
             &directive,
+            &story_context.chapter_outline,
+            beat,
             &llm,
             &budget,
             &cfg,
@@ -279,7 +303,16 @@ pub async fn run_engine(
 
         match outcome {
             Ok(outcome) => {
-                commit_step(&pool, &session_id, &hub, &row, &actor_ids, &outcome).await?;
+                commit_step(
+                    &pool,
+                    &session_id,
+                    &hub,
+                    &row,
+                    &actor_ids,
+                    &outcome,
+                    selected_beat,
+                )
+                .await?;
                 consecutive = if last_actor.as_deref() == Some(outcome.actor_id.as_str()) {
                     consecutive + 1
                 } else {
@@ -347,14 +380,24 @@ async fn commit_step(
     row: &SessionRow,
     actor_ids: &[String],
     outcome: &actor::ActorOutcome,
+    beat: Option<(usize, &str)>,
 ) -> Result<(), AppError> {
     let mut tx = db::begin_immediate(pool).await.map_err(db_err)?;
 
+    let mut beats_done = context::parse_beats_done(row.beats_done.as_deref());
+    if let Some((index, _)) = beat {
+        if !beats_done.contains(&index) {
+            beats_done.push(index);
+        }
+    }
+    let beats_done_json = serde_json::to_string(&beats_done).unwrap_or_else(|_| "[]".to_string());
+
     // 状态守卫必须先于任何副作用写入：用户 Abort 后，在途 LLM 结果不得推进步骤或改写情感关系。
     let advanced = sqlx::query(
-        "UPDATE sandbox_sessions SET current_step = ?, pending_directive = NULL, updated_at = strftime('%s','now') WHERE id = ? AND status IN ('running','paused')",
+        "UPDATE sandbox_sessions SET current_step = ?, beats_done = ?, pending_directive = NULL, updated_at = strftime('%s','now') WHERE id = ? AND status IN ('running','paused')",
     )
     .bind(outcome.step as i64)
+    .bind(&beats_done_json)
     .bind(session_id)
     .execute(&mut *tx)
     .await
@@ -429,6 +472,8 @@ async fn commit_step(
             "step": outcome.step,
             "actor_id": outcome.actor_id,
             "actor_name": outcome.actor_name,
+            "beat_index": beat.map(|(index, _)| index),
+            "beat": beat.map(|(_, text)| text),
             "action": { "type": outcome.action_type, "content": outcome.content },
             "emotion_delta": {
                 "target_actor_id": outcome.target_actor_id,
@@ -458,11 +503,11 @@ pub fn validate_outline(text: &str) -> Result<(), &'static str> {
     if text.chars().filter(|ch| !ch.is_whitespace()).count() < 200 {
         return Err("大纲正文不足 200 字");
     }
-    if !text.contains("## 未覆盖要点") {
-        return Err("缺少「未覆盖要点」小节");
-    }
     if !text.contains("## 剧情梗概") {
         return Err("缺少「剧情梗概」小节");
+    }
+    if !text.contains("## 差异清单") {
+        return Err("缺少「差异清单」小节");
     }
     Ok(())
 }

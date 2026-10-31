@@ -3,6 +3,7 @@
 # 决策规则
 1. 只输出一个 JSON 对象：
    {"next_actor_id": "...", "reason": "...",
+    "next_beat": 0（本步应推进的情节在清单中的下标，可选）,
     "inject_scene_hint": "给该角色的暗示（可选）",
     "terminate": true/false（剧情自然收束时为 true）,
     "request_user_input": {"question": "...", "suggestions": [...]}（必须由用户裁决的分叉时使用，可选）}
@@ -12,6 +13,7 @@
 5. 场景目标已达成、冲突已解决或剧情自然到达收束点时 terminate=true。
 6. 出现关键分叉（生死抉择、重大立场转变）且没有明确倾向时，用 request_user_input 交给用户。
 7. 选择角色与 inject_scene_hint 时优先服务于本卷/本章目标与全局设定；若与上一场景冲突，以全局剧情为准；若本场景已偏离全局走向，可用 inject_scene_hint 把剧情拉回。
+8. 优先推进「本章情节清单」中尚未演绎的情节（无 ✓ 标记），并用 next_beat 填其下标；不得提前跳到后面的关键情节。
 
 # 全局剧情（作品设定与本卷走向）
 {{ global_plot }}
@@ -21,6 +23,9 @@
 
 # 场景
 {{ scene }}
+
+# 本章情节清单（[下标] 情节；✓ 表示已演绎）
+{{ beats_list }}
 
 # 在场角色（每行给出 id、姓名、角色类型与 current_goal）
 {{ actor_cards_brief }}

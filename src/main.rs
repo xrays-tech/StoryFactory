@@ -1,6 +1,7 @@
 // src/main.rs — 启动、迁移、优雅关闭（§3.3 / §5.7）
 use std::path::PathBuf;
 
+use story_architect::services::chapter_draft;
 use story_architect::{config, db, jobs, llm, logging, router, state};
 use tokio::net::TcpListener;
 
@@ -57,6 +58,13 @@ async fn run() -> anyhow::Result<()> {
     let recovered = jobs::session_recovery::run_startup(&pool).await?;
     if recovered > 0 {
         tracing::warn!(recovered, "sessions marked interrupted after restart");
+    }
+    let interrupted_drafts = chapter_draft::recover_startup(&pool).await?;
+    if interrupted_drafts > 0 {
+        tracing::warn!(
+            interrupted_drafts,
+            "chapter drafts marked failed after restart"
+        );
     }
     let interrupted_imports = jobs::novel_import_recovery::run_startup(&pool).await?;
     if interrupted_imports > 0 {

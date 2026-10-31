@@ -1,4 +1,7 @@
 // tests/export_bindings.rs — Rust DTO → TS 类型导出（ADR-07）
+use story_architect::models::draft::{
+    ChapterContent, CreateDraftReq, DraftJob, DraftStatus, SaveChapterContentReq,
+};
 use story_architect::models::dto::{
     ChapterDto, CharacterDto, CreateChapterReq, CreateCharacterReq, CreateItemReq, CreateNovelReq,
     CreateVolumeReq, ItemDto, MoveReq, NovelDto, PutRelationsReq, RelationDto, RestoreReq,
@@ -58,5 +61,10 @@ fn export_all_bindings() {
     PreviewRelation::export_all_to(out).expect("PreviewRelation");
     PreviewItem::export_all_to(out).expect("PreviewItem");
     NovelImportPreview::export_all_to(out).expect("NovelImportPreview");
+    CreateDraftReq::export_all_to(out).expect("CreateDraftReq");
+    DraftJob::export_all_to(out).expect("DraftJob");
+    DraftStatus::export_all_to(out).expect("DraftStatus");
+    SaveChapterContentReq::export_all_to(out).expect("SaveChapterContentReq");
+    ChapterContent::export_all_to(out).expect("ChapterContent");
     CreateNovelFromImportReq::export_all_to(out).expect("CreateNovelFromImportReq");
 }

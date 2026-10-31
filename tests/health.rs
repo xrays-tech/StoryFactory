@@ -27,9 +27,9 @@ async fn test_state() -> AppState {
         4,
     ));
     AppState {
-        config,
+        config: config.clone(),
         sessions,
-        pool,
+        pool: pool.clone(),
         bind_host: "127.0.0.1".to_string(),
         bind_port: 8080,
         is_public: false,
@@ -39,6 +39,13 @@ async fn test_state() -> AppState {
         imports: std::sync::Arc::new(
             story_architect::services::novel_import::ImportRegistry::new(
                 story_architect::services::novel_import::IMPORT_SEMAPHORE,
+            ),
+        ),
+        drafts: std::sync::Arc::new(
+            story_architect::services::chapter_draft::DraftRegistry::new(
+                config.clone(),
+                pool.clone(),
+                None,
             ),
         ),
     }

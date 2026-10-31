@@ -51,11 +51,12 @@ pub struct HistoryStep {
     pub emotion_note: String,
 }
 
-/// 导演所需的全局剧情上下文：作品设定/卷章定位 + 上一场景。
+/// 导演所需的全局剧情上下文：作品设定/卷章定位 + 上一场景 + 本章大纲。
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StoryContext {
     pub global_plot: String,
     pub previous_scene: String,
+    pub chapter_outline: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,6 +107,155 @@ fn clip(value: Option<&str>, max: usize) -> Option<String> {
         return None;
     }
     Some(truncate_chars(text, max))
+}
+
+const BEATS_MAX: usize = 12;
+const BEAT_MAX_CHARS: usize = 80;
+
+/// 单条情节裁剪到 80 字以内（含省略号）。
+fn clip_beat(text: &str) -> String {
+    let text = text.trim();
+    if text.chars().count() <= BEAT_MAX_CHARS {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(BEAT_MAX_CHARS - 1).collect();
+    out.push('…');
+    out
+}
+
+fn json_string_array(raw: &str) -> Option<Vec<String>> {
+    let values: Vec<String> = serde_json::from_str(raw).ok()?;
+    Some(
+        values
+            .into_iter()
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+    )
+}
+
+/// 返回 `## 标题` 小节的正文行（不含标题本身）。
+fn markdown_section<'a>(outline: &'a str, heading: &str) -> Vec<&'a str> {
+    let mut in_section = false;
+    let mut lines = Vec::new();
+    for line in outline.lines() {
+        let trimmed = line.trim();
+        if let Some(title) = trimmed.strip_prefix("## ") {
+            if in_section {
+                break;
+            }
+            in_section = title.trim() == heading;
+            continue;
+        }
+        if in_section {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+/// 解析列表项：`- `、`* ` 或 `1.` / `1、` / `1)` 等数字列表。
+fn list_item_text(line: &str) -> Option<&str> {
+    let text = line.trim();
+    for prefix in ["- ", "* "] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let rest = rest.trim();
+            return (!rest.is_empty()).then_some(rest);
+        }
+    }
+    let digits = text.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let rest = &text[digits..];
+    let rest = rest
+        .strip_prefix('.')
+        .or_else(|| rest.strip_prefix('、'))
+        .or_else(|| rest.strip_prefix(')'))
+        .or_else(|| rest.strip_prefix('）'))?;
+    let rest = rest.trim();
+    (!rest.is_empty()).then_some(rest)
+}
+
+fn beats_from_list(outline: &str, heading: &str) -> Vec<String> {
+    markdown_section(outline, heading)
+        .into_iter()
+        .filter_map(list_item_text)
+        .map(clip_beat)
+        .filter(|item| !item.is_empty())
+        .take(BEATS_MAX)
+        .collect()
+}
+
+fn beats_from_prose(outline: &str, heading: &str) -> Vec<String> {
+    let prose = markdown_section(outline, heading).join("");
+    prose
+        .split(['。', '；', ';'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(clip_beat)
+        .take(BEATS_MAX)
+        .collect()
+}
+
+/// 解析本章情节清单：优先使用显式 JSON 数组，否则从大纲 Markdown 派生。
+pub fn parse_beats(outline: &str, beats_json: Option<&str>) -> Vec<String> {
+    if let Some(beats) = beats_json.and_then(json_string_array) {
+        if !beats.is_empty() {
+            return beats;
+        }
+    }
+    let listed = beats_from_list(outline, "关键场景");
+    if !listed.is_empty() {
+        return listed;
+    }
+    beats_from_prose(outline, "剧情梗概")
+}
+
+/// 已消费的下标（去重、保持出现顺序）。
+pub fn parse_beats_done(raw: Option<&str>) -> Vec<usize> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let Ok(values) = serde_json::from_str::<Vec<usize>>(raw) else {
+        return Vec::new();
+    };
+    let mut done = Vec::with_capacity(values.len());
+    for value in values {
+        if !done.contains(&value) {
+            done.push(value);
+        }
+    }
+    done
+}
+
+/// 尚未演绎的情节（保持原始下标）。
+pub fn remaining_beats<'a>(beats: &'a [String], done: &[usize]) -> Vec<(usize, &'a str)> {
+    beats
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !done.contains(index))
+        .map(|(index, beat)| (index, beat.as_str()))
+        .collect()
+}
+
+/// 读取章节情节清单；章节缺失时返回空清单。
+pub async fn load_chapter_beats(
+    pool: &SqlitePool,
+    chapter_id: &str,
+) -> Result<Vec<String>, AppError> {
+    let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT final_outline, beats FROM chapters WHERE id = ? AND deleted_at IS NULL",
+    )
+    .bind(chapter_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    Ok(row
+        .map(|(outline, beats)| {
+            parse_beats(outline.as_deref().unwrap_or_default(), beats.as_deref())
+        })
+        .unwrap_or_default())
 }
 
 /// 标题是否已自带「第X卷/章/回/节」序号，避免渲染时出现「第2卷《第二卷 破晓》」。
@@ -286,6 +436,7 @@ pub async fn load_story_context(
         return Ok(StoryContext {
             global_plot: render_global_plot(&novel, None, None, &[]),
             previous_scene: render_previous_scene(None, prior_summary.as_deref()),
+            chapter_outline: String::new(),
         });
     };
 
@@ -319,6 +470,7 @@ pub async fn load_story_context(
         summary: volume_summary,
         volume_index,
     };
+    let chapter_outline = final_outline.clone().unwrap_or_default();
     let chapter_ctx = ChapterContext {
         title: chapter_title,
         final_outline,
@@ -370,6 +522,7 @@ pub async fn load_story_context(
             &chapter_list,
         ),
         previous_scene: render_previous_scene(previous_outline.as_deref(), None),
+        chapter_outline,
     })
 }
 

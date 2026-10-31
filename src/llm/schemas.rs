@@ -42,6 +42,7 @@ pub fn director_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "next_actor_id": { "type": "string" },
+            "next_beat": { "type": "integer", "minimum": 0 },
             "reason": { "type": "string", "maxLength": 300 },
             "inject_scene_hint": { "type": "string", "maxLength": 200 },
             "terminate": { "type": "boolean" },

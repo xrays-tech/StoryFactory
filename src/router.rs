@@ -10,8 +10,8 @@ use crate::assets;
 use crate::error::AppError;
 use crate::handlers::health;
 use crate::handlers::{
-    characters, config as config_handler, export_import, items, novel_import, novels, outline,
-    recycle, sandbox, search, sse,
+    chapter_draft, characters, config as config_handler, export_import, items, novel_import,
+    novels, outline, recycle, sandbox, search, sse,
 };
 use crate::middleware::{body_limit, host_guard, idempotency, request_log};
 use crate::state::AppState;
@@ -154,6 +154,7 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/v1", v1)
         .merge(import_router)
         .merge(novel_import_router)
+        .merge(chapter_draft::router())
         .fallback(api_not_found)
         .with_state(state.clone());
 

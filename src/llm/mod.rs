@@ -26,6 +26,7 @@ pub enum Purpose {
     Finalize,
     Analyze,
     Structure,
+    Prose,
 }
 
 impl Purpose {
@@ -38,6 +39,7 @@ impl Purpose {
             Purpose::Finalize => "finalize",
             Purpose::Analyze => "analyze",
             Purpose::Structure => "structure",
+            Purpose::Prose => "prose",
         }
     }
 }

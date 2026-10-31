@@ -18,7 +18,7 @@ use crate::services::util::{
 const MAX_CHAPTER_INDEX: i64 = 1_000_000;
 
 const VOL_COLS: &str = "id, novel_id, volume_index, title, summary, created_at, updated_at";
-const CH_COLS: &str = "id, novel_id, volume_id, chapter_index, title, scene_prompt, final_outline, status, created_at, updated_at";
+const CH_COLS: &str = "id, novel_id, volume_id, chapter_index, title, scene_prompt, final_outline, beats, status, created_at, updated_at";
 
 #[derive(sqlx::FromRow)]
 struct VolumeRow {
@@ -40,6 +40,7 @@ struct ChapterRow {
     title: String,
     scene_prompt: Option<String>,
     final_outline: Option<String>,
+    beats: Option<String>,
     status: String,
     created_at: i64,
     updated_at: i64,
@@ -58,6 +59,11 @@ fn vol_dto(row: VolumeRow) -> VolumeDto {
 }
 
 fn ch_dto(row: ChapterRow) -> ChapterDto {
+    let beat_count = crate::services::sandbox::context::parse_beats(
+        row.final_outline.as_deref().unwrap_or_default(),
+        row.beats.as_deref(),
+    )
+    .len() as i64;
     ChapterDto {
         id: row.id,
         novel_id: row.novel_id,
@@ -66,6 +72,7 @@ fn ch_dto(row: ChapterRow) -> ChapterDto {
         title: row.title,
         scene_prompt: row.scene_prompt,
         final_outline: row.final_outline,
+        beat_count,
         status: ChapterStatus::from_db_or_default(row.status),
         created_at: row.created_at,
         updated_at: row.updated_at,

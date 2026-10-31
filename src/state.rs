@@ -5,6 +5,7 @@ use arc_swap::ArcSwap;
 use sqlx::sqlite::SqlitePool;
 
 use crate::config::{parse_bind, AppConfig};
+use crate::services::chapter_draft::DraftRegistry;
 use crate::services::novel_import::{ImportRegistry, IMPORT_SEMAPHORE};
 use crate::services::sandbox::SessionManager;
 
@@ -20,6 +21,7 @@ pub struct AppState {
     pub dev_cors: bool,
     pub sessions: std::sync::Arc<SessionManager>,
     pub imports: Arc<ImportRegistry>,
+    pub drafts: Arc<DraftRegistry>,
 }
 
 pub fn new_state(config: AppConfig, pool: SqlitePool, token: String) -> Result<AppState, String> {
@@ -41,6 +43,7 @@ pub fn new_state(config: AppConfig, pool: SqlitePool, token: String) -> Result<A
         config.sandbox.max_concurrent as usize,
     ));
     let imports = Arc::new(ImportRegistry::new(IMPORT_SEMAPHORE));
+    let drafts = Arc::new(DraftRegistry::new(config_arc.clone(), pool.clone(), None));
     Ok(AppState {
         config: config_arc,
         pool,
@@ -52,6 +55,7 @@ pub fn new_state(config: AppConfig, pool: SqlitePool, token: String) -> Result<A
         dev_cors: config.http.dev_cors,
         sessions,
         imports,
+        drafts,
     })
 }
 

@@ -42,9 +42,9 @@ pub async fn test_state_with_chain(
         }
     });
     AppState {
-        config,
+        config: config.clone(),
         sessions,
-        pool,
+        pool: pool.clone(),
         bind_host: "127.0.0.1".to_string(),
         bind_port: 8080,
         is_public: false,
@@ -54,6 +54,13 @@ pub async fn test_state_with_chain(
         imports: std::sync::Arc::new(
             story_architect::services::novel_import::ImportRegistry::new(
                 story_architect::services::novel_import::IMPORT_SEMAPHORE,
+            ),
+        ),
+        drafts: std::sync::Arc::new(
+            story_architect::services::chapter_draft::DraftRegistry::new(
+                config.clone(),
+                pool.clone(),
+                None,
             ),
         ),
     }

@@ -12,6 +12,7 @@ use crate::services::sandbox::context::{actor_cards_brief, AgentCard, HistorySte
 #[derive(Debug, Clone)]
 pub struct DirectorDecision {
     pub actor_id: String,
+    pub beat_index: Option<usize>,
     pub hint: Option<String>,
     pub terminate: bool,
     pub request_input: Option<(String, Vec<String>)>,
@@ -35,6 +36,28 @@ pub struct DirectorInput<'a> {
     pub previous_scene: &'a str,
     pub last_actor: Option<&'a str>,
     pub consecutive: u32,
+    pub beats: &'a [String],
+    pub beats_done: &'a [usize],
+}
+
+/// 导演看到的情节清单：带下标，已消费项标注 ✓。
+fn render_beats_for_director(beats: &[String], done: &[usize]) -> String {
+    if beats.is_empty() {
+        return "（无情节清单，按场景自然推进）".to_string();
+    }
+    beats
+        .iter()
+        .enumerate()
+        .map(|(index, beat)| {
+            let consumed = if done.contains(&index) {
+                "✓ 已演绎 "
+            } else {
+                ""
+            };
+            format!("[{index}] {consumed}{beat}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn roundrobin(
@@ -49,6 +72,7 @@ fn roundrobin(
         .unwrap_or_default();
     DirectorDecision {
         actor_id,
+        beat_index: None,
         hint: None,
         terminate: false,
         request_input: None,
@@ -94,6 +118,7 @@ pub async fn decide(
                 if let Some(step) = plan.steps.get(input.current_step as usize) {
                     return DirectorDecision {
                         actor_id: step.actor_id.clone(),
+                        beat_index: None,
                         hint: step.beat_hint.clone(),
                         terminate: false,
                         request_input: None,
@@ -105,6 +130,7 @@ pub async fn decide(
             }
             DirectorDecision {
                 actor_id: String::new(),
+                beat_index: None,
                 hint: None,
                 terminate: true,
                 request_input: None,
@@ -126,6 +152,7 @@ pub async fn decide(
                 "consecutive_steps": input.consecutive,
                 "rolling_summary": input.rolling_summary,
                 "recent_history": input.history,
+                "beats_list": render_beats_for_director(input.beats, input.beats_done),
             });
             let prompt =
                 match crate::llm::prompts::render(crate::llm::prompts::DIRECTOR_DECIDE, &ctx) {
@@ -149,6 +176,14 @@ pub async fn decide(
             };
 
             let terminate = value["terminate"].as_bool().unwrap_or(false);
+            // 越界或已消费的下标一律视为无效，由引擎回退到第一个未消费情节。
+            let beat_index = value
+                .get("next_beat")
+                .and_then(Value::as_u64)
+                .and_then(|raw| usize::try_from(raw).ok())
+                .filter(|index| {
+                    input.beats.get(*index).is_some() && !input.beats_done.contains(index)
+                });
             // terminate 优先：两者同时出现时直接收尾，绝不进入等待输入。
             let request_input = if terminate {
                 None
@@ -206,6 +241,7 @@ pub async fn decide(
 
             DirectorDecision {
                 actor_id,
+                beat_index,
                 hint,
                 terminate,
                 request_input,
@@ -221,6 +257,7 @@ pub fn decision_event_payload(decision: &DirectorDecision, step: u32) -> Value {
     json!({
         "step": step,
         "next_actor_id": decision.actor_id,
+        "beat_index": decision.beat_index,
         "reason": decision.hint.clone().unwrap_or_default(),
         "hint": decision.hint,
     })
