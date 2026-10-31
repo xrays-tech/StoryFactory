@@ -105,7 +105,8 @@ pub fn actor_cards_brief(cards: &[AgentCard]) -> String {
         .iter()
         .map(|c| {
             format!(
-                "- {}（{}）：{}",
+                "- id={}｜{}（{}）：{}",
+                c.id,
                 c.name,
                 c.role_type,
                 c.current_goal.as_deref().unwrap_or("暂无明确目标")
@@ -301,4 +302,42 @@ pub async fn maybe_compress(
     .await?;
     tx.commit().await.map_err(db_err)?;
     Ok(Some(until_seq))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card(id: &str, name: &str, goal: Option<&str>) -> AgentCard {
+        AgentCard {
+            id: id.to_string(),
+            name: name.to_string(),
+            role_type: "support".to_string(),
+            appearance: None,
+            personality: None,
+            hidden_personality: None,
+            biography: None,
+            current_goal: goal.map(str::to_string),
+            speaking_style: None,
+        }
+    }
+
+    #[test]
+    fn actor_cards_brief_includes_id_and_name() {
+        let cards = vec![
+            card(
+                "0123456789abcdef0123456789abcdef",
+                "角色A",
+                Some("找回失物"),
+            ),
+            card("fedcba9876543210fedcba9876543210", "角色B", None),
+        ];
+
+        let text = actor_cards_brief(&cards);
+
+        assert_eq!(
+            text,
+            "- id=0123456789abcdef0123456789abcdef｜角色A（support）：找回失物\n- id=fedcba9876543210fedcba9876543210｜角色B（support）：暂无明确目标"
+        );
+    }
 }

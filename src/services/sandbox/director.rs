@@ -56,6 +56,29 @@ fn roundrobin(
     }
 }
 
+fn resolve_actor_id(raw: &str, actor_ids: &[String], cards: &[AgentCard]) -> Option<String> {
+    let candidate = raw.trim();
+    if candidate.is_empty() {
+        return None;
+    }
+    if let Some(id) = actor_ids
+        .iter()
+        .find(|id| id.eq_ignore_ascii_case(candidate))
+    {
+        return Some(id.clone());
+    }
+    if let Some(card) = cards
+        .iter()
+        .find(|card| card.id.eq_ignore_ascii_case(candidate))
+    {
+        return Some(card.id.clone());
+    }
+    cards
+        .iter()
+        .find(|card| card.name.trim().to_lowercase() == candidate.to_lowercase())
+        .map(|card| card.id.clone())
+}
+
 pub async fn decide(
     input: &DirectorInput<'_>,
     cfg: &AppConfig,
@@ -152,16 +175,17 @@ pub async fn decide(
                 .as_str()
                 .map(str::to_string)
                 .or_else(|| value["reason"].as_str().map(str::to_string));
-            let mut actor_id = value["next_actor_id"].as_str().unwrap_or("").to_string();
-
-            let mut fallback = false;
-            let mut reason = None;
-            if !input.actor_ids.iter().any(|id| id == &actor_id) {
-                actor_id =
-                    roundrobin(input, true, Some("导演选择了不在场角色".to_string())).actor_id;
-                fallback = true;
-                reason = Some("导演选择了不在场角色".to_string());
-            }
+            let raw_actor_id = value["next_actor_id"].as_str().unwrap_or("");
+            let (mut actor_id, mut fallback, mut reason) =
+                match resolve_actor_id(raw_actor_id, input.actor_ids, input.cards) {
+                    Some(actor_id) => (actor_id, false, None),
+                    None => {
+                        let shown: String = raw_actor_id.trim().chars().take(40).collect();
+                        let cause = format!("导演返回了无法识别的角色标识：{shown}");
+                        let actor_id = roundrobin(input, true, Some(cause.clone())).actor_id;
+                        (actor_id, true, Some(cause))
+                    }
+                };
             if input.last_actor == Some(actor_id.as_str())
                 && input.consecutive >= cfg.sandbox.director_repeat_limit
             {
@@ -196,4 +220,91 @@ pub fn decision_event_payload(decision: &DirectorDecision, step: u32) -> Value {
         "reason": decision.hint.clone().unwrap_or_default(),
         "hint": decision.hint,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn card(id: &str, name: &str) -> AgentCard {
+        AgentCard {
+            id: id.to_string(),
+            name: name.to_string(),
+            role_type: "support".to_string(),
+            appearance: None,
+            personality: None,
+            hidden_personality: None,
+            biography: None,
+            current_goal: None,
+            speaking_style: None,
+        }
+    }
+
+    #[test]
+    fn resolve_actor_id_matches_exact_and_case_insensitive_id() {
+        let actor_ids = vec!["A1B2C3".to_string(), "d4e5f6".to_string()];
+        let cards = vec![card("A1B2C3", "甲"), card("d4e5f6", "乙")];
+
+        assert_eq!(
+            resolve_actor_id("A1B2C3", &actor_ids, &cards).as_deref(),
+            Some("A1B2C3")
+        );
+        assert_eq!(
+            resolve_actor_id("a1b2c3", &actor_ids, &cards).as_deref(),
+            Some("A1B2C3")
+        );
+    }
+
+    #[test]
+    fn resolve_actor_id_matches_card_id_when_actor_list_misses() {
+        let actor_ids: Vec<String> = Vec::new();
+        let cards = vec![card("CARD-1", "甲")];
+
+        assert_eq!(
+            resolve_actor_id("CARD-1", &actor_ids, &cards).as_deref(),
+            Some("CARD-1")
+        );
+    }
+
+    #[test]
+    fn resolve_actor_id_matches_name() {
+        let actor_ids = vec!["id-a".to_string()];
+        let cards = vec![card("id-a", "角色A")];
+
+        assert_eq!(
+            resolve_actor_id("角色A", &actor_ids, &cards).as_deref(),
+            Some("id-a")
+        );
+    }
+
+    #[test]
+    fn resolve_actor_id_matches_name_with_surrounding_spaces() {
+        let actor_ids = vec!["id-a".to_string()];
+        let cards = vec![card("id-a", " 角色A ")];
+
+        assert_eq!(
+            resolve_actor_id("  角色A  ", &actor_ids, &cards).as_deref(),
+            Some("id-a")
+        );
+    }
+
+    #[test]
+    fn resolve_actor_id_returns_none_for_unknown_value() {
+        let actor_ids = vec!["id-a".to_string()];
+        let cards = vec![card("id-a", "角色A")];
+
+        assert_eq!(resolve_actor_id("并不存在", &actor_ids, &cards), None);
+        assert_eq!(resolve_actor_id("", &actor_ids, &cards), None);
+    }
+
+    #[test]
+    fn resolve_actor_id_uses_first_card_on_duplicate_names() {
+        let actor_ids = vec!["id-1".to_string(), "id-2".to_string()];
+        let cards = vec![card("id-1", "同名"), card("id-2", "同名")];
+
+        assert_eq!(
+            resolve_actor_id("同名", &actor_ids, &cards).as_deref(),
+            Some("id-1")
+        );
+    }
 }

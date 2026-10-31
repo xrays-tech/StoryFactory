@@ -200,6 +200,127 @@ async fn director_mode_uses_llm_decision() {
 }
 
 #[tokio::test]
+async fn director_mode_accepts_actor_name_as_next_actor_id() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    provider.push_ok(json!({ "next_actor_id": "角色B", "reason": "冲突" }).to_string());
+    provider.push_ok(actor_json("B 的行动"));
+    provider.push_ok(outline_text());
+    let state = test_state_with_chain(Some(ProviderChain::new(
+        vec![provider],
+        0,
+        Duration::from_secs(2),
+    )))
+    .await;
+    let (nid, actors, cid) = base_novel(&state).await;
+    let actor_ids: Vec<String> = actors.split(',').map(str::to_string).collect();
+    let expected_actor = actor_ids[1].clone();
+    let req = CreateSessionReq {
+        actor_ids,
+        mode: DirectorMode::Director,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+    let done = wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+    assert_eq!(done.current_step, 1);
+
+    let action_payload: String = sqlx::query_scalar(
+        "SELECT payload FROM sandbox_events WHERE session_id = ? AND event_type = 'actor_action' LIMIT 1",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    let action: serde_json::Value = serde_json::from_str(&action_payload).unwrap();
+    assert_eq!(
+        action["actor_id"], expected_actor,
+        "导演返回姓名时必须解析为对应角色 id"
+    );
+
+    let fallbacks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? AND event_type = 'director_fallback'",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(fallbacks, 0, "姓名可解析时不应降级");
+
+    let decision_payload: String = sqlx::query_scalar(
+        "SELECT payload FROM sandbox_events WHERE session_id = ? AND event_type = 'director_decision' LIMIT 1",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    let decision: serde_json::Value = serde_json::from_str(&decision_payload).unwrap();
+    assert_eq!(decision["next_actor_id"], expected_actor);
+}
+
+#[tokio::test]
+async fn director_mode_falls_back_on_unknown_actor_identifier() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    provider.push_ok(json!({ "next_actor_id": "完全不存在", "reason": "冲突" }).to_string());
+    provider.push_ok(actor_json("轮转行动"));
+    provider.push_ok(outline_text());
+    let state = test_state_with_chain(Some(ProviderChain::new(
+        vec![provider],
+        0,
+        Duration::from_secs(2),
+    )))
+    .await;
+    let (nid, actors, cid) = base_novel(&state).await;
+    let actor_ids: Vec<String> = actors.split(',').map(str::to_string).collect();
+    let expected_actor = actor_ids[0].clone();
+    let req = CreateSessionReq {
+        actor_ids,
+        mode: DirectorMode::Director,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let cause: String = sqlx::query_scalar(
+        "SELECT json_extract(payload, '$.cause') FROM sandbox_events WHERE session_id = ? AND event_type = 'director_fallback' LIMIT 1",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert!(
+        cause.contains("无法识别"),
+        "降级原因应标明无法识别: {cause}"
+    );
+    assert!(
+        cause.contains("完全不存在"),
+        "降级原因应包含模型原始值: {cause}"
+    );
+
+    let action_payload: String = sqlx::query_scalar(
+        "SELECT payload FROM sandbox_events WHERE session_id = ? AND event_type = 'actor_action' LIMIT 1",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    let action: serde_json::Value = serde_json::from_str(&action_payload).unwrap();
+    assert_eq!(action["actor_id"], expected_actor, "应降级为轮转选角");
+}
+
+#[tokio::test]
 async fn step_executes_one_step_and_stays_paused() {
     let state = test_state_with_chain(Some(mock_chain(vec![actor_json("单步行动")]))).await;
     let (nid, actors, cid) = base_novel(&state).await;

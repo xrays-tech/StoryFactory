@@ -6,15 +6,16 @@
     "inject_scene_hint": "给该角色的暗示（可选）",
     "terminate": true/false（剧情自然收束时为 true）,
     "request_user_input": {"question": "...", "suggestions": [...]}（必须由用户裁决的分叉时使用，可选）}
-2. 选择依据优先级：戏剧冲突潜力 > 角色未完成诉求（current_goal）> 情感张力变化 > 轮换公平。
-3. 同一角色连续行动不超过 {{ repeat_limit }} 步；已连续 {{ consecutive_steps }} 步的角色尽量避免再选。
-4. 场景目标已达成、冲突已解决或剧情自然到达收束点时 terminate=true。
-5. 出现关键分叉（生死抉择、重大立场转变）且没有明确倾向时，用 request_user_input 交给用户。
+2. next_actor_id 必须严格等于下面「在场角色」列表中给出的 id= 后的字符串（32 位十六进制），禁止填姓名或自造 id。
+3. 选择依据优先级：戏剧冲突潜力 > 角色未完成诉求（current_goal）> 情感张力变化 > 轮换公平。
+4. 同一角色连续行动不超过 {{ repeat_limit }} 步；已连续 {{ consecutive_steps }} 步的角色尽量避免再选。
+5. 场景目标已达成、冲突已解决或剧情自然到达收束点时 terminate=true。
+6. 出现关键分叉（生死抉择、重大立场转变）且没有明确倾向时，用 request_user_input 交给用户。
 
 # 场景
 {{ scene }}
 
-# 在场角色（含各自 current_goal）
+# 在场角色（每行给出 id、姓名、角色类型与 current_goal）
 {{ actor_cards_brief }}
 
 # 情感矩阵
