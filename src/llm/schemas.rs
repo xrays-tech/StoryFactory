@@ -113,7 +113,7 @@ pub fn novel_chunk_schema() -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["a", "b"],
+                    "required": ["a", "b", "affinity", "trust"],
                     "properties": {
                         "a": { "type": "string" },
                         "b": { "type": "string" },

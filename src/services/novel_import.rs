@@ -695,7 +695,13 @@ async fn call_chunk(
         token,
     )
     .await?;
-    serde_json::from_value(value).map_err(|e| RunError::Failed(format!("分块结果解析失败: {e}")))
+    // 解析失败等同于输出不合格：交给上层二分/跳过，避免单块拖垮整个导入。
+    serde_json::from_value(value).map_err(|e| {
+        RunError::Llm(LlmError::new(
+            LlmErrorKind::InvalidOutput,
+            format!("分块结果解析失败: {e}"),
+        ))
+    })
 }
 
 fn merge_chunk_outcomes(left: ChunkOutcome, right: ChunkOutcome) -> ChunkOutcome {

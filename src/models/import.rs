@@ -133,7 +133,10 @@ pub struct PreviewRelation {
     pub a: String,
     pub b: String,
     pub conflict_desc: Option<String>,
+    // 模型可能漏字段（schema 里非必填时），缺省按 0 处理而不是让整块解析失败。
+    #[serde(default)]
     pub affinity: i64,
+    #[serde(default)]
     pub trust: i64,
 }
 
@@ -144,6 +147,7 @@ pub struct PreviewItem {
     pub description: Option<String>,
     pub features: Option<String>,
     pub owner: Option<String>,
+    #[serde(default)]
     pub importance: i64,
 }
 

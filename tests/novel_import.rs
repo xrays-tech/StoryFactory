@@ -1179,3 +1179,16 @@ async fn novel_import_status_parses_all_values() {
         assert_eq!(parsed.to_db(), raw);
     }
 }
+
+#[test]
+fn preview_models_tolerate_missing_optional_numbers() {
+    use story_architect::models::import::{PreviewItem, PreviewRelation};
+
+    let relation: PreviewRelation = serde_json::from_value(json!({ "a": "祖安", "b": "郑旦" }))
+        .expect("缺 affinity/trust 时应回退为 0 而不是报错");
+    assert_eq!((relation.affinity, relation.trust), (0, 0));
+
+    let item: PreviewItem =
+        serde_json::from_value(json!({ "name": "洗髓丹" })).expect("缺 importance 时应回退为 0");
+    assert_eq!(item.importance, 0);
+}
