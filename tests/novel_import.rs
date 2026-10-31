@@ -890,6 +890,68 @@ fn split_into_chapters_handles_variants() {
 }
 
 #[test]
+fn split_into_chapters_supports_zhengwen_sections() {
+    let mut raw = String::from("正文 1\n");
+    raw.push_str(&"甲".repeat(300));
+    raw.push_str("\n正文 2\n");
+    raw.push_str(&"乙".repeat(300));
+    raw.push_str("\n后记\n");
+    raw.push_str(&"丙".repeat(300));
+
+    let chapters = split_into_chapters(&raw);
+    let titles: Vec<&str> = chapters
+        .iter()
+        .map(|chapter| chapter.title.as_str())
+        .collect();
+    assert_eq!(titles, vec!["正文 1", "正文 2", "后记"]);
+    assert_eq!(chapters.len(), 3);
+    assert!(chapters[0].text.contains('甲'));
+    assert!(chapters[1].text.contains('乙'));
+    assert!(chapters[2].text.contains('丙'));
+
+    let single = format!("正文 1\n{}", "丁".repeat(50));
+    let chapters = split_into_chapters(&single);
+    assert_eq!(chapters.len(), 1, "只有 正文 1 也应切出一章");
+    assert_eq!(chapters[0].title, "正文 1");
+}
+
+#[test]
+fn split_into_chapters_ignores_inline_keywords() {
+    let mut raw = String::from("正文 1\n");
+    raw.push_str(&"甲".repeat(300));
+    raw.push('\n');
+    raw.push_str("他翻到正文的最后一页，忽然想起后记里写过的那句意味深长的话。\n");
+    raw.push_str("正文里提到的后记其实并不存在，只是作者留下的一个谜题而已。\n");
+    raw.push_str("前面还有一句话 正文 3 后面继续正文内容。\n");
+    raw.push_str("正文\n");
+    raw.push_str("后记 里还有很多未说完的故事与人物命运的补充说明。\n");
+
+    let chapters = split_into_chapters(&raw);
+    assert_eq!(chapters.len(), 1, "正文句子中的关键词不应切章");
+    assert_eq!(chapters[0].title, "正文 1");
+    assert!(chapters[0].text.contains("后记里写过"));
+    assert!(chapters[0].text.contains("前面还有一句话"));
+}
+
+#[test]
+fn split_into_chapters_supports_front_matter_variants() {
+    let mut raw = String::from("楔子\n");
+    raw.push_str(&"甲".repeat(120));
+    raw.push_str("\n序章\n");
+    raw.push_str(&"乙".repeat(120));
+    raw.push_str("\n尾声\n");
+    raw.push_str(&"丙".repeat(120));
+
+    let chapters = split_into_chapters(&raw);
+    let titles: Vec<&str> = chapters
+        .iter()
+        .map(|chapter| chapter.title.as_str())
+        .collect();
+    assert_eq!(titles, vec!["楔子", "序章", "尾声"]);
+    assert_eq!(chapters.len(), 3);
+}
+
+#[test]
 fn long_chapter_splits_without_crossing_boundary() {
     let mut raw = String::from("第1章 长\n");
     raw.push_str(&"甲".repeat(15_000));

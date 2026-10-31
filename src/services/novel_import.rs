@@ -1409,16 +1409,52 @@ fn is_english_chapter_heading(content: &str) -> bool {
     (1..=8).contains(&digits)
 }
 
+/// 新增独立标题行的最大长度（去首尾空白后的字符数）。
+/// 正文里出现「正文」「后记」等词的长句不应被当成标题。
+const EXTRA_HEADING_MAX_CHARS: usize = 20;
+
+/// 可单独成章的固定标题词，允许带可选编号（如「楔子一」「后记 2」）。
+const EXTRA_NAMED_HEADINGS: [&str; 6] = ["楔子", "序章", "序幕", "尾声", "终章", "后记"];
+
+/// `正文 N`：前缀后只允许 1-4 位阿拉伯数字，可带半角/全角空白。
+fn is_zhengwen_heading(content: &str) -> bool {
+    let Some(rest) = content.strip_prefix("正文") else {
+        return false;
+    };
+    let rest = rest.trim();
+    let digits = rest.chars().count();
+    (1..=4).contains(&digits) && rest.chars().all(|c| c.is_ascii_digit())
+}
+
+/// 固定标题词，可带可选编号；编号复用章节数字规则（阿拉伯/中文数字）。
+fn is_named_heading(content: &str) -> bool {
+    EXTRA_NAMED_HEADINGS.iter().any(|keyword| {
+        let Some(rest) = content.strip_prefix(keyword) else {
+            return false;
+        };
+        let rest = rest.trim();
+        rest.is_empty() || rest.chars().all(is_chapter_numeral)
+    })
+}
+
+fn is_extra_heading(content: &str) -> bool {
+    content.chars().count() <= EXTRA_HEADING_MAX_CHARS
+        && (is_zhengwen_heading(content) || is_named_heading(content))
+}
+
 /// 识别章节标题行；返回去除 Markdown `#` 与首尾空白后的原始标题。
+/// 标题逐字保留，不做序号改写。
 fn parse_chapter_heading(line: &str) -> Option<String> {
     let content = line.trim().trim_start_matches('#').trim_start();
     if content.is_empty() {
         return None;
     }
-    if !is_chinese_chapter_heading(content) && !is_english_chapter_heading(content) {
+    let content = content.trim_end();
+    let known = is_chinese_chapter_heading(content) || is_english_chapter_heading(content);
+    if !known && !is_extra_heading(content) {
         return None;
     }
-    Some(content.trim_end().to_string())
+    Some(content.to_string())
 }
 
 fn push_source_chapter(
