@@ -327,3 +327,124 @@ async fn draft_prompt_includes_pov_and_defaults_to_third_person() {
         .expect("default prose prompt");
     assert!(first_prompt.contains("第三人称"), "prompt: {first_prompt}");
 }
+
+#[tokio::test]
+async fn draft_falls_back_to_novel_style() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let sample = "参考范文：雨落长街，灯火次第熄灭。";
+    sqlx::query(
+        "UPDATE novels SET style_name = ?, style_sample = ?, style_instruction = ?, pov = ? \
+         WHERE id = ?",
+    )
+    .bind("冷峻武侠")
+    .bind(sample)
+    .bind("多用短句")
+    .bind("第一人称")
+    .bind(&fixture.novel_id)
+    .execute(&fixture.pool)
+    .await
+    .expect("set novel style");
+
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..3 {
+        mock.push_ok("第一人称正文。");
+    }
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(&fixture.novel_id, &fixture.chapter_id, draft_request(900))
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+
+    let system = mock.last_system_prompt().expect("system prompt");
+    assert!(system.contains(sample), "system prompt: {system}");
+    assert!(system.contains("冷峻武侠"), "system prompt: {system}");
+
+    let prompts: Vec<String> = mock
+        .captured_requests()
+        .into_iter()
+        .flat_map(|(_, messages)| messages)
+        .filter(|message| message.role == story_architect::llm::MessageRole::User)
+        .map(|message| message.content)
+        .collect();
+    assert!(!prompts.is_empty(), "expected prose requests");
+    for prompt in &prompts {
+        assert!(prompt.contains("第一人称"), "prompt: {prompt}");
+        assert!(prompt.contains("多用短句"), "prompt: {prompt}");
+    }
+
+    // 草稿快照实际使用的文风，便于任务追溯
+    let (style_name, style_sample, instruction, pov): (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT style_name, style_sample, instruction, pov FROM chapter_drafts WHERE id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("draft style snapshot");
+    assert_eq!(style_name.as_deref(), Some("冷峻武侠"));
+    assert_eq!(style_sample.as_deref(), Some(sample));
+    assert_eq!(instruction.as_deref(), Some("多用短句"));
+    assert_eq!(pov.as_deref(), Some("第一人称"));
+}
+
+#[tokio::test]
+async fn draft_request_overrides_novel_style() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let novel_sample = "小说档案里的范文，不应出现在本次请求。";
+    sqlx::query("UPDATE novels SET style_sample = ?, pov = ? WHERE id = ?")
+        .bind(novel_sample)
+        .bind("第一人称")
+        .bind(&fixture.novel_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("set novel style");
+
+    let request_sample = "请求指定的范文：月光落在剑刃上。";
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..3 {
+        mock.push_ok("正文。");
+    }
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(
+            &fixture.novel_id,
+            &fixture.chapter_id,
+            CreateDraftReq {
+                style_sample: Some(request_sample.to_string()),
+                pov: Some("第三人称".to_string()),
+                ..draft_request(900)
+            },
+        )
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+
+    let system = mock.last_system_prompt().expect("system prompt");
+    assert!(system.contains(request_sample), "system prompt: {system}");
+    assert!(!system.contains(novel_sample), "system prompt: {system}");
+
+    let first_prompt = mock
+        .captured_requests()
+        .into_iter()
+        .flat_map(|(_, messages)| messages)
+        .find(|message| message.role == story_architect::llm::MessageRole::User)
+        .map(|message| message.content)
+        .expect("prose prompt");
+    assert!(first_prompt.contains("第三人称"), "prompt: {first_prompt}");
+
+    let (sample, pov): (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT style_sample, pov FROM chapter_drafts WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(&fixture.pool)
+            .await
+            .expect("draft style snapshot");
+    assert_eq!(sample.as_deref(), Some(request_sample));
+    assert_eq!(pov.as_deref(), Some("第三人称"));
+}

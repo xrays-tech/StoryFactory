@@ -6,6 +6,7 @@ import * as api from "../api/endpoints";
 import { EventStream, type StreamState } from "../api/eventStream";
 import { newIdempotencyKey } from "../api/client";
 import { userMessage } from "../lib/errors";
+import type { DraftPov } from "../lib/draftStyle";
 import { useUiStore } from "./uiStore";
 import { useChapterContentStore } from "./chapterContentStore";
 import { zh } from "../copy/zh";
@@ -15,7 +16,7 @@ export type DraftPrefs = {
   style_sample: string | null;
   instruction: string | null;
   target_words: number;
-  pov: "第一人称" | "第三人称";
+  pov: DraftPov | null;
 };
 
 type ChapterDraftState = {
@@ -120,8 +121,8 @@ function toBody(prefs: DraftPrefs): api.CreateChapterDraftBody {
     style_sample: prefs.style_sample?.trim() || null,
     instruction: prefs.instruction?.trim() || null,
     target_words: prefs.target_words,
-    // 留空表示第三人称，避免把默认值写死进后端枚举。
-    pov: prefs.pov === "第一人称" ? "第一人称" : null,
+    // null 表示沿用小说档案（未设置时由后端回退到第三人称）。
+    pov: prefs.pov,
   };
 }
 

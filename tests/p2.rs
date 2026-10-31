@@ -688,3 +688,83 @@ async fn create_returns_location_header() {
         Some(format!("/api/v1/novels/{id}").as_str())
     );
 }
+
+#[tokio::test]
+async fn novel_style_fields_persist_and_clear() {
+    let app = test_app(test_state().await);
+    let id = create_novel(&app, "文风档案").await;
+    let uri = format!("/api/v1/novels/{id}");
+
+    let (status, updated) = call(
+        &app,
+        Method::PATCH,
+        &uri,
+        Some(json!({
+            "style_name": "冷峻武侠",
+            "style_sample": "月光如刀，刀光如雪。",
+            "style_instruction": "多用短句，少用形容词。",
+            "pov": "第一人称"
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["style_name"], "冷峻武侠");
+    assert_eq!(updated["style_sample"], "月光如刀，刀光如雪。");
+    assert_eq!(updated["style_instruction"], "多用短句，少用形容词。");
+    assert_eq!(updated["pov"], "第一人称");
+
+    let (status, fetched) = call(&app, Method::GET, &uri, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fetched["style_name"], "冷峻武侠");
+    assert_eq!(fetched["style_sample"], "月光如刀，刀光如雪。");
+    assert_eq!(fetched["style_instruction"], "多用短句，少用形容词。");
+    assert_eq!(fetched["pov"], "第一人称");
+
+    // 空白串 = 清空；未出现的字段保持原值
+    let (status, cleared) = call(
+        &app,
+        Method::PATCH,
+        &uri,
+        Some(json!({ "style_name": "   ", "pov": "" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{cleared}");
+    assert!(cleared["style_name"].is_null());
+    assert!(cleared["pov"].is_null());
+    assert_eq!(cleared["style_sample"], "月光如刀，刀光如雪。");
+    assert_eq!(cleared["style_instruction"], "多用短句，少用形容词。");
+
+    // 非法叙述人称 → 422，且不落库
+    let (status, rejected) = call(
+        &app,
+        Method::PATCH,
+        &uri,
+        Some(json!({ "pov": "第二人称" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "validation_failed");
+    let (_, after) = call(&app, Method::GET, &uri, None).await;
+    assert!(after["pov"].is_null());
+    assert_eq!(after["style_sample"], "月光如刀，刀光如雪。");
+}
+
+#[tokio::test]
+async fn novel_style_rejects_too_long_fields() {
+    let app = test_app(test_state().await);
+    let id = create_novel(&app, "超长文风").await;
+    let uri = format!("/api/v1/novels/{id}");
+
+    let (status, rejected) = call(
+        &app,
+        Method::PATCH,
+        &uri,
+        Some(json!({ "style_sample": "风".repeat(6001) })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+    assert_eq!(rejected["error"]["code"], "validation_failed");
+
+    let (_, fetched) = call(&app, Method::GET, &uri, None).await;
+    assert!(fetched["style_sample"].is_null());
+}

@@ -9,7 +9,8 @@ use crate::models::enums::NovelStatus;
 use crate::services::search;
 use crate::services::util::{db_err, invalid, not_found, push_len, push_required};
 
-const COLS: &str = "id, title, background, world_view, summary, status, created_at, updated_at";
+const COLS: &str = "id, title, background, world_view, summary, style_name, style_sample, \
+     style_instruction, pov, status, created_at, updated_at";
 
 #[derive(sqlx::FromRow)]
 struct NovelRow {
@@ -18,6 +19,10 @@ struct NovelRow {
     background: Option<String>,
     world_view: Option<String>,
     summary: Option<String>,
+    style_name: Option<String>,
+    style_sample: Option<String>,
+    style_instruction: Option<String>,
+    pov: Option<String>,
     status: String,
     created_at: i64,
     updated_at: i64,
@@ -30,6 +35,10 @@ fn dto(row: NovelRow) -> NovelDto {
         background: row.background,
         world_view: row.world_view,
         summary: row.summary,
+        style_name: row.style_name,
+        style_sample: row.style_sample,
+        style_instruction: row.style_instruction,
+        pov: row.pov,
         status: NovelStatus::from_db_or_default(row.status),
         created_at: row.created_at,
         updated_at: row.updated_at,
@@ -49,13 +58,31 @@ fn fts_body(d: &NovelDto) -> String {
     .join("\n")
 }
 
-fn validate(
-    title: Option<&str>,
-    background: Option<&str>,
-    world_view: Option<&str>,
-    summary: Option<&str>,
+/// 一次请求里参与校验的小说字段（None = 未出现，不校验）。
+struct NovelFields<'a> {
+    title: Option<&'a str>,
+    background: Option<&'a str>,
+    world_view: Option<&'a str>,
+    summary: Option<&'a str>,
+    style_name: Option<&'a str>,
+    style_sample: Option<&'a str>,
+    style_instruction: Option<&'a str>,
+    pov: Option<&'a str>,
     require_title: bool,
-) -> Result<(), AppError> {
+}
+
+fn validate(fields: NovelFields<'_>) -> Result<(), AppError> {
+    let NovelFields {
+        title,
+        background,
+        world_view,
+        summary,
+        style_name,
+        style_sample,
+        style_instruction,
+        pov,
+        require_title,
+    } = fields;
     let mut errs: Vec<(&'static str, String)> = Vec::new();
     if require_title || title.is_some() {
         match title {
@@ -66,10 +93,34 @@ fn validate(
     push_len(&mut errs, "background", background, 20000);
     push_len(&mut errs, "world_view", world_view, 20000);
     push_len(&mut errs, "summary", summary, 20000);
+    push_len(&mut errs, "style_name", style_name.map(str::trim), 40);
+    push_len(&mut errs, "style_sample", style_sample.map(str::trim), 6000);
+    push_len(
+        &mut errs,
+        "style_instruction",
+        style_instruction.map(str::trim),
+        1000,
+    );
+    if let Some(value) = pov {
+        let normalized = value.trim();
+        if !normalized.is_empty() && !matches!(normalized, "第一人称" | "第三人称") {
+            errs.push(("pov", "pov 仅支持「第一人称」或「第三人称」".to_string()));
+        }
+    }
     if errs.is_empty() {
         Ok(())
     } else {
         Err(invalid(errs))
+    }
+}
+
+/// 部分更新中的可清空文本：全空白视为清空（NULL），否则 trim 后覆盖。
+fn clearable(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -142,13 +193,17 @@ pub async fn list(
 }
 
 pub async fn create(pool: &SqlitePool, req: CreateNovelReq) -> Result<NovelDto, AppError> {
-    validate(
-        Some(&req.title),
-        req.background.as_deref(),
-        req.world_view.as_deref(),
-        req.summary.as_deref(),
-        true,
-    )?;
+    validate(NovelFields {
+        title: Some(&req.title),
+        background: req.background.as_deref(),
+        world_view: req.world_view.as_deref(),
+        summary: req.summary.as_deref(),
+        style_name: None,
+        style_sample: None,
+        style_instruction: None,
+        pov: None,
+        require_title: true,
+    })?;
 
     let mut tx = db::begin_immediate(pool).await.map_err(db_err)?;
     let id: String = sqlx::query_scalar(
@@ -192,47 +247,76 @@ pub async fn update(
     id: &str,
     req: UpdateNovelReq,
 ) -> Result<NovelDto, AppError> {
-    validate(
-        req.title.as_deref(),
-        req.background.as_deref(),
-        req.world_view.as_deref(),
-        req.summary.as_deref(),
-        false,
-    )?;
+    validate(NovelFields {
+        title: req.title.as_deref(),
+        background: req.background.as_deref(),
+        world_view: req.world_view.as_deref(),
+        summary: req.summary.as_deref(),
+        style_name: req.style_name.as_deref(),
+        style_sample: req.style_sample.as_deref(),
+        style_instruction: req.style_instruction.as_deref(),
+        pov: req.pov.as_deref(),
+        require_title: false,
+    })?;
     let mut tx = db::begin_immediate(pool).await.map_err(db_err)?;
-    let current = sqlx::query_as::<_, NovelRow>(&format!(
-        "SELECT {COLS} FROM novels WHERE id = ? AND deleted_at IS NULL"
-    ))
-    .bind(id)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(db_err)?;
-    let current = match current {
-        Some(c) => c,
-        None => {
-            tx.rollback().await.map_err(db_err)?;
-            return Err(not_found(ErrorCode::NovelNotFound, "小说不存在或已删除"));
-        }
-    };
+    let exists: Option<i64> =
+        sqlx::query_scalar("SELECT 1 FROM novels WHERE id = ? AND deleted_at IS NULL")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+    if exists.is_none() {
+        tx.rollback().await.map_err(db_err)?;
+        return Err(not_found(ErrorCode::NovelNotFound, "小说不存在或已删除"));
+    }
 
-    let title = req.title.unwrap_or(current.title);
-    let background = req.background.or(current.background);
-    let world_view = req.world_view.or(current.world_view);
-    let summary = req.summary.or(current.summary);
-    let status = req.status.map(NovelStatus::to_db).unwrap_or(current.status);
+    // 部分更新：仅把请求里出现的字段拼进 SET；None = 不改。
+    let mut sets: Vec<&'static str> = Vec::new();
+    let mut values: Vec<Option<String>> = Vec::new();
+    if let Some(title) = req.title {
+        sets.push("title = ?");
+        values.push(Some(title));
+    }
+    if let Some(background) = req.background {
+        sets.push("background = ?");
+        values.push(Some(background));
+    }
+    if let Some(world_view) = req.world_view {
+        sets.push("world_view = ?");
+        values.push(Some(world_view));
+    }
+    if let Some(summary) = req.summary {
+        sets.push("summary = ?");
+        values.push(Some(summary));
+    }
+    if let Some(style_name) = req.style_name {
+        sets.push("style_name = ?");
+        values.push(clearable(style_name));
+    }
+    if let Some(style_sample) = req.style_sample {
+        sets.push("style_sample = ?");
+        values.push(clearable(style_sample));
+    }
+    if let Some(style_instruction) = req.style_instruction {
+        sets.push("style_instruction = ?");
+        values.push(clearable(style_instruction));
+    }
+    if let Some(pov) = req.pov {
+        sets.push("pov = ?");
+        values.push(clearable(pov));
+    }
+    if let Some(status) = req.status {
+        sets.push("status = ?");
+        values.push(Some(NovelStatus::to_db(status)));
+    }
+    sets.push("updated_at = strftime('%s','now')");
 
-    sqlx::query(
-        "UPDATE novels SET title = ?, background = ?, world_view = ?, summary = ?, status = ?, updated_at = strftime('%s','now') WHERE id = ?",
-    )
-    .bind(&title)
-    .bind(&background)
-    .bind(&world_view)
-    .bind(&summary)
-    .bind(&status)
-    .bind(id)
-    .execute(&mut *tx)
-    .await
-    .map_err(db_err)?;
+    let sql = format!("UPDATE novels SET {} WHERE id = ?", sets.join(", "));
+    let mut update = sqlx::query(&sql);
+    for value in &values {
+        update = update.bind(value);
+    }
+    update.bind(id).execute(&mut *tx).await.map_err(db_err)?;
 
     let row = sqlx::query_as::<_, NovelRow>(&format!("SELECT {COLS} FROM novels WHERE id = ?"))
         .bind(id)

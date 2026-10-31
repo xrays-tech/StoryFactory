@@ -44,6 +44,16 @@ const DRAFT_COLS: &str =
     "id, chapter_id, status, stage, progress, style_name, target_words, message, error, \
      created_at, updated_at";
 
+/// 章节大纲 + 小说文风档案（一次查询完成回退所需的读取）。
+#[derive(sqlx::FromRow)]
+struct ChapterStyleRow {
+    final_outline: Option<String>,
+    style_name: Option<String>,
+    style_sample: Option<String>,
+    style_instruction: Option<String>,
+    pov: Option<String>,
+}
+
 /// 后台任务注册表：取消令牌 + 并发闸。
 #[derive(Clone)]
 pub struct DraftRegistry {
@@ -118,8 +128,9 @@ impl DraftRegistry {
         chapter_id: &str,
         req: CreateDraftReq,
     ) -> Result<DraftJob, AppError> {
-        let outline: Option<Option<String>> = sqlx::query_scalar(
-            "SELECT c.final_outline FROM chapters c \
+        let chapter = sqlx::query_as::<_, ChapterStyleRow>(
+            "SELECT c.final_outline, n.style_name, n.style_sample, n.style_instruction, n.pov \
+             FROM chapters c \
              JOIN novels n ON n.id = c.novel_id \
              WHERE c.id = ? AND c.novel_id = ? AND c.deleted_at IS NULL AND n.deleted_at IS NULL",
         )
@@ -129,10 +140,11 @@ impl DraftRegistry {
         .await
         .map_err(db_err)?;
 
-        let Some(outline) = outline else {
+        let Some(chapter) = chapter else {
             return Err(not_found(ErrorCode::ChapterNotFound, "章节不存在或已删除"));
         };
-        if outline
+        if chapter
+            .final_outline
             .as_deref()
             .map(str::trim)
             .filter(|text| !text.is_empty())
@@ -144,12 +156,22 @@ impl DraftRegistry {
             ));
         }
 
+        // 文风优先级：请求 > 小说档案 > 默认（叙述人称默认第三人称，在 ProseContext 处理）。
         let target_words = clamp_target_words(req.target_words);
         let mut message = None;
-        let style_sample = normalize_style_sample(req.style_sample, &mut message);
-        let style_name = normalize_optional_text(req.style_name, usize::MAX);
-        let instruction = normalize_optional_text(req.instruction, MAX_INSTRUCTION_CHARS);
-        let pov = normalize_optional_text(req.pov, 20);
+        let style_sample = normalize_style_sample(
+            first_non_blank(req.style_sample, chapter.style_sample),
+            &mut message,
+        );
+        let style_name = normalize_optional_text(
+            first_non_blank(req.style_name, chapter.style_name),
+            usize::MAX,
+        );
+        let instruction = normalize_optional_text(
+            first_non_blank(req.instruction, chapter.style_instruction),
+            MAX_INSTRUCTION_CHARS,
+        );
+        let pov = normalize_optional_text(first_non_blank(req.pov, chapter.pov), 20);
 
         let id: String = sqlx::query_scalar(
             "INSERT INTO chapter_drafts( \
@@ -891,6 +913,15 @@ fn normalize_optional_text(value: Option<String>, max_chars: usize) -> Option<St
         return None;
     }
     Some(trimmed.chars().take(max_chars).collect())
+}
+
+/// 字段级回退：主值缺失/全空白时取备用值；两处都空白按未设置处理。
+fn first_non_blank(primary: Option<String>, fallback: Option<String>) -> Option<String> {
+    let clean = |value: String| {
+        let trimmed = value.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    primary.and_then(clean).or_else(|| fallback.and_then(clean))
 }
 
 fn normalize_style_sample(raw: Option<String>, message: &mut Option<String>) -> Option<String> {

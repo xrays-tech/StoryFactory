@@ -13,6 +13,14 @@ pub struct NovelDto {
     pub background: Option<String>,
     pub world_view: Option<String>,
     pub summary: Option<String>,
+    /// 文风档案：风格名（≤40 字）。
+    pub style_name: Option<String>,
+    /// 文风档案：参考范文（≤6000 字）。
+    pub style_sample: Option<String>,
+    /// 文风档案：额外写作要求（≤1000 字）。
+    pub style_instruction: Option<String>,
+    /// 文风档案：默认叙述人称（第一人称/第三人称）。
+    pub pov: Option<String>,
     pub status: NovelStatus,
     pub created_at: i64,
     pub updated_at: i64,
@@ -34,6 +42,14 @@ pub struct UpdateNovelReq {
     pub background: Option<String>,
     pub world_view: Option<String>,
     pub summary: Option<String>,
+    /// None = 不改；Some("")/全空白 = 清空（写 NULL）；Some(text) = trim 后覆盖。
+    pub style_name: Option<String>,
+    /// None = 不改；Some("")/全空白 = 清空（写 NULL）；Some(text) = trim 后覆盖。
+    pub style_sample: Option<String>,
+    /// None = 不改；Some("")/全空白 = 清空（写 NULL）；Some(text) = trim 后覆盖。
+    pub style_instruction: Option<String>,
+    /// None = 不改；Some("")/全空白 = 清空（写 NULL）；仅接受 第一人称/第三人称。
+    pub pov: Option<String>,
     pub status: Option<NovelStatus>,
 }
 

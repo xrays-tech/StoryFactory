@@ -16,6 +16,7 @@ import { useUiStore } from "../stores/uiStore";
 import { zh, novelStatusLabel } from "../copy/zh";
 import { formatDateTime, truncate } from "../lib/format";
 import { userMessage } from "../lib/errors";
+import { STYLE_LIMITS } from "../lib/draftStyle";
 import { Badge } from "../components/common/Badge";
 import { Button } from "../components/common/Button";
 import { Dialog } from "../components/common/Dialog";
@@ -48,6 +49,10 @@ export function NovelDetail() {
     worldView: "",
     background: "",
     summary: "",
+    styleName: "",
+    styleSample: "",
+    styleInstruction: "",
+    pov: "" as "" | "第一人称" | "第三人称",
   });
 
   const novel = current && current.id === novelId ? current : null;
@@ -92,6 +97,10 @@ export function NovelDetail() {
       worldView: novel.world_view ?? "",
       background: novel.background ?? "",
       summary: novel.summary ?? "",
+      styleName: novel.style_name ?? "",
+      styleSample: novel.style_sample ?? "",
+      styleInstruction: novel.style_instruction ?? "",
+      pov: novel.pov === "第一人称" || novel.pov === "第三人称" ? novel.pov : "",
     });
     setFormError(null);
     setFieldErrors({});
@@ -114,6 +123,10 @@ export function NovelDetail() {
         world_view: form.worldView.trim() || null,
         background: form.background.trim() || null,
         summary: form.summary.trim() || null,
+        style_name: form.styleName.trim() || null,
+        style_sample: form.styleSample.trim() || null,
+        style_instruction: form.styleInstruction.trim() || null,
+        pov: form.pov || null,
       });
       setEditOpen(false);
       toast({ tone: "success", message: "项目信息已更新" });
@@ -272,6 +285,82 @@ export function NovelDetail() {
               invalid={!!fieldErrors.summary}
             />
           </Field>
+
+          <div className="border-t border-line/60 pt-5">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+              <h3 className="font-display text-sm font-semibold text-ink">{zh.novel.styleSection}</h3>
+              <p className="text-xs text-faint">{zh.novel.styleSectionHint}</p>
+            </div>
+
+            <div className="mt-4 space-y-4">
+              <div className="grid gap-4 sm:grid-cols-[1fr_180px]">
+                <Field label={zh.novel.styleName} htmlFor="edit-style-name" error={fieldErrors.style_name}>
+                  <Input
+                    id="edit-style-name"
+                    value={form.styleName}
+                    onChange={(e) => setForm({ ...form, styleName: e.target.value })}
+                    invalid={!!fieldErrors.style_name}
+                    placeholder={zh.novel.styleNamePlaceholder}
+                    maxLength={STYLE_LIMITS.name}
+                  />
+                </Field>
+                <Field label={zh.novel.stylePov} htmlFor="edit-style-pov" error={fieldErrors.pov}>
+                  <Select
+                    id="edit-style-pov"
+                    value={form.pov}
+                    onChange={(e) =>
+                      setForm({
+                        ...form,
+                        pov: e.target.value as "" | "第一人称" | "第三人称",
+                      })
+                    }
+                    invalid={!!fieldErrors.pov}
+                  >
+                    <option value="">{zh.novel.stylePovUnset}</option>
+                    <option value="第三人称">{zh.novel.stylePovThird}</option>
+                    <option value="第一人称">{zh.novel.stylePovFirst}</option>
+                  </Select>
+                </Field>
+              </div>
+
+              <Field
+                label={zh.novel.styleSample}
+                htmlFor="edit-style-sample"
+                hint={zh.novel.styleSampleHint}
+                error={fieldErrors.style_sample}
+              >
+                <Textarea
+                  id="edit-style-sample"
+                  rows={5}
+                  value={form.styleSample}
+                  onChange={(e) => setForm({ ...form, styleSample: e.target.value })}
+                  invalid={!!fieldErrors.style_sample}
+                  placeholder={zh.novel.styleSamplePlaceholder}
+                  maxLength={STYLE_LIMITS.sample}
+                />
+                <div className="mt-1 flex justify-end font-mono text-[10px] text-faint">
+                  {form.styleSample.length}/{STYLE_LIMITS.sample}
+                </div>
+              </Field>
+
+              <Field
+                label={zh.novel.styleInstruction}
+                htmlFor="edit-style-instruction"
+                error={fieldErrors.style_instruction}
+              >
+                <Textarea
+                  id="edit-style-instruction"
+                  rows={3}
+                  value={form.styleInstruction}
+                  onChange={(e) => setForm({ ...form, styleInstruction: e.target.value })}
+                  invalid={!!fieldErrors.style_instruction}
+                  placeholder={zh.novel.styleInstructionPlaceholder}
+                  maxLength={STYLE_LIMITS.instruction}
+                />
+              </Field>
+            </div>
+          </div>
+
           {formError ? (
             <p className="rounded-lg border border-danger/25 bg-danger-soft/50 px-3 py-2 text-sm text-danger" role="alert">
               {formError}

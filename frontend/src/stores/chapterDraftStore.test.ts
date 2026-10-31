@@ -95,7 +95,7 @@ describe("useChapterDraftStore.create", () => {
         style_sample: "范文",
         instruction: null,
         target_words: 1200,
-        pov: null,
+        pov: "第三人称",
       },
       expect.stringMatching(/^draft-/),
     );

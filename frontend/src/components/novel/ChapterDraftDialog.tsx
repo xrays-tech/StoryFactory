@@ -2,15 +2,18 @@ import { useEffect, useState } from "react";
 import { Sparkles } from "lucide-react";
 import { zh } from "../../copy/zh";
 import { useChapterDraftStore, type DraftPrefs } from "../../stores/chapterDraftStore";
+import { useNovelStore } from "../../stores/novelStore";
 import { userMessage } from "../../lib/errors";
+import { resolveStylePayload, STYLE_LIMITS, type DraftPov } from "../../lib/draftStyle";
 import { cn } from "../../lib/cn";
 import { Button } from "../common/Button";
 import { Dialog } from "../common/Dialog";
 import { Field } from "../common/Field";
 import { Input, Textarea } from "../common/Input";
 
-const STYLE_SAMPLE_LIMIT = 6000;
-const INSTRUCTION_LIMIT = 1000;
+const STYLE_NAME_LIMIT = STYLE_LIMITS.name;
+const STYLE_SAMPLE_LIMIT = STYLE_LIMITS.sample;
+const INSTRUCTION_LIMIT = STYLE_LIMITS.instruction;
 const TARGET_MIN = 500;
 const TARGET_MAX = 8000;
 const TARGET_DEFAULT = 1200;
@@ -25,21 +28,34 @@ export type ChapterDraftDialogProps = {
 export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: ChapterDraftDialogProps) {
   const creatingDraft = useChapterDraftStore((s) => s.creating);
   const createDraft = useChapterDraftStore((s) => s.create);
+  const current = useNovelStore((s) => s.current);
+  const profile = current?.id === novelId ? current : null;
+  const hasProfile =
+    !!profile &&
+    [profile.style_name, profile.style_sample, profile.style_instruction, profile.pov].some(
+      (value) => !!value?.trim(),
+    );
 
+  const [styleName, setStyleName] = useState("");
   const [styleSample, setStyleSample] = useState("");
-  const [pov, setPov] = useState<DraftPrefs["pov"]>("第三人称");
+  const [pov, setPov] = useState<DraftPov>("第三人称");
   const [targetWords, setTargetWords] = useState(String(TARGET_DEFAULT));
   const [instruction, setInstruction] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  const profileId = profile?.id ?? null;
+
   useEffect(() => {
     if (!open) return;
-    setStyleSample("");
-    setPov("第三人称");
+    const source = useNovelStore.getState().current;
+    const novel = source?.id === novelId ? source : null;
+    setStyleName(novel?.style_name ?? "");
+    setStyleSample(novel?.style_sample ?? "");
+    setPov(novel?.pov === "第一人称" ? "第一人称" : "第三人称");
     setTargetWords(String(TARGET_DEFAULT));
-    setInstruction("");
+    setInstruction(novel?.style_instruction ?? "");
     setError(null);
-  }, [open, chapterId]);
+  }, [open, chapterId, novelId, profileId]);
 
   const submit = async () => {
     const target = Number(targetWords);
@@ -56,12 +72,16 @@ export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: Chapte
       return;
     }
 
-    const prefs: DraftPrefs = {
-      style_name: null,
-      style_sample: styleSample.trim() || null,
-      instruction: instruction.trim() || null,
-      target_words: target,
+    const style = resolveStylePayload(profile, {
+      style_name: styleName,
+      style_sample: styleSample,
+      instruction,
       pov,
+    });
+
+    const prefs: DraftPrefs = {
+      ...style,
+      target_words: target,
     };
 
     try {
@@ -102,6 +122,26 @@ export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: Chapte
           void submit();
         }}
       >
+        {hasProfile ? (
+          <p className="rounded-lg border border-accent/20 bg-accent-soft/40 px-3 py-2 text-xs leading-5 text-accent-strong">
+            {zh.draft.profilePrefilled}
+          </p>
+        ) : null}
+
+        <Field label={zh.draft.styleName} htmlFor="draft-style-name">
+          <Input
+            id="draft-style-name"
+            value={styleName}
+            onChange={(event) => {
+              setStyleName(event.target.value.slice(0, STYLE_NAME_LIMIT));
+              setError(null);
+            }}
+            placeholder={zh.draft.styleNamePlaceholder}
+            maxLength={STYLE_NAME_LIMIT}
+            data-autofocus
+          />
+        </Field>
+
         <Field
           label={zh.draft.styleSample}
           htmlFor="draft-style-sample"
@@ -116,14 +156,16 @@ export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: Chapte
               setError(null);
             }}
             placeholder={zh.draft.styleSamplePlaceholder}
-            data-autofocus
           />
           <div className="mt-1 flex justify-end font-mono text-[10px] text-faint">
             {styleSample.length.toLocaleString("zh-CN")} / {STYLE_SAMPLE_LIMIT.toLocaleString("zh-CN")}
           </div>
         </Field>
 
-        <Field label={zh.draft.pov} hint={zh.draft.povHint}>
+        <Field
+          label={zh.draft.pov}
+          hint={profile?.pov ? `项目默认：${profile.pov}。` : zh.draft.povHint}
+        >
           <div
             className="inline-flex items-center gap-1 rounded-lg border border-line bg-paper p-1"
             role="radiogroup"
