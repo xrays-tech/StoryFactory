@@ -74,6 +74,7 @@ async fn roundrobin_runs_to_completion_and_writes_outline() {
     let (nid, actors, cid) = base_novel(&state).await;
     let actor_ids: Vec<String> = actors.split(',').map(str::to_string).collect();
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids,
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -117,6 +118,7 @@ async fn finalize_indexes_generated_outline_for_search() {
     .await;
     let (nid, actors, cid) = base_novel(&state).await;
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: actors.split(',').map(str::to_string).collect(),
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -174,6 +176,7 @@ async fn director_mode_uses_llm_decision() {
         state
     };
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids,
         mode: DirectorMode::Director,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -215,6 +218,7 @@ async fn director_mode_accepts_actor_name_as_next_actor_id() {
     let actor_ids: Vec<String> = actors.split(',').map(str::to_string).collect();
     let expected_actor = actor_ids[1].clone();
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids,
         mode: DirectorMode::Director,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -279,6 +283,7 @@ async fn director_mode_falls_back_on_unknown_actor_identifier() {
     let actor_ids: Vec<String> = actors.split(',').map(str::to_string).collect();
     let expected_actor = actor_ids[0].clone();
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids,
         mode: DirectorMode::Director,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -325,6 +330,7 @@ async fn step_executes_one_step_and_stays_paused() {
     let state = test_state_with_chain(Some(mock_chain(vec![actor_json("单步行动")]))).await;
     let (nid, actors, cid) = base_novel(&state).await;
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: actors.split(',').map(str::to_string).collect(),
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -364,6 +370,7 @@ async fn abort_during_llm_drops_half_step() {
     .await;
     let (nid, actors, cid) = base_novel(&state).await;
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: actors.split(',').map(str::to_string).collect(),
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -416,6 +423,7 @@ async fn in_flight_step_cannot_commit_after_abort() {
         .to_string(),
     );
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids,
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -473,6 +481,7 @@ async fn recover_resumes_interrupted_session() {
     .await;
     let (nid, actors, cid) = base_novel(&state).await;
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: actors.split(',').map(str::to_string).collect(),
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -532,6 +541,7 @@ async fn waiting_input_then_input_continues() {
         .push_ok(json!({ "next_actor_id": a, "reason": "收束", "terminate": true }).to_string());
     provider.push_ok(outline_text());
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: vec![a],
         mode: DirectorMode::Director,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -567,6 +577,7 @@ async fn startup_recovery_marks_active_sessions_interrupted() {
     let state = test_state_with_chain(Some(mock_chain(vec![actor_json("x")]))).await;
     let (nid, actors, cid) = base_novel(&state).await;
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: actors.split(',').map(str::to_string).collect(),
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -653,6 +664,7 @@ async fn concurrent_start_allows_only_one_engine() {
     .await;
     let (nid, actors, cid) = base_novel(&state).await;
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: actors.split(',').map(str::to_string).collect(),
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -708,6 +720,7 @@ async fn waiting_input_timeout_finalizes() {
         state
     };
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids,
         mode: DirectorMode::Director,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -759,6 +772,7 @@ async fn terminate_precedes_request_input() {
     );
     provider.push_ok(outline_text());
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: vec![a],
         mode: DirectorMode::Director,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -804,6 +818,7 @@ async fn scripted_plan_exhaustion_finalizes() {
     let actor_ids: Vec<String> = actors.split(',').map(str::to_string).collect();
     let first = actor_ids[0].clone();
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids,
         mode: DirectorMode::Scripted,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -870,6 +885,7 @@ async fn negative_emotion_delta_on_new_pair_is_clamped() {
         ),
     );
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: vec![a.clone(), b.clone()],
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -895,4 +911,143 @@ async fn negative_emotion_delta_on_new_pair_is_clamped() {
     .unwrap();
     assert_eq!(affinity, -5);
     assert_eq!(trust, 0, "negative trust must clamp to 0 on insert");
+}
+
+#[tokio::test]
+async fn create_session_with_chapter_binds_and_finalizes() {
+    let state = test_state_with_chain(Some(mock_chain(vec![
+        actor_json("绑定章节的行动"),
+        outline_text(),
+    ])))
+    .await;
+    let (nid, actors, cid) = base_novel(&state).await;
+    let req = CreateSessionReq {
+        chapter_id: Some(cid.clone()),
+        actor_ids: actors.split(',').map(str::to_string).collect(),
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state
+        .sessions
+        .create(&nid, None, req)
+        .await
+        .expect("create");
+    assert_eq!(
+        created.chapter_id.as_deref(),
+        Some(cid.as_str()),
+        "创建返回体必须回显绑定的章节"
+    );
+
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let (outline, session_summary): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT c.final_outline, s.summary_text
+         FROM chapters c JOIN sandbox_sessions s ON s.id = ?
+         WHERE c.id = ?",
+    )
+    .bind(&created.id)
+    .bind(&cid)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    let outline = outline.expect("绑定章节后收束必须写入 final_outline");
+    assert!(!outline.trim().is_empty());
+    assert_eq!(Some(&outline), session_summary.as_ref());
+
+    let indexed: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM search_docs WHERE entity_id = ?")
+        .bind(&cid)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert!(indexed >= 1, "finalize 后必须重建章节 FTS 索引");
+
+    let ready: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? AND event_type = 'outline_ready'",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(ready, 1, "绑定章节的会话必须持久化 outline_ready 事件");
+}
+
+#[tokio::test]
+async fn create_session_rejects_foreign_chapter() {
+    let state = test_state_with_chain(None).await;
+    let app = test_app(state.clone());
+    let nid = create_novel(&app, "绑定目标小说").await;
+    let actor = create_character(&app, &nid, "角色A").await;
+    let other_nid = create_novel(&app, "其它小说").await;
+    let other_vid = create_volume(&app, &other_nid, "其它卷").await;
+    let foreign_cid = create_chapter(&app, &other_nid, &other_vid, "其它章").await;
+
+    let req = CreateSessionReq {
+        chapter_id: Some(foreign_cid),
+        actor_ids: vec![actor],
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(false),
+    };
+    let err = state
+        .sessions
+        .create(&nid, None, req)
+        .await
+        .expect_err("跨小说章节必须被拒绝");
+    assert!(
+        matches!(err.code, story_architect::error::ErrorCode::ChapterNotFound),
+        "unexpected error code: {:?}",
+        err.code
+    );
+    assert_eq!(err.status, 404);
+
+    let sessions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sandbox_sessions WHERE novel_id = ?")
+            .bind(&nid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(sessions, 0, "校验失败时不得写入会话");
+}
+
+#[tokio::test]
+async fn create_session_with_blank_chapter_id_is_none() {
+    let state = test_state_with_chain(None).await;
+    let app = test_app(state.clone());
+    let nid = create_novel(&app, "空白章节测试").await;
+    let actor = create_character(&app, &nid, "角色A").await;
+
+    let req = CreateSessionReq {
+        chapter_id: Some("".to_string()),
+        actor_ids: vec![actor],
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(false),
+    };
+    let created = state
+        .sessions
+        .create(&nid, None, req)
+        .await
+        .expect("create");
+    assert_eq!(created.chapter_id, None);
+
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT chapter_id FROM sandbox_sessions WHERE id = ?")
+            .bind(&created.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, None, "空白 chapter_id 必须按未绑定落库");
 }

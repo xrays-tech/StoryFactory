@@ -16,6 +16,7 @@ import { LoadingBlock } from "../components/common/Skeleton";
 import { ProgressBar } from "../components/common/Progress";
 import { CreateSessionWizard } from "../components/sandbox/CreateSessionWizard";
 import { formatCost, formatDateTime } from "../lib/format";
+import { chapterBindingLabel, findChapterLocation } from "../lib/chapterLocation";
 import { cn } from "../lib/cn";
 
 export async function sandboxListLoader({ params }: LoaderFunctionArgs) {
@@ -52,6 +53,8 @@ export function SandboxPage() {
   const filter = useSandboxStore((s) => s.sessionFilter);
   const loadSessions = useSandboxStore((s) => s.loadSessions);
   const characters = useCharacterStore((s) => s.items);
+  const volumes = useOutlineStore((s) => s.volumes);
+  const chaptersByVolume = useOutlineStore((s) => s.chaptersByVolume);
 
   const [wizardOpen, setWizardOpen] = useState(false);
   const defaultChapter = searchParams.get("chapter");
@@ -139,6 +142,11 @@ export function SandboxPage() {
             const active = ["running", "waiting_input", "finalizing", "paused", "interrupted"].includes(
               session.status,
             );
+            const chapterLocation = findChapterLocation(
+              volumes,
+              chaptersByVolume,
+              session.chapter_id,
+            );
             return (
               <button
                 key={session.id}
@@ -168,6 +176,11 @@ export function SandboxPage() {
                       </span>
                     </p>
                     <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-faint">
+                      {session.chapter_id ? (
+                        <span className={chapterLocation ? "text-muted" : "text-faint"}>
+                          {chapterBindingLabel(chapterLocation)}
+                        </span>
+                      ) : null}
                       <span>{formatDateTime(session.created_at)}</span>
                       <span>成本 {formatCost(session.usage.cost_usd)}</span>
                       <span>{session.usage.calls} 次调用</span>

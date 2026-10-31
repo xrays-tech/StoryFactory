@@ -365,6 +365,7 @@ async fn relations_put_rejected_while_session_is_active() {
             &nid,
             None,
             CreateSessionReq {
+                chapter_id: None,
                 actor_ids: vec![a.clone(), b.clone()],
                 mode: DirectorMode::Roundrobin,
                 scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),

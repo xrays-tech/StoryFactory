@@ -2,4 +2,4 @@
 import type { DirectorMode } from "./DirectorMode";
 import type { ScriptedPlan } from "./ScriptedPlan";
 
-export type CreateSessionReq = { actor_ids: Array<string>, mode: DirectorMode, scene_prompt: string, step_limit: number | null, director_config: ScriptedPlan | null, user_directive: string | null, autostart: boolean | null, };
+export type CreateSessionReq = { actor_ids: Array<string>, mode: DirectorMode, scene_prompt: string, step_limit: number | null, director_config: ScriptedPlan | null, user_directive: string | null, autostart: boolean | null, chapter_id: string | null, };

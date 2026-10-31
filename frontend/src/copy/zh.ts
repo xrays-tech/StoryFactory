@@ -222,7 +222,7 @@ export const zh = {
     directivePlaceholder: "例如：保持悬疑氛围，不要过早揭晓凶手。",
     autostart: "创建后立即开始",
     chapter: "关联章节",
-    noChapter: "不关联章节（探索会话）",
+    noChapter: "不绑定（整本书级）",
     script: "剧本步骤",
     addStep: "添加步骤",
     stepActor: "行动角色",

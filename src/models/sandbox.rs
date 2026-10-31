@@ -130,6 +130,8 @@ pub struct CreateSessionReq {
     pub director_config: Option<ScriptedPlan>,
     pub user_directive: Option<String>,
     pub autostart: Option<bool>,
+    #[serde(default)]
+    pub chapter_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

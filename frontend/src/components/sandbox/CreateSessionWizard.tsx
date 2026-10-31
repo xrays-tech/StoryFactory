@@ -18,6 +18,7 @@ import { useOutlineStore } from "../../stores/outlineStore";
 import { useSandboxStore, type Session } from "../../stores/sandboxStore";
 import { useUiStore } from "../../stores/uiStore";
 import { userMessage } from "../../lib/errors";
+import { buildCreateSessionPayload } from "../../lib/sandboxSession";
 import { newIdempotencyKey } from "../../api/client";
 import { cn } from "../../lib/cn";
 import { Dialog } from "../common/Dialog";
@@ -71,6 +72,10 @@ export function CreateSessionWizard({
   const characters = useCharacterStore((s) => s.items);
   const volumes = useOutlineStore((s) => s.volumes);
   const chaptersByVolume = useOutlineStore((s) => s.chaptersByVolume);
+  const outlineNovelId = useOutlineStore((s) => s.novelId);
+  const outlineLoading = useOutlineStore((s) => s.loading);
+  const outlineError = useOutlineStore((s) => s.error);
+  const loadTree = useOutlineStore((s) => s.loadTree);
   const createSession = useSandboxStore((s) => s.createSession);
   const toast = useUiStore((s) => s.toast);
 
@@ -104,6 +109,35 @@ export function CreateSessionWizard({
     setFormError(null);
     setFieldErrors({});
   }, [open, defaultChapterId]);
+
+  // 沙盒页 loader 通常已经加载好大纲树；从其他入口打开时再补一次，失败也不阻塞提交。
+  useEffect(() => {
+    if (!open || outlineNovelId === novelId) return;
+    void loadTree(novelId, { silent: true });
+  }, [open, novelId, outlineNovelId, loadTree]);
+
+  // 上下文预填的章节可能已被删除；树加载完成后找不到就退回整本书级。
+  useEffect(() => {
+    if (!open || !chapterId) return;
+    if (outlineNovelId !== novelId || outlineLoading) return;
+    if (outlineError) {
+      setChapterId("");
+      return;
+    }
+    const exists = volumes.some((volume) =>
+      (chaptersByVolume[volume.id] ?? []).some((chapter) => chapter.id === chapterId),
+    );
+    if (!exists) setChapterId("");
+  }, [
+    open,
+    novelId,
+    chapterId,
+    outlineNovelId,
+    outlineLoading,
+    outlineError,
+    volumes,
+    chaptersByVolume,
+  ]);
 
   const selectedSet = useMemo(() => new Set(actorIds), [actorIds]);
 
@@ -161,30 +195,27 @@ export function CreateSessionWizard({
     setSaving(true);
     setFormError(null);
     try {
-      const session = await createSession(
-        novelId,
-        chapterId || null,
-        {
-          actor_ids: actorIds,
-          mode,
-          scene_prompt: scenePrompt.trim(),
-          step_limit: stepLimit,
-          director_config:
-            mode === "scripted"
-              ? {
-                  steps: script
-                    .filter((item) => item.actor_id)
-                    .map((item) => ({
-                      actor_id: item.actor_id,
-                      beat_hint: item.beat_hint.trim() || null,
-                    })),
-                }
-              : null,
-          user_directive: directive.trim() || null,
-          autostart,
-        },
-        idemKey,
-      );
+      const payload = buildCreateSessionPayload({
+        actorIds,
+        mode,
+        scenePrompt: scenePrompt.trim(),
+        stepLimit,
+        directorConfig:
+          mode === "scripted"
+            ? {
+                steps: script
+                  .filter((item) => item.actor_id)
+                  .map((item) => ({
+                    actor_id: item.actor_id,
+                    beat_hint: item.beat_hint.trim() || null,
+                  })),
+              }
+            : null,
+        userDirective: directive.trim() || null,
+        autostart,
+        chapterId: chapterId || null,
+      });
+      const session = await createSession(novelId, chapterId || null, payload, idemKey);
       toast({ tone: "success", message: zh.sandbox.created });
       onCreated(session);
     } catch (error) {
@@ -204,6 +235,12 @@ export function CreateSessionWizard({
     volume,
     chapters: chaptersByVolume[volume.id] ?? [],
   }));
+
+  const chapterHint = outlineError
+    ? "章节列表加载失败，本次将按整本书推演。"
+    : outlineLoading
+      ? "正在读取章节…"
+      : "关联章节后，收束时会生成大纲并可直接定稿。";
 
   return (
     <Dialog
@@ -270,7 +307,7 @@ export function CreateSessionWizard({
 
         {step === 1 ? (
           <div className="space-y-5">
-            <Field label={`${zh.sandbox.chapter}（${zh.common.optional}）`} htmlFor="session-chapter" hint="关联章节后，收束时会生成大纲并可直接定稿。">
+            <Field label={`${zh.sandbox.chapter}（${zh.common.optional}）`} htmlFor="session-chapter" hint={chapterHint}>
               <Select
                 id="session-chapter"
                 value={chapterId}

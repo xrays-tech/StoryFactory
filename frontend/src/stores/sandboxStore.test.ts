@@ -14,6 +14,7 @@ vi.mock("../api/endpoints", () => ({
 }));
 
 import { useSandboxStore } from "./sandboxStore";
+import { buildCreateSessionPayload, type CreateSessionDraft } from "../lib/sandboxSession";
 
 type Session = Wire<SessionSnapshot>;
 
@@ -68,6 +69,7 @@ const createReq: Wire<CreateSessionReq> = {
   director_config: null,
   user_directive: null,
   autostart: true,
+  chapter_id: null,
 };
 
 function resetStore() {
@@ -122,6 +124,33 @@ describe("useSandboxStore.ingestEvent", () => {
     expect(state.events[0].seq).toBe(502);
     expect(state.events.at(-1)?.seq).toBe(1001);
     expect(state.lastEventSeq).toBe(1001);
+  });
+});
+
+describe("buildCreateSessionPayload", () => {
+  const draft: CreateSessionDraft = {
+    actorIds: ["a1", "a2"],
+    mode: "director",
+    scenePrompt: "雨夜的旧书店，两人重逢。",
+    stepLimit: 12,
+    directorConfig: null,
+    userDirective: "保持悬疑",
+    autostart: true,
+    chapterId: null,
+  };
+
+  it("puts the bound chapter into the request body", () => {
+    const payload = buildCreateSessionPayload({ ...draft, chapterId: "c1" });
+
+    expect(payload.chapter_id).toBe("c1");
+    expect(payload.actor_ids).toEqual(["a1", "a2"]);
+    expect(payload.scene_prompt).toBe("雨夜的旧书店，两人重逢。");
+    expect(payload.step_limit).toBe(12);
+  });
+
+  it("sends null when the session is not bound to a chapter", () => {
+    expect(buildCreateSessionPayload(draft).chapter_id).toBeNull();
+    expect(buildCreateSessionPayload({ ...draft, chapterId: "   " }).chapter_id).toBeNull();
   });
 });
 

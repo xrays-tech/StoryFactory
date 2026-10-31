@@ -40,6 +40,7 @@ async fn completed_session(state: &story_architect::state::AppState) -> (String,
     let vid = create_volume(&app, &nid, "卷一").await;
     let cid = create_chapter(&app, &nid, &vid, "第一章").await;
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: vec![a],
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -107,6 +108,7 @@ async fn sse_after_seq_skips_earlier_events() {
     let vid = create_volume(&app, &nid, "卷一").await;
     let cid = create_chapter(&app, &nid, &vid, "第一章").await;
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: vec![a],
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
@@ -244,6 +246,7 @@ async fn sse_attaches_to_hub_created_after_connect() {
     let vid = create_volume(&app, &nid, "卷一").await;
     let cid = create_chapter(&app, &nid, &vid, "第一章").await;
     let req = CreateSessionReq {
+        chapter_id: None,
         actor_ids: vec![a],
         mode: DirectorMode::Roundrobin,
         scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),

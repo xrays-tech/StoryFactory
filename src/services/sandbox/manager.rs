@@ -121,6 +121,14 @@ impl SessionManager {
         req: CreateSessionReq,
     ) -> Result<SessionSnapshot, AppError> {
         novel_alive(&self.pool, novel_id).await?;
+        // 章节路由参数作为默认绑定；请求体 chapter_id 可显式覆盖（探索会话）。
+        // 空白字符串视为未绑定。
+        let requested_chapter_id = req
+            .chapter_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let bound_chapter_id = requested_chapter_id.or(chapter_id);
         let cfg = self.config.load();
         let scene = req.scene_prompt.trim();
         if scene.chars().count() < 10 || scene.chars().count() > 4000 {
@@ -193,20 +201,6 @@ impl SessionManager {
                 )]));
             }
         }
-        if let Some(cid) = chapter_id {
-            let found: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM chapters WHERE id = ? AND novel_id = ? AND deleted_at IS NULL",
-            )
-            .bind(cid)
-            .bind(novel_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_err)?;
-            if found.is_none() {
-                return Err(not_found(ErrorCode::ChapterNotFound, "章节不存在或已删除"));
-            }
-        }
-
         let template_versions = crate::llm::prompts::snapshot_versions(&self.pool).await?;
         let actor_ids_json =
             serde_json::to_string(&req.actor_ids).unwrap_or_else(|_| "[]".to_string());
@@ -217,12 +211,31 @@ impl SessionManager {
         let id = uuid::Uuid::new_v4().to_string().replace('-', "");
 
         let mut tx = db::begin_immediate(&self.pool).await.map_err(db_err)?;
+        if let Some(cid) = bound_chapter_id {
+            // 与 INSERT 同一连接校验，避免校验后章节被并发移动/软删。
+            let found: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM chapters WHERE id = ? AND novel_id = ? AND deleted_at IS NULL",
+            )
+            .bind(cid)
+            .bind(novel_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if found.is_none() {
+                tx.rollback().await.map_err(db_err)?;
+                return Err(AppError::new(
+                    ErrorCode::ChapterNotFound,
+                    "章节不存在或不属于该项目",
+                ));
+            }
+        }
+        // 绑定章节后，收束大纲会写入该章 final_outline 并重建 FTS 索引（engine::finalize）。
         sqlx::query(
             "INSERT INTO sandbox_sessions(id, novel_id, chapter_id, scene_prompt, actor_ids, mode, step_limit, director_config, template_versions, user_directive) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(novel_id)
-        .bind(chapter_id)
+        .bind(bound_chapter_id)
         .bind(scene)
         .bind(&actor_ids_json)
         .bind(req.mode.as_str())

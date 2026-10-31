@@ -36,6 +36,7 @@ import type { SandboxEvent } from "../api/sse";
 import * as api from "../api/endpoints";
 import { ApiError, userMessage } from "../lib/errors";
 import { formatCost, formatDateTime, formatDuration, formatNumber } from "../lib/format";
+import { chapterBindingLabel, findChapterLocation } from "../lib/chapterLocation";
 import { cn } from "../lib/cn";
 import { Button } from "../components/common/Button";
 import { Badge } from "../components/common/Badge";
@@ -52,6 +53,14 @@ export async function sandboxConsoleLoader({ params }: LoaderFunctionArgs) {
   if (!sid) return null;
   useSandboxStore.getState().disconnect(true);
   await useSandboxStore.getState().loadSession(sid);
+  const session = useSandboxStore.getState().session;
+  if (session?.chapter_id) {
+    const outline = useOutlineStore.getState();
+    const known =
+      outline.novelId === session.novel_id &&
+      findChapterLocation(outline.volumes, outline.chaptersByVolume, session.chapter_id);
+    if (!known) await outline.loadTree(session.novel_id, { silent: true });
+  }
   return null;
 }
 
@@ -192,6 +201,8 @@ export function SandboxConsole() {
   const autoScroll = useSandboxStore((s) => s.autoScroll);
   const outline = useSandboxStore((s) => s.outline);
   const outlineChapterId = useSandboxStore((s) => s.outlineChapterId);
+  const volumes = useOutlineStore((s) => s.volumes);
+  const chaptersByVolume = useOutlineStore((s) => s.chaptersByVolume);
   const loadSession = useSandboxStore((s) => s.loadSession);
   const connect = useSandboxStore((s) => s.connect);
   const disconnect = useSandboxStore((s) => s.disconnect);
@@ -208,6 +219,8 @@ export function SandboxConsole() {
   const [outlineSaved, setOutlineSaved] = useState(false);
   const [leaveBusy, setLeaveBusy] = useState<"pause" | "abort" | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const previousStatusRef = useRef<SessionStatus | null>(null);
+  const completedNoticeRef = useRef<string | null>(null);
 
   const active = !!session && !isSessionTerminal(session.status);
   const blocker = useBlocker(active);
@@ -284,6 +297,18 @@ export function SandboxConsole() {
     if (outline) setOutlineSaved(false);
   }, [outline]);
 
+  // 只在会话本次运行到完成时提示，重新打开历史会话不重复打扰。
+  useEffect(() => {
+    const status = session?.status ?? null;
+    const previous = previousStatusRef.current;
+    previousStatusRef.current = status;
+    if (!session || !status || previous === null) return;
+    if (previous === "completed" || status !== "completed" || !session.chapter_id) return;
+    if (completedNoticeRef.current === session.id) return;
+    completedNoticeRef.current = session.id;
+    toast({ tone: "success", message: "大纲已写入该章节" });
+  }, [session?.id, session?.status, session?.chapter_id, toast]);
+
   if (!sid) return null;
 
   if (loading && !session) return <LoadingBlock label="正在打开会话…" />;
@@ -314,6 +339,7 @@ export function SandboxConsole() {
   }
 
   const actors = session.actor_names;
+  const chapterLocation = findChapterLocation(volumes, chaptersByVolume, session.chapter_id);
   const actorName = (id: string) => actors.find((actor) => actor.id === id)?.name ?? "未知角色";
   const actorTone = (id: string) => {
     const index = session.actor_ids.indexOf(id);
@@ -685,13 +711,17 @@ export function SandboxConsole() {
               <span className="text-[11px] text-faint">#{session.id.slice(0, 8)}</span>
               <span className="text-[11px] text-faint">{modeLabel[session.mode]}</span>
               {session.chapter_id ? (
-                <button
-                  type="button"
-                  onClick={() => navigate(`/novel/${session.novel_id}/outline`)}
-                  className="focus-ring rounded text-[11px] font-medium text-accent-strong hover:underline"
-                >
-                  关联章节
-                </button>
+                chapterLocation ? (
+                  <button
+                    type="button"
+                    onClick={() => navigate(`/novel/${session.novel_id}/outline`)}
+                    className="focus-ring rounded text-[11px] font-medium text-accent-strong hover:underline"
+                  >
+                    {chapterBindingLabel(chapterLocation)}
+                  </button>
+                ) : (
+                  <span className="text-[11px] text-faint">章节已删除</span>
+                )
               ) : (
                 <span className="text-[11px] text-faint">探索会话</span>
               )}
