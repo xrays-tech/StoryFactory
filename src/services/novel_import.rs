@@ -25,7 +25,8 @@ use crate::llm::service::LlmService;
 use crate::llm::{LlmError, LlmErrorKind, Message, Purpose};
 use crate::models::import::{
     AnalysisData, CreateNovelFromImportReq, NovelImportJob, NovelImportPreview, NovelImportStage,
-    NovelImportStatus, PreviewCharacter, PreviewItem, PreviewRelation, PreviewVolume,
+    NovelImportStatus, PreviewChapter, PreviewCharacter, PreviewItem, PreviewRelation,
+    PreviewVolume,
 };
 use crate::services::util::{db_err, import_name, invalid, new_id, not_found};
 use crate::services::{novel, search};
@@ -35,7 +36,7 @@ pub const MAX_IMPORT_BYTES: usize = 32 * 1024 * 1024;
 pub const MIN_IMPORT_CHARS: usize = 200;
 pub const CHUNK_CHARS: usize = 6000;
 pub const CHUNK_OVERLAP: usize = 200;
-pub const MAX_CHUNKS: usize = 200;
+pub const MAX_CHUNKS: usize = 400;
 /// 分块阶段同时进行的 LLM 调用上限。
 pub const IMPORT_CHUNK_CONCURRENCY: usize = 3;
 
@@ -44,12 +45,23 @@ const SUMMARY_JOIN_LIMIT: usize = 12000;
 const SUMMARY_MERGE_GROUP: usize = 20;
 const ANALYSIS_RETRIES: usize = 1;
 
+/// 每章大纲中「关键场景」最多保留的条数。
+const CHAPTER_BEATS_LIMIT: usize = 8;
+/// 结构阶段每批最多送入的章节数。
+const STRUCTURE_BATCH_SIZE: usize = 30;
+/// 结构阶段单章摘要的截断长度，避免超长上下文。
+const STRUCTURE_SUMMARY_LIMIT: usize = 200;
+/// 回退确定性分组时每卷的章节数。
+const FALLBACK_VOLUME_CHAPTERS: usize = 10;
+/// 回退卷摘要取前几章。
+const FALLBACK_SUMMARY_CHAPTERS: usize = 3;
+/// 回退卷摘要每章的截断长度。
+const FALLBACK_SUMMARY_CHARS: usize = 120;
+
 /// 截断二分的最小粒度：低于该字符数不再拆分，直接记为跳过。
 const MIN_SUBCHUNK_CHARS: usize = 800;
 /// 截断二分递归深度上限。
 const MAX_SUBCHUNK_DEPTH: usize = 3;
-/// 结构生成每批 summary 数量。
-const STRUCTURE_BATCH_SIZE: usize = 10;
 
 /// 单次分析调用的输出预算。推理模型的 reasoning tokens 与正文共享预算，
 /// 必须显著高于普通沙盒调用的 1500，否则会以 finish_reason=length 截断。
@@ -416,16 +428,13 @@ async fn analyze(
     llm: Arc<LlmService>,
     token: &CancellationToken,
 ) -> Result<(), RunError> {
-    let (chunks, truncated) = split_into_chunks(text);
-    if chunks.is_empty() {
-        return Err(RunError::Failed("文本无法分块".to_string()));
+    let chapters = split_into_chapters(text);
+    if chapters.is_empty() {
+        return Err(RunError::Failed("文本无法解析出章节".to_string()));
     }
+    let chunks = chunk_chapters(&chapters).map_err(|e| RunError::Failed(e.message))?;
     let total = chunks.len() as i64;
-    let mut note = if truncated {
-        Some(format!("文本过长，仅分析前 {MAX_CHUNKS} 个分块"))
-    } else {
-        None
-    };
+    let mut note = None;
 
     sqlx::query(
         "UPDATE novel_imports SET chunks_total = ?, stage = 'analyzing_chunks', progress = 10, \
@@ -439,8 +448,8 @@ async fn analyze(
     .map_err(db_failure)?;
 
     let outcomes = analyze_chunks(pool, id, llm.clone(), &chunks, total, token).await?;
-    let (chunk_characters, chunk_items, chunk_relations, summaries, skipped_segments) =
-        collect_chunk_outcomes(outcomes);
+    let (chunk_characters, chunk_items, chunk_relations, digests, skipped_segments) =
+        collect_chunk_outcomes(&chunks, outcomes);
 
     if skipped_segments > 0 {
         append_note(
@@ -473,8 +482,20 @@ async fn analyze(
     .await
     .map_err(db_failure)?;
 
-    let mut structure = generate_structure(llm.as_ref(), &summaries, token).await?;
-    renumber_volumes(&mut structure.volumes);
+    let assembled = assemble_chapters(&chapters, &digests);
+    let (body_chapters, preface_chapter) = split_preface(&assembled);
+    let structure_summaries: Vec<String> = body_chapters
+        .iter()
+        .map(|chapter| structure_summary(chapter))
+        .collect();
+    let structure = generate_structure(llm.as_ref(), &structure_summaries, token).await?;
+    let plans = validated_volume_plans(&structure.volumes, structure_summaries.len())
+        .unwrap_or_else(|| deterministic_volume_plans(&structure_summaries));
+    let volumes = build_volumes(&plans, &body_chapters, preface_chapter);
+    let beats = assembled
+        .iter()
+        .flat_map(|chapter| chapter.beats.iter().cloned())
+        .collect();
 
     ensure_active(token)?;
     let data = AnalysisData {
@@ -482,7 +503,8 @@ async fn analyze(
         world_view: structure.world_view,
         background: structure.background,
         summary: structure.summary,
-        volumes: structure.volumes,
+        volumes,
+        beats,
         characters,
         relations,
         items,
@@ -527,7 +549,7 @@ async fn analyze_chunks(
     pool: &SqlitePool,
     id: &str,
     llm: Arc<LlmService>,
-    chunks: &[String],
+    chunks: &[ChapterChunk],
     total: i64,
     token: &CancellationToken,
 ) -> Result<Vec<Option<ChunkOutcome>>, RunError> {
@@ -557,7 +579,7 @@ async fn analyze_chunks(
             let token = token.clone();
             tasks.spawn(async move {
                 let _permit = permit;
-                let outcome = analyze_chunk_text(&llm, index, total, &chunk, &token, 0).await;
+                let outcome = analyze_chunk_text(&llm, index, total, &chunk.text, &token, 0).await;
                 (index, outcome)
             });
             next_index += 1;
@@ -684,6 +706,7 @@ fn merge_chunk_outcomes(left: ChunkOutcome, right: ChunkOutcome) -> ChunkOutcome
         (ChunkOutcome::Parsed(left), ChunkOutcome::Parsed(right)) => {
             ChunkOutcome::Parsed(ChunkOutput {
                 summary: format!("{}\n{}", left.summary, right.summary),
+                beats: left.beats.into_iter().chain(right.beats).collect(),
                 characters: left
                     .characters
                     .into_iter()
@@ -696,32 +719,232 @@ fn merge_chunk_outcomes(left: ChunkOutcome, right: ChunkOutcome) -> ChunkOutcome
     }
 }
 
+#[derive(Default, Clone)]
+struct ChapterDigest {
+    summary: String,
+    beats: Vec<String>,
+}
+
+struct AssembledChapter {
+    source_index: usize,
+    title: String,
+    outline: String,
+    summary: String,
+    beats: Vec<String>,
+}
+
 type CollectedChunks = (
     Vec<PreviewCharacter>,
     Vec<PreviewItem>,
     Vec<PreviewRelation>,
-    Vec<String>,
+    HashMap<usize, ChapterDigest>,
     usize,
 );
 
-fn collect_chunk_outcomes(outcomes: Vec<Option<ChunkOutcome>>) -> CollectedChunks {
+fn collect_chunk_outcomes(
+    chunks: &[ChapterChunk],
+    outcomes: Vec<Option<ChunkOutcome>>,
+) -> CollectedChunks {
     let mut characters = Vec::new();
     let mut items = Vec::new();
     let mut relations = Vec::new();
-    let mut summaries = Vec::new();
+    let mut digests: HashMap<usize, ChapterDigest> = HashMap::new();
     let mut skipped = 0usize;
-    for outcome in outcomes.into_iter().flatten() {
+    for (chunk, outcome) in chunks.iter().zip(outcomes) {
+        let Some(outcome) = outcome else {
+            continue;
+        };
         match outcome {
             ChunkOutcome::Parsed(output) => {
                 characters.extend(output.characters);
                 items.extend(output.items);
                 relations.extend(output.relations);
-                summaries.push(output.summary);
+                let digest = digests.entry(chunk.chapter_index).or_default();
+                append_summary(&mut digest.summary, &output.summary);
+                digest.beats.extend(output.beats);
             }
             ChunkOutcome::Skipped => skipped += 1,
         }
     }
-    (characters, items, relations, summaries, skipped)
+    (characters, items, relations, digests, skipped)
+}
+
+fn append_summary(target: &mut String, incoming: &str) {
+    let incoming = incoming.trim();
+    if incoming.is_empty() {
+        return;
+    }
+    if !target.is_empty() {
+        target.push('\n');
+    }
+    target.push_str(incoming);
+}
+
+fn assemble_chapters(
+    chapters: &[SourceChapter],
+    digests: &HashMap<usize, ChapterDigest>,
+) -> Vec<AssembledChapter> {
+    chapters
+        .iter()
+        .map(|chapter| {
+            let digest = digests.get(&chapter.index);
+            let summary = digest
+                .map(|digest| clip_text(digest.summary.trim(), SUMMARY_JOIN_LIMIT))
+                .unwrap_or_default();
+            let beats = dedup_beats(
+                digest
+                    .map(|digest| digest.beats.as_slice())
+                    .unwrap_or_default(),
+            );
+            let outline = build_chapter_outline(&summary, &beats);
+            AssembledChapter {
+                source_index: chapter.index,
+                title: chapter.title.clone(),
+                outline,
+                summary,
+                beats,
+            }
+        })
+        .collect()
+}
+
+fn dedup_beats(raw: &[String]) -> Vec<String> {
+    let mut beats: Vec<String> = Vec::new();
+    for beat in raw {
+        let beat = beat.trim();
+        if beat.is_empty() || beats.iter().any(|existing| existing.as_str() == beat) {
+            continue;
+        }
+        beats.push(beat.to_string());
+        if beats.len() == CHAPTER_BEATS_LIMIT {
+            break;
+        }
+    }
+    beats
+}
+
+fn build_chapter_outline(summary: &str, beats: &[String]) -> String {
+    if summary.is_empty() && beats.is_empty() {
+        return String::new();
+    }
+    let mut outline = String::from("## 剧情梗概\n");
+    outline.push_str(summary);
+    outline.push_str("\n## 关键场景\n");
+    for beat in beats {
+        outline.push_str("- ");
+        outline.push_str(beat);
+        outline.push('\n');
+    }
+    outline.trim_end().to_string()
+}
+
+fn structure_summary(chapter: &AssembledChapter) -> String {
+    let raw = if chapter.summary.trim().is_empty() {
+        chapter.title.trim()
+    } else {
+        chapter.summary.trim()
+    };
+    clip_text(raw, STRUCTURE_SUMMARY_LIMIT)
+}
+
+fn split_preface(
+    assembled: &[AssembledChapter],
+) -> (Vec<&AssembledChapter>, Option<&AssembledChapter>) {
+    if assembled.iter().any(|chapter| chapter.source_index > 0) {
+        (
+            assembled
+                .iter()
+                .filter(|chapter| chapter.source_index > 0)
+                .collect(),
+            assembled.iter().find(|chapter| chapter.source_index == 0),
+        )
+    } else {
+        (assembled.iter().collect(), None)
+    }
+}
+
+fn validated_volume_plans(plans: &[VolumePlan], total_chapters: usize) -> Option<Vec<VolumePlan>> {
+    if plans.is_empty() || total_chapters == 0 {
+        return None;
+    }
+    let mut expected_start = 1usize;
+    for plan in plans {
+        if plan.start != expected_start || plan.end < plan.start || plan.end > total_chapters {
+            return None;
+        }
+        if plan.end - plan.start + 1 > 30 {
+            return None;
+        }
+        expected_start = plan.end + 1;
+    }
+    if expected_start != total_chapters + 1 {
+        return None;
+    }
+    Some(plans.to_vec())
+}
+
+fn deterministic_volume_plans(summaries: &[String]) -> Vec<VolumePlan> {
+    if summaries.is_empty() {
+        return Vec::new();
+    }
+    summaries
+        .chunks(FALLBACK_VOLUME_CHAPTERS)
+        .enumerate()
+        .map(|(index, group)| {
+            let start = index * FALLBACK_VOLUME_CHAPTERS + 1;
+            let end = start + group.len() - 1;
+            let summary = group
+                .iter()
+                .take(FALLBACK_SUMMARY_CHAPTERS)
+                .map(|item| clip_text(item.trim(), FALLBACK_SUMMARY_CHARS))
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+                .join("；");
+            VolumePlan {
+                start,
+                end,
+                title: format!("卷{}", index + 1),
+                summary: non_empty(summary),
+            }
+        })
+        .collect()
+}
+
+fn build_volumes(
+    plans: &[VolumePlan],
+    body_chapters: &[&AssembledChapter],
+    preface: Option<&AssembledChapter>,
+) -> Vec<PreviewVolume> {
+    plans
+        .iter()
+        .enumerate()
+        .map(|(volume_index, plan)| {
+            let mut chapters = Vec::new();
+            if volume_index == 0 {
+                if let Some(preface) = preface {
+                    chapters.push(preview_chapter(preface));
+                }
+            }
+            for chapter_number in plan.start..=plan.end {
+                if let Some(chapter) = body_chapters.get(chapter_number - 1) {
+                    chapters.push(preview_chapter(chapter));
+                }
+            }
+            let description = strip_ordinal_prefix(plan.title.trim()).trim();
+            PreviewVolume {
+                title: ordinal_title("卷", volume_index + 1, description),
+                summary: plan.summary.clone().and_then(non_empty),
+                chapters,
+            }
+        })
+        .collect()
+}
+
+fn preview_chapter(chapter: &AssembledChapter) -> PreviewChapter {
+    PreviewChapter {
+        title: chapter.title.clone(),
+        outline: chapter.outline.clone(),
+    }
 }
 
 #[derive(Default)]
@@ -730,7 +953,7 @@ struct StructureAccumulator {
     world_view: Option<String>,
     background: Option<String>,
     summary: Option<String>,
-    volumes: Vec<PreviewVolume>,
+    volumes: Vec<VolumePlan>,
 }
 
 impl StructureAccumulator {
@@ -783,21 +1006,26 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
-/// 分批生成结构；单批截断时二分该批 summary，最终按批次顺序拼接。
+/// 分批生成结构；单批截断时二分该批章节区间，最终按批次顺序拼接。
 async fn generate_structure(
     llm: &LlmService,
     summaries: &[String],
     token: &CancellationToken,
 ) -> Result<StructureOutput, RunError> {
+    if summaries.is_empty() {
+        return Ok(StructureOutput::default());
+    }
     let clipped: Vec<String> = summaries
         .iter()
-        .map(|summary| clip_text(summary, SUMMARY_ITEM_LIMIT))
+        .map(|summary| clip_text(summary.trim(), STRUCTURE_SUMMARY_LIMIT))
         .collect();
-    let batches = split_into_batches(&clipped, STRUCTURE_BATCH_SIZE);
     let mut accumulator = StructureAccumulator::default();
-    for batch in batches {
-        let output = structure_batch(llm, &batch, token).await?;
+    let mut start = 1usize;
+    while start <= clipped.len() {
+        let end = (start + STRUCTURE_BATCH_SIZE - 1).min(clipped.len());
+        let output = structure_batch(llm, &clipped, start, end, token).await?;
         accumulator.absorb(output);
+        start = end + 1;
     }
     Ok(accumulator.finish())
 }
@@ -805,13 +1033,22 @@ async fn generate_structure(
 async fn structure_batch(
     llm: &LlmService,
     summaries: &[String],
+    start: usize,
+    end: usize,
     token: &CancellationToken,
 ) -> Result<StructureOutput, RunError> {
     ensure_active(token)?;
-    let numbered = numbered_summaries(summaries);
+    let batch = &summaries[start - 1..end];
+    let numbered = numbered_summaries(batch, start);
     let system = prompts::render(
         prompts::NOVEL_ANALYZE_STRUCTURE,
-        &json!({ "summaries": numbered, "chunk_count": summaries.len() }),
+        &json!({
+            "chapters": numbered,
+            "chapter_count": batch.len(),
+            "range_start": start,
+            "range_end": end,
+            "total_chapters": summaries.len(),
+        }),
     )
     .map_err(|e| RunError::Failed(e.message))?;
     let value = match structured_with_retry(
@@ -831,25 +1068,28 @@ async fn structure_batch(
                 LlmErrorKind::InvalidOutput | LlmErrorKind::Truncated
             ) =>
         {
-            return split_structure_batch(llm, summaries, token).await;
+            return split_structure_batch(llm, summaries, start, end, token).await;
         }
         Err(error) => return Err(error),
     };
     serde_json::from_value(value).map_err(|e| RunError::Failed(format!("结构结果解析失败: {e}")))
 }
 
-/// 截断批次的二分处理；单条 summary 仍失败时返回空结构，避免整单失败。
+/// 截断区间的二分处理；单章仍失败时返回空结构，交由确定性分组兜底。
 async fn split_structure_batch(
     llm: &LlmService,
     summaries: &[String],
+    start: usize,
+    end: usize,
     token: &CancellationToken,
 ) -> Result<StructureOutput, RunError> {
-    let Some((left, right)) = split_slice_half(summaries) else {
+    if start >= end {
         return Ok(StructureOutput::default());
-    };
+    }
+    let middle = start + (end - start) / 2;
     let mut accumulator = StructureAccumulator::default();
-    accumulator.absorb(Box::pin(structure_batch(llm, left, token)).await?);
-    accumulator.absorb(Box::pin(structure_batch(llm, right, token)).await?);
+    accumulator.absorb(Box::pin(structure_batch(llm, summaries, start, middle, token)).await?);
+    accumulator.absorb(Box::pin(structure_batch(llm, summaries, middle + 1, end, token)).await?);
     Ok(accumulator.into_output())
 }
 
@@ -919,11 +1159,25 @@ async fn structured_with_retry(
 struct ChunkOutput {
     summary: String,
     #[serde(default)]
+    beats: Vec<String>,
+    #[serde(default)]
     characters: Vec<PreviewCharacter>,
     #[serde(default)]
     items: Vec<PreviewItem>,
     #[serde(default)]
     relations: Vec<PreviewRelation>,
+}
+
+#[derive(Default, Clone, Deserialize)]
+struct VolumePlan {
+    #[serde(default)]
+    start: usize,
+    #[serde(default)]
+    end: usize,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    summary: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -936,7 +1190,7 @@ struct StructureOutput {
     #[serde(default)]
     summary: Option<String>,
     #[serde(default)]
-    volumes: Vec<PreviewVolume>,
+    volumes: Vec<VolumePlan>,
 }
 
 // ============================================================
@@ -968,13 +1222,6 @@ pub fn split_into_batches<T: Clone>(items: &[T], batch_size: usize) -> Vec<Vec<T
     items.chunks(batch_size).map(<[T]>::to_vec).collect()
 }
 
-fn split_slice_half<T>(items: &[T]) -> Option<(&[T], &[T])> {
-    if items.len() < 2 {
-        return None;
-    }
-    Some(items.split_at(items.len() / 2))
-}
-
 fn is_ordinal_numeral(c: char) -> bool {
     c.is_ascii_digit()
         || matches!(
@@ -989,6 +1236,8 @@ fn is_ordinal_numeral(c: char) -> bool {
                 | '九'
                 | '十'
                 | '百'
+                | '千'
+                | '万'
                 | '零'
                 | '〇'
                 | '两'
@@ -1083,28 +1332,29 @@ fn ordinal_title(unit: &str, index: usize, description: &str) -> String {
     }
 }
 
-/// 按合并后的顺序重编卷/章序号，并去除各批次自带的重复序号。
-fn renumber_volumes(volumes: &mut [PreviewVolume]) {
-    for (volume_index, volume) in volumes.iter_mut().enumerate() {
-        let description = strip_ordinal_prefix(volume.title.trim());
-        volume.title = ordinal_title("卷", volume_index + 1, description);
+// ============================================================
+// 原文解析 / 分块（章节边界由原文决定）
+// ============================================================
 
-        for (chapter_index, chapter) in volume.chapters.iter_mut().enumerate() {
-            let description = strip_ordinal_prefix(chapter.title.trim());
-            chapter.title = ordinal_title("章", chapter_index + 1, description);
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceChapter {
+    pub index: usize,
+    pub title: String,
+    pub text: String,
 }
 
-// ============================================================
-// 分块（章节标题优先，再按 6000 字符上限 + 200 字符重叠）
-// ============================================================
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChapterChunk {
+    pub chapter_index: usize,
+    pub text: String,
+}
 
 fn is_chapter_numeral(c: char) -> bool {
     c.is_ascii_digit()
         || matches!(
             c,
-            '零' | '一'
+            '零' | '〇'
+                | '一'
                 | '二'
                 | '三'
                 | '四'
@@ -1116,54 +1366,136 @@ fn is_chapter_numeral(c: char) -> bool {
                 | '十'
                 | '百'
                 | '千'
+                | '万'
+                | '两'
         )
 }
 
-pub fn is_chapter_heading(line: &str) -> bool {
-    let trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix('第') {
-        let mut numerals = 0usize;
-        let mut chars = rest.chars().peekable();
-        while let Some(&c) = chars.peek() {
-            if !is_chapter_numeral(c) || numerals >= 8 {
-                break;
-            }
-            chars.next();
-            numerals += 1;
+fn is_chinese_chapter_heading(content: &str) -> bool {
+    let Some(rest) = content.strip_prefix('第') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let mut numeral_end = 0usize;
+    for (index, c) in rest.char_indices() {
+        if !is_chapter_numeral(c) {
+            break;
         }
-        if numerals == 0 {
-            return false;
-        }
-        return matches!(chars.next(), Some('章' | '回' | '节' | '卷'));
+        numeral_end = index + c.len_utf8();
     }
-    let lowered = trimmed.to_lowercase();
-    if let Some(rest) = lowered.strip_prefix("chapter") {
-        let digits = rest
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .count();
-        return (1..=8).contains(&digits);
+    if numeral_end == 0 {
+        return false;
     }
-    false
+    let tail = rest[numeral_end..].trim_start();
+    matches!(tail.chars().next(), Some('章' | '回' | '节'))
 }
 
-fn chapter_segments(text: &str) -> Vec<String> {
-    let mut segments: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for line in text.split_inclusive('\n') {
-        if is_chapter_heading(line) && !current.trim().is_empty() {
-            segments.push(std::mem::take(&mut current));
+fn is_english_chapter_heading(content: &str) -> bool {
+    let lowered = content.to_lowercase();
+    let Some(rest) = lowered.strip_prefix("chapter") else {
+        return false;
+    };
+    let digits = rest
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .count();
+    (1..=8).contains(&digits)
+}
+
+/// 识别章节标题行；返回去除 Markdown `#` 与首尾空白后的原始标题。
+fn parse_chapter_heading(line: &str) -> Option<String> {
+    let content = line.trim().trim_start_matches('#').trim_start();
+    if content.is_empty() {
+        return None;
+    }
+    if !is_chinese_chapter_heading(content) && !is_english_chapter_heading(content) {
+        return None;
+    }
+    Some(content.trim_end().to_string())
+}
+
+fn push_source_chapter(
+    chapters: &mut Vec<SourceChapter>,
+    next_index: &mut usize,
+    title: String,
+    text: String,
+) {
+    chapters.push(SourceChapter {
+        index: *next_index,
+        title,
+        text,
+    });
+    *next_index += 1;
+}
+
+/// 按原文标题行切分章节，章节边界不再交给 LLM。
+pub fn split_into_chapters(raw: &str) -> Vec<SourceChapter> {
+    let mut chapters = Vec::new();
+    let mut next_index = 1usize;
+    let mut preface = String::new();
+    let mut current: Option<(String, String)> = None;
+
+    for line in raw.split_inclusive('\n') {
+        if let Some(title) = parse_chapter_heading(line) {
+            if let Some((title, text)) = current.take() {
+                push_source_chapter(&mut chapters, &mut next_index, title, text);
+            } else if preface.trim().chars().count() >= MIN_IMPORT_CHARS {
+                chapters.push(SourceChapter {
+                    index: 0,
+                    title: "前言".to_string(),
+                    text: std::mem::take(&mut preface),
+                });
+            } else {
+                preface.clear();
+            }
+            current = Some((title, String::new()));
+            continue;
         }
-        current.push_str(line);
+        match current.as_mut() {
+            Some((_, text)) => text.push_str(line),
+            None => preface.push_str(line),
+        }
     }
-    if !current.trim().is_empty() {
-        segments.push(current);
+
+    match current {
+        Some((title, text)) => push_source_chapter(&mut chapters, &mut next_index, title, text),
+        None if preface.trim().chars().count() >= MIN_IMPORT_CHARS => {
+            chapters.push(SourceChapter {
+                index: 0,
+                title: "前言".to_string(),
+                text: preface,
+            })
+        }
+        None => {}
     }
-    if segments.is_empty() && !text.trim().is_empty() {
-        segments.push(text.to_string());
+
+    chapters
+}
+
+/// 每个章节独立分块；长章节按现有重叠窗口切分，短章节绝不跨章合并。
+pub fn chunk_chapters(chapters: &[SourceChapter]) -> Result<Vec<ChapterChunk>, AppError> {
+    let mut chunks = Vec::new();
+    for chapter in chapters {
+        let text = chapter.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let (parts, _) = chunk_segment(text, usize::MAX);
+        for part in parts {
+            chunks.push(ChapterChunk {
+                chapter_index: chapter.index,
+                text: part,
+            });
+            if chunks.len() > MAX_CHUNKS {
+                return Err(AppError::validation(
+                    "文本过长，请拆分为多部后分别导入",
+                    json!({}),
+                ));
+            }
+        }
     }
-    segments
+    Ok(chunks)
 }
 
 fn char_boundary_after(text: &str, start: usize, count: usize) -> usize {
@@ -1217,26 +1549,6 @@ fn chunk_segment(segment: &str, limit: usize) -> (Vec<String>, bool) {
         start = if next <= start { end } else { next };
     }
     (chunks, false)
-}
-
-/// 按章节标题切段，再按字符上限切块；返回 (chunks, 是否因 MAX_CHUNKS 截断)。
-pub fn split_into_chunks(text: &str) -> (Vec<String>, bool) {
-    let mut chunks = Vec::new();
-    let mut truncated = false;
-    for segment in chapter_segments(text) {
-        let remaining = MAX_CHUNKS.saturating_sub(chunks.len());
-        if remaining == 0 {
-            truncated = true;
-            break;
-        }
-        let (mut part, cut) = chunk_segment(&segment, remaining);
-        truncated |= cut;
-        chunks.append(&mut part);
-        if truncated {
-            break;
-        }
-    }
-    (chunks, truncated)
 }
 
 // ============================================================
@@ -1391,11 +1703,11 @@ pub fn layer_summaries(input: &[String]) -> Vec<String> {
     current
 }
 
-fn numbered_summaries(items: &[String]) -> String {
+fn numbered_summaries(items: &[String], start: usize) -> String {
     items
         .iter()
         .enumerate()
-        .map(|(index, summary)| format!("{}. {}", index + 1, summary))
+        .map(|(index, summary)| format!("{}. {}", start + index, summary))
         .collect::<Vec<_>>()
         .join("\n")
 }

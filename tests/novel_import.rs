@@ -10,19 +10,22 @@ use axum::Router;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+use story_architect::error::ErrorCode;
 use story_architect::jobs::novel_import_cleanup::run_once as cleanup_imports;
 use story_architect::llm::failover::ProviderChain;
 use story_architect::llm::mock::MockProvider;
 use story_architect::llm::{LlmError, LlmErrorKind, StructuredMode};
 use story_architect::models::import::{NovelImportStatus, PreviewCharacter, PreviewRelation};
 use story_architect::services::novel_import::{
-    chinese_numeral, layer_summaries, merge_characters, merge_relations, split_half_at_boundary,
-    split_into_batches, split_into_chunks, strip_ordinal_prefix, ImportRegistry,
+    chinese_numeral, chunk_chapters, layer_summaries, merge_characters, merge_relations,
+    split_half_at_boundary, split_into_batches, split_into_chapters, strip_ordinal_prefix,
+    ImportRegistry,
 };
 use story_architect::state::AppState;
 
 const CHUNK_ONE: &str = r#"{
   "summary": "第一章摘要：少年林默在山村长大，偶得祖传玉佩。",
+  "beats": ["林默在山村拾到祖传玉佩", "玉佩背面刻着陌生剑纹"],
   "characters": [
     {"name":"林默","role_type":"support","appearance":"黑衣少年","personality":"沉默","biography":"山村少年","current_goal":"寻找身世"},
     {"name":"苏晚","role_type":"deuteragonist","appearance":"白衣女子","personality":"冷静","biography":"神秘剑客"}
@@ -37,6 +40,7 @@ const CHUNK_ONE: &str = r#"{
 
 const CHUNK_TWO: &str = r#"{
   "summary": "第二章摘要：林默下山，与苏晚再度相遇。",
+  "beats": ["林默带着玉佩下山谋生", "林默在集市初遇苏晚"],
   "characters": [
     {"name":"林默","role_type":"protagonist","appearance":"","personality":"坚毅","hidden_personality":"重情","biography":"山村少年，身负血仇，踏上修行之路，逐渐成长为一代剑客","speaking_style":"寡言"},
     {"name":"苏晚","role_type":"support","biography":"神秘剑客"}
@@ -49,6 +53,7 @@ const CHUNK_TWO: &str = r#"{
 
 const CHUNK_THREE: &str = r#"{
   "summary": "第三章摘要：两人联手对抗敌人。",
+  "beats": ["追兵循玉佩气息找到林默", "林默与苏晚在破庙并肩退敌"],
   "characters": [
     {"name":"林默","role_type":"protagonist"},
     {"name":"苏晚","role_type":"deuteragonist"}
@@ -65,18 +70,14 @@ const STRUCTURE: &str = r#"{
   "background": "少年复仇",
   "summary": "林默与苏晚的成长故事",
   "volumes": [
-    {"title":"第一卷 山村少年","summary":"林默离乡","chapters":[
-      {"title":"第一章 初入江湖","outline":"林默离开山村，在集市初遇苏晚，因玉佩被追兵盯上。"},
-      {"title":"第二章 并肩而战","outline":"林默与苏晚在破庙联手退敌，互相信任。"}
-    ]},
-    {"title":"第二卷 风云再起","summary":"更大的阴谋","chapters":[
-      {"title":"第三章 血仇浮现","outline":"林默得知灭门真相，决心复仇。"}
-    ]}
+    {"start":1,"end":2,"title":"山村少年","summary":"林默离乡"},
+    {"start":3,"end":3,"title":"风云再起","summary":"更大的阴谋"}
   ]
 }"#;
 
 const SUBCHUNK_LEFT: &str = r#"{
   "summary": "左半摘要",
+  "beats": ["左半段事件"],
   "characters": [
     {"name":"林默","role_type":"protagonist","biography":"山村少年"},
     {"name":"苏晚","role_type":"support"}
@@ -89,6 +90,7 @@ const SUBCHUNK_LEFT: &str = r#"{
 
 const SUBCHUNK_RIGHT: &str = r#"{
   "summary": "右半摘要",
+  "beats": ["右半段事件"],
   "characters": [
     {"name":"苏晚","role_type":"deuteragonist"},
     {"name":"顾寒","role_type":"antagonist"}
@@ -103,6 +105,7 @@ const SUBCHUNK_RIGHT: &str = r#"{
 
 const SURVIVOR_CHUNK: &str = r#"{
   "summary": "可解析片段",
+  "beats": ["片段事件"],
   "characters": [
     {"name":"留存角色","role_type":"support"}
   ],
@@ -111,64 +114,51 @@ const SURVIVOR_CHUNK: &str = r#"{
 }"#;
 
 const STRUCTURE_BATCH_A: &str = r#"{
-  "title": "",
-  "world_view": "",
-  "background": "",
-  "summary": "",
+  "title": "全书标题",
+  "world_view": "武道世界",
+  "background": "少年复仇",
+  "summary": "全书简介",
   "volumes": [
-    {"title":"卷甲","summary":"","chapters":[
-      {"title":"章甲一","outline":"甲一剧情推进"},
-      {"title":"章甲二","outline":"甲二剧情推进"}
-    ]}
+    {"start":1,"end":3,"title":"卷甲","summary":"甲部剧情"},
+    {"start":4,"end":6,"title":"卷乙","summary":"乙部剧情"}
   ]
 }"#;
 
 const STRUCTURE_BATCH_B: &str = r#"{
   "title": "",
   "volumes": [
-    {"title":"卷乙","summary":"","chapters":[
-      {"title":"章乙一","outline":"乙一剧情推进"}
-    ]}
+    {"start":7,"end":8,"title":"卷丙","summary":"丙部剧情"},
+    {"start":9,"end":11,"title":"卷丁","summary":"丁部剧情"}
   ]
 }"#;
 
-const STRUCTURE_BATCH_C: &str = r#"{
-  "title": "全书标题",
-  "world_view": "武道世界",
-  "background": "少年复仇",
-  "summary": "全书简介",
+const STRUCTURE_FIVE: &str = r#"{
+  "title": "五章短篇",
   "volumes": [
-    {"title":"卷丙","summary":"","chapters":[
-      {"title":"章丙一","outline":"丙一剧情推进"},
-      {"title":"章丙二","outline":"丙二剧情推进"},
-      {"title":"章丙三","outline":"丙三剧情推进"}
-    ]}
+    {"start":1,"end":5,"title":"全篇","summary":"五章剧情"}
+  ]
+}"#;
+
+const STRUCTURE_INVALID_OVERLAP: &str = r#"{
+  "title": "坏结构",
+  "volumes": [
+    {"start":1,"end":10,"title":"重叠甲","summary":"甲"},
+    {"start":5,"end":15,"title":"重叠乙","summary":"乙"}
   ]
 }"#;
 
 const STRUCTURE_RENUMBER_A: &str = r#"{
   "title": "书名",
   "volumes": [
-    {"title":"第一卷 甲部","chapters":[
-      {"title":"第一章 开端","outline":"甲部开端"},
-      {"title":"第二章 发展","outline":"甲部发展"}
-    ]},
-    {"title":"第二卷 乙部","chapters":[
-      {"title":"第一章 转折","outline":"乙部转折"},
-      {"title":"第二章 高潮","outline":"乙部高潮"}
-    ]}
+    {"start":1,"end":15,"title":"第一卷 甲部","summary":"甲部剧情"},
+    {"start":16,"end":30,"title":"第二卷 乙部","summary":"乙部剧情"}
   ]
 }"#;
 
 const STRUCTURE_RENUMBER_B: &str = r#"{
   "title": "书名",
   "volumes": [
-    {"title":"第一卷 丙部","chapters":[
-      {"title":"第一章 收束","outline":"丙部收束"}
-    ]},
-    {"title":"第二卷 丁部","chapters":[
-      {"title":"第一章 尾声","outline":"丁部尾声"}
-    ]}
+    {"start":31,"end":31,"title":"第一卷 丙部","summary":"丙部剧情"}
   ]
 }"#;
 
@@ -391,7 +381,7 @@ async fn novel_import_end_to_end() {
 
     let hits = story_architect::services::search::search(
         &state.pool,
-        "初入江湖",
+        "山村少年",
         None,
         Some(&novel_id),
         1,
@@ -403,7 +393,7 @@ async fn novel_import_end_to_end() {
     assert!(
         hits.items
             .iter()
-            .any(|hit| hit.entity_type == "chapter" && hit.title.contains("初入江湖")),
+            .any(|hit| hit.entity_type == "chapter" && hit.title.contains("山村少年")),
         "FTS 应能检索到新章节: {:?}",
         hits.items
     );
@@ -653,7 +643,6 @@ async fn structure_truncation_splits_batches_and_merges_volumes() {
     mock.push_err(truncation_error());
     mock.push_ok(STRUCTURE_BATCH_A);
     mock.push_ok(STRUCTURE_BATCH_B);
-    mock.push_ok(STRUCTURE_BATCH_C);
     let (state, app) = build_mock_state(mock.clone()).await;
 
     let text = text_with_chapters(11, 300);
@@ -664,7 +653,7 @@ async fn structure_truncation_splits_batches_and_merges_volumes() {
     assert_eq!(job["status"], "ready", "job: {job}");
     assert_eq!(job["chunks_total"], 11);
     assert_eq!(job["chunks_done"], 11);
-    assert_eq!(mock.call_count(), 15, "11 分块 + 1 超限 + 2 子批 + 1 尾批");
+    assert_eq!(mock.call_count(), 14, "11 分块 + 1 超限 + 2 个二分区间");
 
     let (status, body) = common::call(
         &app,
@@ -676,12 +665,12 @@ async fn structure_truncation_splits_batches_and_merges_volumes() {
     assert_eq!(status, StatusCode::OK, "preview: {body}");
     assert_eq!(body["title"], "全书标题");
     let volumes = body["volumes"].as_array().expect("volumes");
-    assert_eq!(volumes.len(), 3, "分批结果必须按顺序拼接: {body}");
+    assert_eq!(volumes.len(), 4, "二分结果必须按顺序拼接: {body}");
     let chapter_counts: Vec<usize> = volumes
         .iter()
         .map(|volume| volume["chapters"].as_array().expect("chapters").len())
         .collect();
-    assert_eq!(chapter_counts, vec![2, 1, 3]);
+    assert_eq!(chapter_counts, vec![3, 3, 2, 3]);
 }
 
 #[tokio::test]
@@ -695,7 +684,6 @@ async fn truncated_structure_bisects_after_budget_escalation() {
     mock.push_err(truncated_error());
     mock.push_ok(STRUCTURE_BATCH_A);
     mock.push_ok(STRUCTURE_BATCH_B);
-    mock.push_ok(STRUCTURE_BATCH_C);
     let (state, app) = build_mock_state(mock.clone()).await;
 
     let text = text_with_chapters(11, 300);
@@ -707,8 +695,8 @@ async fn truncated_structure_bisects_after_budget_escalation() {
     assert_eq!(job["chunks_total"], 11);
     assert_eq!(
         mock.call_count(),
-        16,
-        "11 分块 + 2 次截断（含升级重试） + 2 子批 + 1 尾批"
+        15,
+        "11 分块 + 2 次截断（含升级重试） + 2 个二分区间"
     );
 
     let (status, body) = common::call(
@@ -719,20 +707,20 @@ async fn truncated_structure_bisects_after_budget_escalation() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "preview: {body}");
-    assert_eq!(body["volumes"].as_array().expect("volumes").len(), 3);
+    assert_eq!(body["volumes"].as_array().expect("volumes").len(), 4);
 }
 
 #[tokio::test]
 async fn structure_batches_are_renumbered_without_duplicate_ordinals() {
     let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
-    for _ in 0..11 {
+    for _ in 0..31 {
         mock.push_ok(SURVIVOR_CHUNK);
     }
     mock.push_ok(STRUCTURE_RENUMBER_A);
     mock.push_ok(STRUCTURE_RENUMBER_B);
     let (state, app) = build_mock_state(mock.clone()).await;
 
-    let text = text_with_chapters(11, 300);
+    let text = text_with_chapters(31, 300);
     let (status, created) = upload(&app, &text, "renumber.txt").await;
     assert_eq!(status, StatusCode::ACCEPTED, "upload: {created}");
     let job_id = created["id"].as_str().expect("job id").to_string();
@@ -748,30 +736,60 @@ async fn structure_batches_are_renumbered_without_duplicate_ordinals() {
     .await;
     assert_eq!(status, StatusCode::OK, "preview: {body}");
     let volumes = body["volumes"].as_array().expect("volumes");
-    assert_eq!(volumes.len(), 4, "两个批次各 2 卷: {body}");
+    assert_eq!(volumes.len(), 3, "两个批次共 3 卷: {body}");
     let titles: Vec<&str> = volumes
         .iter()
         .map(|volume| volume["title"].as_str().expect("volume title"))
         .collect();
-    assert_eq!(
-        titles,
-        vec!["第一卷 甲部", "第二卷 乙部", "第三卷 丙部", "第四卷 丁部"]
-    );
-    let expected_chapters = [
-        vec!["第一章 开端", "第二章 发展"],
-        vec!["第一章 转折", "第二章 高潮"],
-        vec!["第一章 收束"],
-        vec!["第一章 尾声"],
-    ];
-    for (volume, expected) in volumes.iter().zip(expected_chapters) {
-        let chapters: Vec<&str> = volume["chapters"]
-            .as_array()
-            .expect("chapters")
-            .iter()
-            .map(|chapter| chapter["title"].as_str().expect("chapter title"))
-            .collect();
-        assert_eq!(chapters, expected);
+    assert_eq!(titles, vec!["第一卷 甲部", "第二卷 乙部", "第三卷 丙部"]);
+    let chapter_counts: Vec<usize> = volumes
+        .iter()
+        .map(|volume| volume["chapters"].as_array().expect("chapters").len())
+        .collect();
+    assert_eq!(chapter_counts, vec![15, 15, 1]);
+    let last_chapter = volumes[2]["chapters"][0]["title"]
+        .as_str()
+        .expect("chapter title");
+    assert_eq!(last_chapter, "第31章 测试");
+}
+
+#[tokio::test]
+async fn structure_ranges_invalid_falls_back_to_deterministic_grouping() {
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..15 {
+        mock.push_ok(SURVIVOR_CHUNK);
     }
+    mock.push_ok(STRUCTURE_INVALID_OVERLAP);
+    let (state, app) = build_mock_state(mock.clone()).await;
+
+    let text = text_with_chapters(15, 300);
+    let (status, created) = upload(&app, &text, "invalid-ranges.txt").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "upload: {created}");
+    let job_id = created["id"].as_str().expect("job id").to_string();
+    let job = wait_terminal(&state, &job_id).await;
+    assert_eq!(job["status"], "ready", "job: {job}");
+    assert_eq!(job["chunks_total"], 15);
+
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novel-imports/{job_id}/preview"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preview: {body}");
+    assert_eq!(body["title"], "坏结构", "元信息仍可保留: {body}");
+    let volumes = body["volumes"].as_array().expect("volumes");
+    assert_eq!(volumes.len(), 2, "15 章应按 10 章一卷回退: {body}");
+    let chapter_counts: Vec<usize> = volumes
+        .iter()
+        .map(|volume| volume["chapters"].as_array().expect("chapters").len())
+        .collect();
+    assert_eq!(chapter_counts, vec![10, 5]);
+    assert!(
+        chapter_counts.iter().all(|count| *count <= 10),
+        "回退卷不得超过 10 章: {chapter_counts:?}"
+    );
 }
 
 #[tokio::test]
@@ -834,37 +852,164 @@ async fn upload_rejects_invalid_input() {
 }
 
 #[test]
+fn split_into_chapters_handles_variants() {
+    let mut raw = "前".repeat(200);
+    raw.push('\n');
+    raw.push_str("第1章 开端\n开篇正文。\n");
+    raw.push_str("第一章 第二章名\n后续正文内容。\n");
+    raw.push_str("第一百二十三章 终局\n终局正文。\n");
+    raw.push_str("Chapter 3 Title\nEnglish body.\n");
+    raw.push_str("##第5章 五\n收尾正文内容。\n");
+
+    let chapters = split_into_chapters(&raw);
+    let titles: Vec<&str> = chapters
+        .iter()
+        .map(|chapter| chapter.title.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        vec![
+            "前言",
+            "第1章 开端",
+            "第一章 第二章名",
+            "第一百二十三章 终局",
+            "Chapter 3 Title",
+            "第5章 五"
+        ]
+    );
+    let indices: Vec<usize> = chapters.iter().map(|chapter| chapter.index).collect();
+    assert_eq!(indices, vec![0, 1, 2, 3, 4, 5]);
+    assert!(chapters[1].text.contains("开篇正文"));
+    assert!(chapters[4].text.contains("English body"));
+
+    let short_preface = format!("{}\n第1章 正文\n内容", "短".repeat(10));
+    let chapters = split_into_chapters(&short_preface);
+    assert_eq!(chapters.len(), 1, "不足 200 字的前言应丢弃");
+    assert_eq!(chapters[0].index, 1);
+    assert_eq!(chapters[0].title, "第1章 正文");
+}
+
+#[test]
+fn long_chapter_splits_without_crossing_boundary() {
+    let mut raw = String::from("第1章 长\n");
+    raw.push_str(&"甲".repeat(15_000));
+    raw.push('\n');
+    raw.push_str("第2章 短\n");
+    raw.push_str(&"乙".repeat(300));
+
+    let chapters = split_into_chapters(&raw);
+    assert_eq!(chapters.len(), 2);
+    let chunks = chunk_chapters(&chapters).expect("chunk");
+    let first: Vec<_> = chunks
+        .iter()
+        .filter(|chunk| chunk.chapter_index == 1)
+        .collect();
+    let second: Vec<_> = chunks
+        .iter()
+        .filter(|chunk| chunk.chapter_index == 2)
+        .collect();
+    assert!(first.len() > 1, "15000 字应切成多块");
+    assert_eq!(second.len(), 1);
+    assert_eq!(first.len() + second.len(), chunks.len());
+    assert!(first.iter().all(|chunk| !chunk.text.contains('乙')));
+    assert!(second.iter().all(|chunk| !chunk.text.contains('甲')));
+}
+
+#[test]
 fn chunking_prefers_chapter_headings() {
-    let text = novel_text();
-    let (chunks, truncated) = split_into_chunks(&text);
-    assert!(!truncated);
+    let chapters = split_into_chapters(&novel_text());
+    assert_eq!(chapters.len(), 3);
+    let titles: Vec<&str> = chapters
+        .iter()
+        .map(|chapter| chapter.title.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        vec!["第一章 山村少年", "第二章 下山", "第三章 联手"]
+    );
+    let chunks = chunk_chapters(&chapters).expect("chunk");
     assert_eq!(chunks.len(), 3);
-    assert!(chunks[0].contains("第一章 山村少年"));
-    assert!(chunks[1].contains("第二章 下山"));
-    assert!(chunks[2].contains("第三章 联手"));
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.chapter_index)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
 }
 
 #[test]
 fn chunking_splits_long_text_with_overlap() {
-    let text = "a".repeat(13_000);
-    let (chunks, truncated) = split_into_chunks(&text);
-    assert!(!truncated);
+    let chapters = split_into_chapters(&"a".repeat(13_000));
+    assert_eq!(chapters.len(), 1, "无标题长文本作为前言保留");
+    let chunks = chunk_chapters(&chapters).expect("chunk");
     assert_eq!(chunks.len(), 3);
-    let first_tail: String = chunks[0].chars().skip(5_800).collect();
-    let second_head: String = chunks[1].chars().take(200).collect();
+    let first_tail: String = chunks[0].text.chars().skip(5_800).collect();
+    let second_head: String = chunks[1].text.chars().take(200).collect();
     assert_eq!(first_tail, second_head, "相邻分块应有 200 字符重叠");
     assert_eq!(
-        chunks.iter().map(|c| c.len()).sum::<usize>(),
+        chunks.iter().map(|chunk| chunk.text.len()).sum::<usize>(),
         13_000 + 200 + 200
     );
 }
 
 #[test]
 fn chunking_respects_max_chunks() {
-    let text = "b".repeat(6000 * 250);
-    let (chunks, truncated) = split_into_chunks(&text);
-    assert!(truncated);
-    assert_eq!(chunks.len(), 200);
+    let text = "b".repeat(6000 * 500);
+    let chapters = split_into_chapters(&text);
+    assert_eq!(chapters.len(), 1);
+    let error = chunk_chapters(&chapters).expect_err("超过 400 块必须失败");
+    assert!(matches!(error.code, ErrorCode::ValidationFailed));
+    assert!(
+        error.message.contains("文本过长"),
+        "message: {}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn chapters_are_never_merged() {
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..5 {
+        mock.push_ok(SURVIVOR_CHUNK);
+    }
+    mock.push_ok(STRUCTURE_FIVE);
+    let (state, app) = build_mock_state(mock.clone()).await;
+
+    let text = text_with_chapters(5, 300);
+    let (status, created) = upload(&app, &text, "five-chapters.txt").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "upload: {created}");
+    let job_id = created["id"].as_str().expect("job id").to_string();
+    let job = wait_terminal(&state, &job_id).await;
+    assert_eq!(job["status"], "ready", "job: {job}");
+    assert_eq!(job["chunks_total"], 5);
+
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novel-imports/{job_id}/preview"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preview: {body}");
+    let volumes = body["volumes"].as_array().expect("volumes");
+    assert_eq!(volumes.len(), 1);
+    let chapters = volumes[0]["chapters"].as_array().expect("chapters");
+    assert_eq!(chapters.len(), 5, "5 个短章不得合并: {body}");
+    let titles: Vec<&str> = chapters
+        .iter()
+        .map(|chapter| chapter["title"].as_str().expect("chapter title"))
+        .collect();
+    assert_eq!(
+        titles,
+        vec![
+            "第1章 测试",
+            "第2章 测试",
+            "第3章 测试",
+            "第4章 测试",
+            "第5章 测试"
+        ]
+    );
 }
 
 #[test]

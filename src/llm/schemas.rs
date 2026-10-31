@@ -67,9 +67,14 @@ pub fn novel_chunk_schema() -> Value {
     json!({
         "type": "object",
         "additionalProperties": false,
-        "required": ["summary", "characters", "items", "relations"],
+        "required": ["summary", "beats", "characters", "items", "relations"],
         "properties": {
             "summary": { "type": "string" },
+            "beats": {
+                "type": "array",
+                "maxItems": 6,
+                "items": { "type": "string", "maxLength": 40 }
+            },
             "characters": {
                 "type": "array",
                 "items": {
@@ -138,22 +143,12 @@ pub fn novel_structure_schema() -> Value {
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": ["title", "chapters"],
+                    "required": ["start", "end", "title", "summary"],
                     "properties": {
+                        "start": { "type": "integer" },
+                        "end": { "type": "integer" },
                         "title": { "type": "string" },
-                        "summary": { "type": "string" },
-                        "chapters": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": ["title", "outline"],
-                                "properties": {
-                                    "title": { "type": "string" },
-                                    "outline": { "type": "string" }
-                                }
-                            }
-                        }
+                        "summary": { "type": "string" }
                     }
                 }
             }

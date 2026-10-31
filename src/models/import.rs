@@ -176,6 +176,10 @@ pub(crate) struct AnalysisData {
     pub background: Option<String>,
     pub summary: Option<String>,
     pub volumes: Vec<PreviewVolume>,
+    /// 分块阶段按原文顺序收集的「实际情节」条目，仅供内部审计；
+    /// 对外 DTO（NovelImportPreview）不暴露该字段。
+    #[serde(default)]
+    pub beats: Vec<String>,
     pub characters: Vec<PreviewCharacter>,
     pub relations: Vec<PreviewRelation>,
     pub items: Vec<PreviewItem>,

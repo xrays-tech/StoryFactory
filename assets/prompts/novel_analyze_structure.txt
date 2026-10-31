@@ -1,20 +1,22 @@
-你是一名资深小说策划。下面是本片段的分块摘要（共 {{ chunk_count }} 段，已编号）。
-请只针对这一批摘要，构建本片段对应的项目结构；其它批次会另行生成并在之后合并。
+你是一名资深小说策划。章节边界已经由原文确定，你只负责卷的划分和作品级元信息。
+
+下面是原文章节的摘要（当前批次覆盖原文章节 {{ range_start }}..{{ range_end }}，全书共 {{ total_chapters }} 章，本批 {{ chapter_count }} 章，已用原文章节序号编号）。
 
 只输出一个 JSON 对象，不要 Markdown 代码块，不要解释，不要任何多余文本。
 
 JSON 输出格式示例：
-{"title":"小说书名","world_view":"世界观设定","background":"故事背景","summary":"全书简介","volumes":[{"title":"第一卷 卷名","summary":"本卷摘要","chapters":[{"title":"第一章 章名","outline":"本章大纲"}]}]}
+{"title":"小说书名","world_view":"世界观设定","background":"故事背景","summary":"全书简介","volumes":[{"start":1,"end":10,"title":"楚家暗流","summary":"本卷摘要"}]}
 
 硬性约束：
 - title 简洁，不超过 60 字；没有把握时留空字符串。
 - world_view、background、summary 各不超过 500 字；没有内容时留空字符串。
 - summary 直接叙述剧情本身，禁止出现「本片段」「本批」「摘要中」这类元描述。
-- volumes 为 1..4 卷，按故事时间顺序排列。
-- 每卷 chapters 为 1..12 章，chapter_index 由输出顺序隐含。
-- 每章 outline 为 80..200 字，包含场景、冲突与推进。
+- volumes 必须连续覆盖本批区间 {{ range_start }}..{{ range_end }}：第一个 start 等于 {{ range_start }}，最后一个 end 等于 {{ range_end }}，相邻卷 end+1 等于下一卷 start，不得重叠或留空洞。
+- 每卷 1..30 章；start、end 都是原文章节序号（1-based，end 含）。
+- title 只写卷名（例如「楚家暗流」），不要带「第X卷」前缀，编号由系统生成。
+- 不得输出章节标题或章节大纲；章节由原文决定。
 - 不得输出摘要中不存在的人物或事件；信息不足时做合理概括，但不要编造专有名词。
 - 所有字段都必须出现；没有内容时使用空字符串或空数组。
 
-分块摘要：
-{{ summaries }}
+原文章节摘要：
+{{ chapters }}
