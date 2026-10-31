@@ -25,6 +25,13 @@ cargo build --release
 - 默认监听 `127.0.0.1:8080`，数据目录遵循平台约定（macOS `~/Library/Application Support/StoryArchitect`、Linux `~/.local/share/story-architect`、Windows `%APPDATA%/StoryArchitect`），可用 `APP_DATA_DIR` 覆盖。
 - 同一数据目录只允许一个实例（`story-architect.lock`）；重复启动会直接报错退出，避免多个进程对同一 WAL 各自持有视图。
 - 用 `scripts/serve.sh` 启动时进程已脱离终端：命令立即返回，不会在任务面板里显示成「一直运行中」。
+- 清空全部业务数据（项目/卷章/角色/道具/沙盒/导入任务/用量），保留 LLM 配置与提示词模板：
+  ```bash
+  scripts/reset-data.sh            # 停服 → 清空 → 重启
+  scripts/reset-data.sh --no-start # 只清空
+  scripts/reset-data.sh --yes      # 免确认
+  ```
+  必须停服后执行：服务运行期间用其它进程写同一个库会让新旧连接指向不同的 WAL inode。
 - `APP_BIND=0.0.0.0` 时强制启动令牌（`app.token`，0600），首次访问用 `?token=`，前端存储后以 `X-App-Token` 发送。
 - LLM 密钥只从环境变量读取：`APP_LLM_API_KEY`、`APP_LLM_FALLBACK_API_KEY_<N>`；不写入数据库/日志。
 
