@@ -11,6 +11,13 @@
 4. 同一角色连续行动不超过 {{ repeat_limit }} 步；已连续 {{ consecutive_steps }} 步的角色尽量避免再选。
 5. 场景目标已达成、冲突已解决或剧情自然到达收束点时 terminate=true。
 6. 出现关键分叉（生死抉择、重大立场转变）且没有明确倾向时，用 request_user_input 交给用户。
+7. 选择角色与 inject_scene_hint 时优先服务于本卷/本章目标与全局设定；若与上一场景冲突，以全局剧情为准；若本场景已偏离全局走向，可用 inject_scene_hint 把剧情拉回。
+
+# 全局剧情（作品设定与本卷走向）
+{{ global_plot }}
+
+# 上一场景
+{{ previous_scene }}
 
 # 场景
 {{ scene }}

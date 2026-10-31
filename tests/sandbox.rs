@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde_json::json;
 use story_architect::llm::failover::ProviderChain;
 use story_architect::llm::mock::MockProvider;
-use story_architect::llm::StructuredMode;
+use story_architect::llm::{MessageRole, Purpose, StructuredMode};
 use story_architect::models::sandbox::{
     ControlAction, CreateSessionReq, DirectorMode, SessionSnapshot, SessionStatus,
 };
@@ -28,6 +28,20 @@ fn actor_json(text: &str) -> String {
 
 fn outline_text() -> String {
     "## 章节标题\n雨夜\n## 剧情梗概\n这是测试大纲。".to_string()
+}
+
+fn director_prompt(provider: &MockProvider) -> String {
+    provider
+        .captured_requests()
+        .into_iter()
+        .find(|(purpose, _)| *purpose == Purpose::Director)
+        .and_then(|(_, messages)| {
+            messages
+                .into_iter()
+                .find(|message| message.role == MessageRole::System)
+        })
+        .map(|message| message.content)
+        .expect("应捕获到导演 system prompt")
 }
 
 fn mock_chain(responses: Vec<String>) -> ProviderChain {
@@ -1017,6 +1031,205 @@ async fn create_session_rejects_foreign_chapter() {
             .await
             .unwrap();
     assert_eq!(sessions, 0, "校验失败时不得写入会话");
+}
+
+#[tokio::test]
+async fn director_prompt_includes_global_plot_volume_and_previous_chapter() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    let state = test_state_with_chain(Some(ProviderChain::new(
+        vec![provider.clone()],
+        0,
+        Duration::from_secs(2),
+    )))
+    .await;
+    let app = test_app(state.clone());
+    let nid = create_novel(&app, "星海回声").await;
+    let actor = create_character(&app, &nid, "角色A").await;
+    let vol1 = create_volume(&app, &nid, "第一卷").await;
+    create_chapter(&app, &nid, &vol1, "第一章 启程").await;
+    create_chapter(&app, &nid, &vol1, "第二章 暗流").await;
+    let vol2 = create_volume(&app, &nid, "第二卷 破晓").await;
+    let prev_cid = create_chapter(&app, &nid, &vol2, "第三章 封锁").await;
+    let current_cid = create_chapter(&app, &nid, &vol2, "第四章 归途").await;
+
+    sqlx::query("UPDATE novels SET world_view = ?, background = ?, summary = ? WHERE id = ?")
+        .bind("世界观：星海帝国与失落舰队对峙。")
+        .bind("背景：边境星域战云密布。")
+        .bind("简介：信使寻找失踪的指挥官。")
+        .bind(&nid)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE volumes SET summary = ? WHERE id = ?")
+        .bind("卷摘要：主角重返边境。")
+        .bind(&vol2)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE chapters SET final_outline = ? WHERE id = ?")
+        .bind("上一章大纲：主角穿越封锁线。")
+        .bind(&prev_cid)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE chapters SET final_outline = ? WHERE id = ?")
+        .bind("本章既有大纲：抵达归途港。")
+        .bind(&current_cid)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    provider.push_ok(json!({ "next_actor_id": actor, "reason": "推进本章目标" }).to_string());
+    provider.push_ok(actor_json("抵达归途港"));
+    provider.push_ok(outline_text());
+
+    let req = CreateSessionReq {
+        chapter_id: None,
+        actor_ids: vec![actor],
+        mode: DirectorMode::Director,
+        scene_prompt: "归途港的雨夜，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state
+        .sessions
+        .create(&nid, Some(&current_cid), req)
+        .await
+        .unwrap();
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let prompt = director_prompt(&provider);
+    assert!(
+        prompt.contains("星海帝国与失落舰队对峙"),
+        "prompt 缺少作品世界观: {prompt}"
+    );
+    assert!(
+        prompt.contains("第2卷《破晓》"),
+        "prompt 缺少卷定位: {prompt}"
+    );
+    assert!(
+        prompt.contains("本章：第2章《归途》"),
+        "prompt 缺少当前章定位: {prompt}"
+    );
+    assert!(prompt.contains("← 当前章"), "prompt 未标出当前章: {prompt}");
+    assert!(
+        prompt.contains("上一章大纲：主角穿越封锁线。"),
+        "prompt 缺少上一章大纲: {prompt}"
+    );
+    let global_at = prompt.find("# 全局剧情").expect("缺少全局剧情小节");
+    let scene_at = prompt.find("# 场景").expect("缺少场景小节");
+    assert!(global_at < scene_at, "全局剧情必须位于场景之前");
+}
+
+#[tokio::test]
+async fn director_prompt_uses_recent_completed_session_as_previous_scene() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    let state = test_state_with_chain(Some(ProviderChain::new(
+        vec![provider.clone()],
+        0,
+        Duration::from_secs(2),
+    )))
+    .await;
+    let app = test_app(state.clone());
+    let nid = create_novel(&app, "无章节小说").await;
+    let actor = create_character(&app, &nid, "角色A").await;
+    sqlx::query("UPDATE novels SET world_view = ? WHERE id = ?")
+        .bind("世界观：海上城邦。")
+        .bind(&nid)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO sandbox_sessions(id, novel_id, scene_prompt, actor_ids, mode, status, step_limit, current_step, summary_text, finished_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s','now'))",
+    )
+    .bind("prior-completed-session")
+    .bind(&nid)
+    .bind("码头分别")
+    .bind("[]")
+    .bind("director")
+    .bind("completed")
+    .bind(5_i64)
+    .bind(1_i64)
+    .bind("上一场：他们在码头分手")
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    provider.push_ok(json!({ "next_actor_id": actor, "reason": "承接上一场" }).to_string());
+    provider.push_ok(actor_json("码头重逢"));
+    provider.push_ok(outline_text());
+
+    let req = CreateSessionReq {
+        chapter_id: None,
+        actor_ids: vec![actor],
+        mode: DirectorMode::Director,
+        scene_prompt: "码头重逢，海风裹着咸味。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, None, req).await.unwrap();
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let prompt = director_prompt(&provider);
+    assert!(
+        prompt.contains("上一场：他们在码头分手"),
+        "prompt 的上一场景应回退到最近完成会话的摘要: {prompt}"
+    );
+    assert!(
+        !prompt.contains("（无前置场景"),
+        "存在历史会话时不应输出无前置场景文案"
+    );
+}
+
+#[tokio::test]
+async fn director_prompt_marks_missing_previous_scene() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    let state = test_state_with_chain(Some(ProviderChain::new(
+        vec![provider.clone()],
+        0,
+        Duration::from_secs(2),
+    )))
+    .await;
+    let app = test_app(state.clone());
+    let nid = create_novel(&app, "起点小说").await;
+    let actor = create_character(&app, &nid, "角色A").await;
+
+    provider.push_ok(json!({ "next_actor_id": actor, "reason": "开场" }).to_string());
+    provider.push_ok(actor_json("序幕拉开"));
+    provider.push_ok(outline_text());
+
+    let req = CreateSessionReq {
+        chapter_id: None,
+        actor_ids: vec![actor],
+        mode: DirectorMode::Director,
+        scene_prompt: "故事开始，雨落在空荡的码头。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, None, req).await.unwrap();
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let prompt = director_prompt(&provider);
+    assert!(
+        prompt.contains("（无前置场景，本场景为起点）"),
+        "无上一章且无历史会话时应输出固定文案: {prompt}"
+    );
 }
 
 #[tokio::test]

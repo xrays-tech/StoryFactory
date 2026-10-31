@@ -31,6 +31,8 @@ pub struct DirectorInput<'a> {
     pub rolling_summary: &'a str,
     pub emotion_matrix: &'a str,
     pub scene: &'a str,
+    pub global_plot: &'a str,
+    pub previous_scene: &'a str,
     pub last_actor: Option<&'a str>,
     pub consecutive: u32,
 }
@@ -114,6 +116,8 @@ pub async fn decide(
         DirectorMode::Director => {
             let ctx = json!({
                 "scene": input.scene,
+                "global_plot": input.global_plot,
+                "previous_scene": input.previous_scene,
                 "actor_cards_brief": actor_cards_brief(input.cards),
                 "emotion_matrix": input.emotion_matrix,
                 "current_step": input.current_step,

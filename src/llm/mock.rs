@@ -6,7 +6,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::llm::{
-    CompletionReq, CompletionResp, LlmError, LlmErrorKind, LlmProvider, StructuredMode,
+    CompletionReq, CompletionResp, LlmError, LlmErrorKind, LlmProvider, Message, Purpose,
+    StructuredMode,
 };
 
 enum MockStep {
@@ -22,6 +23,7 @@ pub struct MockProvider {
     steps: Mutex<VecDeque<MockStep>>,
     calls: AtomicUsize,
     last_max_tokens: AtomicU32,
+    captured: Mutex<Vec<(Purpose, Vec<Message>)>>,
 }
 
 impl MockProvider {
@@ -33,6 +35,7 @@ impl MockProvider {
             steps: Mutex::new(VecDeque::new()),
             calls: AtomicUsize::new(0),
             last_max_tokens: AtomicU32::new(0),
+            captured: Mutex::new(Vec::new()),
         }
     }
 
@@ -62,6 +65,26 @@ impl MockProvider {
     pub fn last_max_tokens(&self) -> u32 {
         self.last_max_tokens.load(Ordering::SeqCst)
     }
+
+    /// 仅测试用：按调用顺序返回 (purpose, messages)，用于断言 Prompt 内容。
+    pub fn captured_requests(&self) -> Vec<(Purpose, Vec<Message>)> {
+        self.captured
+            .lock()
+            .map(|captured| captured.clone())
+            .unwrap_or_default()
+    }
+
+    /// 仅测试用：最近一次请求的 system 消息。
+    pub fn last_system_prompt(&self) -> Option<String> {
+        self.captured.lock().ok().and_then(|captured| {
+            captured
+                .iter()
+                .rev()
+                .flat_map(|(_, messages)| messages.iter().rev())
+                .find(|message| message.role == crate::llm::MessageRole::System)
+                .map(|message| message.content.clone())
+        })
+    }
 }
 
 #[async_trait]
@@ -81,6 +104,9 @@ impl LlmProvider for MockProvider {
     async fn complete(&self, req: CompletionReq) -> Result<CompletionResp, LlmError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.last_max_tokens.store(req.max_tokens, Ordering::SeqCst);
+        if let Ok(mut captured) = self.captured.lock() {
+            captured.push((req.purpose, req.messages.clone()));
+        }
         let step = self
             .steps
             .lock()

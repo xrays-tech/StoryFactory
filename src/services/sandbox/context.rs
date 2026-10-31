@@ -13,6 +13,8 @@ use crate::models::sandbox::{SandboxEventType, SessionRow};
 use crate::services::sandbox::events::persist_event;
 use crate::services::util::db_err;
 
+type NovelRow = (String, Option<String>, Option<String>, Option<String>);
+
 type AgentCardRow = (
     String,
     String,
@@ -47,6 +49,328 @@ pub struct HistoryStep {
     pub action_type: String,
     pub content: String,
     pub emotion_note: String,
+}
+
+/// 导演所需的全局剧情上下文：作品设定/卷章定位 + 上一场景。
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StoryContext {
+    pub global_plot: String,
+    pub previous_scene: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NovelContext {
+    pub title: String,
+    pub world_view: Option<String>,
+    pub background: Option<String>,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VolumeContext {
+    pub title: String,
+    pub summary: Option<String>,
+    pub volume_index: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChapterContext {
+    pub title: String,
+    pub final_outline: Option<String>,
+    pub chapter_index: i64,
+}
+
+/// 按字符边界截断；超长追加省略号。
+pub fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// 汇总级硬顶：结果字符数（含省略号）不超过 max。
+fn truncate_total(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+fn clip(value: Option<&str>, max: usize) -> Option<String> {
+    let text = value?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(text, max))
+}
+
+/// 标题是否已自带「第X卷/章/回/节」序号，避免渲染时出现「第2卷《第二卷 破晓》」。
+fn has_ordinal(title: &str) -> bool {
+    let Some(rest) = title.trim().strip_prefix('第') else {
+        return false;
+    };
+    let mut chars = rest.chars().peekable();
+    let mut consumed = 0usize;
+    while let Some(c) = chars.peek() {
+        let numeric = c.is_ascii_digit()
+            || matches!(
+                c,
+                '零' | '〇'
+                    | '一'
+                    | '二'
+                    | '两'
+                    | '三'
+                    | '四'
+                    | '五'
+                    | '六'
+                    | '七'
+                    | '八'
+                    | '九'
+                    | '十'
+                    | '百'
+                    | '千'
+            );
+        if !numeric {
+            break;
+        }
+        consumed += 1;
+        chars.next();
+    }
+    consumed > 0 && matches!(chars.peek(), Some('卷' | '章' | '回' | '节'))
+}
+
+/// 去掉标题自带的「第X卷/章/回/节」及其后的分隔符，供「第N卷《…》」复用。
+fn strip_ordinal_prefix(title: &str) -> &str {
+    let title = title.trim();
+    if !has_ordinal(title) {
+        return title;
+    }
+    let Some(rest) = title.strip_prefix('第') else {
+        return title;
+    };
+    let body = rest.trim_start_matches(|c: char| {
+        c.is_ascii_digit() || "零〇一二两三四五六七八九十百千".contains(c)
+    });
+    let Some(unit) = body.chars().next() else {
+        return title;
+    };
+    if !matches!(unit, '卷' | '章' | '回' | '节') {
+        return title;
+    }
+    body[unit.len_utf8()..]
+        .trim_start_matches(|c: char| c.is_whitespace() || "、:：·-—《》".contains(c))
+        .trim()
+}
+
+/// 列表项标签：标题已带序号时原样展示，避免与索引重复。
+fn list_label(index: i64, title: &str, unit: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        return format!("第{index}{unit}");
+    }
+    if has_ordinal(title) {
+        return title.to_string();
+    }
+    format!("第{index}{unit} {title}")
+}
+
+/// 纯函数：渲染作品设定与卷章定位，总长 ≤2000 字符。
+pub fn render_global_plot(
+    novel: &NovelContext,
+    chapter: Option<&ChapterContext>,
+    volume: Option<&VolumeContext>,
+    chapter_list: &[(i64, String)],
+) -> String {
+    let mut out = String::new();
+    out.push_str("# 作品设定\n");
+    out.push_str(&format!("书名：{}\n", novel.title.trim()));
+    if let Some(world_view) = clip(novel.world_view.as_deref(), 800) {
+        out.push_str(&format!("世界观：{world_view}\n"));
+    }
+    if let Some(background) = clip(novel.background.as_deref(), 600) {
+        out.push_str(&format!("背景：{background}\n"));
+    }
+    if let Some(summary) = clip(novel.summary.as_deref(), 600) {
+        out.push_str(&format!("简介：{summary}\n"));
+    }
+
+    if let (Some(chapter), Some(volume)) = (chapter, volume) {
+        out.push_str("\n# 卷章定位\n");
+        out.push_str(&format!(
+            "卷：第{}卷《{}》\n",
+            volume.volume_index,
+            strip_ordinal_prefix(&volume.title)
+        ));
+        if let Some(summary) = clip(volume.summary.as_deref(), 400) {
+            out.push_str(&format!("卷摘要：{summary}\n"));
+        }
+        out.push_str(&format!(
+            "本章：第{}章《{}》\n",
+            chapter.chapter_index,
+            strip_ordinal_prefix(&chapter.title)
+        ));
+        if let Some(outline) = clip(chapter.final_outline.as_deref(), 800) {
+            out.push_str(&format!("本章既有大纲：{outline}\n"));
+        }
+        if !chapter_list.is_empty() {
+            out.push_str("章节目录：\n");
+            for (index, title) in chapter_list {
+                let marker = if *index == chapter.chapter_index {
+                    " ← 当前章"
+                } else {
+                    ""
+                };
+                out.push_str(&format!("- {}{marker}\n", list_label(*index, title, "章")));
+            }
+        }
+    }
+
+    truncate_total(out.trim_end(), 2000)
+}
+
+/// 纯函数：上一场景优先用上一章定稿大纲，其次用同书最近完成会话的摘要。
+pub fn render_previous_scene(
+    previous_outline: Option<&str>,
+    prior_session_summary: Option<&str>,
+) -> String {
+    for text in [previous_outline, prior_session_summary]
+        .into_iter()
+        .flatten()
+    {
+        let text = text.trim();
+        if !text.is_empty() {
+            return truncate_total(text, 800);
+        }
+    }
+    "（无前置场景，本场景为起点）".to_string()
+}
+
+pub async fn load_story_context(
+    pool: &SqlitePool,
+    novel_id: &str,
+    chapter_id: Option<&str>,
+    session_id: &str,
+) -> Result<StoryContext, AppError> {
+    let novel: Option<NovelRow> =
+        sqlx::query_as("SELECT title, world_view, background, summary FROM novels WHERE id = ?")
+            .bind(novel_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(db_err)?;
+    let Some((title, world_view, background, summary)) = novel else {
+        return Err(AppError::internal("作品不存在，无法加载剧情上下文"));
+    };
+    let novel = NovelContext {
+        title,
+        world_view,
+        background,
+        summary,
+    };
+
+    let Some(chapter_id) = chapter_id else {
+        let prior_summary: Option<String> = sqlx::query_scalar(
+            "SELECT summary_text FROM sandbox_sessions
+             WHERE novel_id = ? AND id <> ? AND status = 'completed'
+               AND summary_text IS NOT NULL AND TRIM(summary_text) <> ''
+             ORDER BY COALESCE(finished_at, updated_at) DESC LIMIT 1",
+        )
+        .bind(novel_id)
+        .bind(session_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?;
+        return Ok(StoryContext {
+            global_plot: render_global_plot(&novel, None, None, &[]),
+            previous_scene: render_previous_scene(None, prior_summary.as_deref()),
+        });
+    };
+
+    let chapter: Option<(String, Option<String>, String, i64)> = sqlx::query_as(
+        "SELECT title, final_outline, volume_id, chapter_index FROM chapters
+         WHERE id = ? AND novel_id = ? AND deleted_at IS NULL",
+    )
+    .bind(chapter_id)
+    .bind(novel_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let Some((chapter_title, final_outline, volume_id, chapter_index)) = chapter else {
+        return Err(AppError::internal("章节不存在，无法加载剧情上下文"));
+    };
+
+    let volume: Option<(String, Option<String>, i64)> = sqlx::query_as(
+        "SELECT title, summary, volume_index FROM volumes
+         WHERE id = ? AND novel_id = ? AND deleted_at IS NULL",
+    )
+    .bind(&volume_id)
+    .bind(novel_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let Some((volume_title, volume_summary, volume_index)) = volume else {
+        return Err(AppError::internal("卷不存在，无法加载剧情上下文"));
+    };
+    let volume_ctx = VolumeContext {
+        title: volume_title,
+        summary: volume_summary,
+        volume_index,
+    };
+    let chapter_ctx = ChapterContext {
+        title: chapter_title,
+        final_outline,
+        chapter_index,
+    };
+
+    let chapter_list: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT chapter_index, title FROM chapters
+         WHERE volume_id = ? AND deleted_at IS NULL ORDER BY chapter_index",
+    )
+    .bind(&volume_id)
+    .fetch_all(pool)
+    .await
+    .map_err(db_err)?;
+
+    let previous_outline: Option<String> = sqlx::query_scalar(
+        "SELECT final_outline FROM chapters
+         WHERE volume_id = ? AND chapter_index < ? AND deleted_at IS NULL
+           AND final_outline IS NOT NULL AND TRIM(final_outline) <> ''
+         ORDER BY chapter_index DESC LIMIT 1",
+    )
+    .bind(&volume_id)
+    .bind(chapter_index)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let previous_outline = match previous_outline {
+        Some(outline) => Some(outline),
+        None => sqlx::query_scalar(
+            "SELECT c.final_outline FROM chapters c
+                 JOIN volumes v ON v.id = c.volume_id
+                 WHERE v.novel_id = ? AND v.volume_index < ?
+                   AND v.deleted_at IS NULL AND c.deleted_at IS NULL
+                   AND c.final_outline IS NOT NULL AND TRIM(c.final_outline) <> ''
+                 ORDER BY v.volume_index DESC, c.chapter_index DESC LIMIT 1",
+        )
+        .bind(novel_id)
+        .bind(volume_index)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_err)?,
+    };
+
+    Ok(StoryContext {
+        global_plot: render_global_plot(
+            &novel,
+            Some(&chapter_ctx),
+            Some(&volume_ctx),
+            &chapter_list,
+        ),
+        previous_scene: render_previous_scene(previous_outline.as_deref(), None),
+    })
 }
 
 pub async fn load_agent_cards(
@@ -338,6 +662,159 @@ mod tests {
         assert_eq!(
             text,
             "- id=0123456789abcdef0123456789abcdef｜角色A（support）：找回失物\n- id=fedcba9876543210fedcba9876543210｜角色B（support）：暂无明确目标"
+        );
+    }
+
+    fn sample_novel() -> NovelContext {
+        NovelContext {
+            title: "星海回声".to_string(),
+            world_view: Some("星际帝国与失落舰队对峙".to_string()),
+            background: Some("边境星域战云密布".to_string()),
+            summary: Some("一名信使寻找失踪的指挥官".to_string()),
+        }
+    }
+
+    #[test]
+    fn render_global_plot_includes_novel_volume_and_current_chapter() {
+        let novel = sample_novel();
+        let volume = VolumeContext {
+            title: "破晓".to_string(),
+            summary: Some("主角重返边境".to_string()),
+            volume_index: 2,
+        };
+        let chapter = ChapterContext {
+            title: "归途".to_string(),
+            final_outline: Some("本章既有大纲：穿越封锁线".to_string()),
+            chapter_index: 2,
+        };
+        let list = vec![(1, "启程".to_string()), (2, "归途".to_string())];
+
+        let text = render_global_plot(&novel, Some(&chapter), Some(&volume), &list);
+
+        assert!(text.contains("星海回声"), "缺少书名: {text}");
+        assert!(
+            text.contains("星际帝国与失落舰队对峙"),
+            "缺少世界观: {text}"
+        );
+        assert!(text.contains("第2卷《破晓》"), "缺少卷定位: {text}");
+        assert!(text.contains("本章：第2章《归途》"), "缺少章定位: {text}");
+        assert!(
+            text.contains("- 第2章 归途 ← 当前章"),
+            "未标出当前章: {text}"
+        );
+        assert_eq!(
+            text.matches("← 当前章").count(),
+            1,
+            "当前章标记应唯一: {text}"
+        );
+    }
+
+    #[test]
+    fn render_global_plot_strips_duplicate_ordinals() {
+        let novel = sample_novel();
+        let volume = VolumeContext {
+            title: "第二卷 破晓".to_string(),
+            summary: None,
+            volume_index: 2,
+        };
+        let chapter = ChapterContext {
+            title: "第四章 归途".to_string(),
+            final_outline: None,
+            chapter_index: 2,
+        };
+        let list = vec![
+            (1, "第三章 封锁".to_string()),
+            (2, "第四章 归途".to_string()),
+        ];
+
+        let text = render_global_plot(&novel, Some(&chapter), Some(&volume), &list);
+
+        assert!(text.contains("卷：第2卷《破晓》"), "卷标题重复序号: {text}");
+        assert!(
+            text.contains("本章：第2章《归途》"),
+            "章标题重复序号: {text}"
+        );
+        assert!(
+            text.contains("- 第四章 归途 ← 当前章"),
+            "列表项标题应原样展示: {text}"
+        );
+        assert!(!text.contains("第2卷《第二卷"), "出现重复卷序号: {text}");
+    }
+
+    #[test]
+    fn render_previous_scene_prefers_outline_then_session_summary() {
+        assert_eq!(
+            render_previous_scene(Some("上一章：他们在码头分手"), Some("更旧的摘要")),
+            "上一章：他们在码头分手"
+        );
+        assert_eq!(
+            render_previous_scene(None, Some("上一场：他们在码头分手")),
+            "上一场：他们在码头分手"
+        );
+        assert_eq!(
+            render_previous_scene(None, None),
+            "（无前置场景，本场景为起点）"
+        );
+        assert_eq!(
+            render_previous_scene(Some("   "), Some("")),
+            "（无前置场景，本场景为起点）"
+        );
+    }
+
+    #[test]
+    fn truncate_chars_respects_boundary_and_empty_input() {
+        let exact = "字".repeat(800);
+        assert_eq!(truncate_chars(&exact, 800), exact, "恰好 800 字不应截断");
+        assert_eq!(truncate_chars("", 800), "");
+
+        let over = "字".repeat(801);
+        let clipped = truncate_chars(&over, 800);
+        assert_eq!(clipped.chars().count(), 801, "800 字 + 省略号");
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clipped.chars().take(800).collect::<String>(), exact);
+    }
+
+    #[test]
+    fn render_previous_scene_truncates_long_outline() {
+        let text = render_previous_scene(Some(&"雨".repeat(900)), None);
+        assert_eq!(text.chars().count(), 800, "汇总级上限含省略号");
+        assert!(text.ends_with('…'));
+    }
+
+    #[test]
+    fn render_global_plot_omits_blank_fields_and_caps_total_length() {
+        let blank = NovelContext {
+            title: "空字段".to_string(),
+            world_view: Some("  ".to_string()),
+            background: None,
+            summary: Some(String::new()),
+        };
+        let text = render_global_plot(&blank, None, None, &[]);
+        assert!(!text.contains("世界观："), "空白字段不应渲染: {text}");
+        assert!(!text.contains("背景："), "缺失字段不应渲染: {text}");
+        assert!(!text.contains("简介："), "空字符串字段不应渲染: {text}");
+
+        let novel = NovelContext {
+            title: "超长作品".to_string(),
+            world_view: Some("界".repeat(800)),
+            background: Some("背".repeat(600)),
+            summary: Some("简".repeat(600)),
+        };
+        let volume = VolumeContext {
+            title: "长卷".to_string(),
+            summary: Some("卷".repeat(400)),
+            volume_index: 1,
+        };
+        let chapter = ChapterContext {
+            title: "长章".to_string(),
+            final_outline: Some("纲".repeat(800)),
+            chapter_index: 1,
+        };
+        let text = render_global_plot(&novel, Some(&chapter), Some(&volume), &[]);
+        assert!(
+            text.chars().count() <= 2000,
+            "global_plot 总长必须 ≤2000，实际 {}",
+            text.chars().count()
         );
     }
 }

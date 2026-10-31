@@ -43,6 +43,30 @@ pub async fn run_engine(
     let mut last_actor: Option<String> = None;
     let mut consecutive = 0u32;
 
+    // 会话内作品/章节数据静态，只加载一次，避免每步重复查询。
+    let initial_row = load_row(&pool, &session_id).await?;
+    let story_context = match context::load_story_context(
+        &pool,
+        &initial_row.novel_id,
+        initial_row.chapter_id.as_deref(),
+        &session_id,
+    )
+    .await
+    {
+        Ok(story_context) => story_context,
+        Err(e) => {
+            tracing::error!(error = %e, "加载作品剧情上下文失败");
+            return fail(
+                &pool,
+                &session_id,
+                &hub,
+                "STORY_CONTEXT",
+                "加载作品剧情上下文失败",
+            )
+            .await;
+        }
+    };
+
     loop {
         if cancel.is_cancelled() {
             return Ok(());
@@ -98,6 +122,8 @@ pub async fn run_engine(
                 .iter()
                 .map(|s| context::estimate_tokens(&s.content) + 8)
                 .sum::<usize>()
+            + context::estimate_tokens(&story_context.global_plot)
+            + context::estimate_tokens(&story_context.previous_scene)
             + 600;
         if estimated > cfg.sandbox.context_hard_cap_tokens as usize {
             return fail(
@@ -136,6 +162,8 @@ pub async fn run_engine(
             rolling_summary: &rolling,
             emotion_matrix: &emotion,
             scene: &row.scene_prompt,
+            global_plot: &story_context.global_plot,
+            previous_scene: &story_context.previous_scene,
             last_actor: last_actor.as_deref(),
             consecutive,
         };
