@@ -17,6 +17,8 @@ import type { ChapterStatus } from "../../types/domain";
 import { chapterStatusLabel, zh } from "../../copy/zh";
 import { useOutlineStore, type Chapter, type Volume } from "../../stores/outlineStore";
 import { useUiStore } from "../../stores/uiStore";
+import { useChapterContentStore } from "../../stores/chapterContentStore";
+import { useChapterDraftStore } from "../../stores/chapterDraftStore";
 import { userMessage } from "../../lib/errors";
 import { formatDateTime, truncate } from "../../lib/format";
 import { PageHeader } from "../../components/common/PageHeader";
@@ -31,6 +33,8 @@ import { Tabs } from "../../components/common/Tabs";
 import { MarkdownPreview } from "../../components/common/MarkdownPreview";
 import { Badge } from "../../components/common/Badge";
 import { cn } from "../../lib/cn";
+import { ChapterContentPanel } from "../../components/novel/ChapterContentPanel";
+import { ChapterDraftDialog } from "../../components/novel/ChapterDraftDialog";
 
 export async function outlineLoader({ params }: LoaderFunctionArgs) {
   if (params.novelId) await useOutlineStore.getState().loadTree(params.novelId);
@@ -89,6 +93,43 @@ export function OutlinePage() {
     status: "draft" as ChapterStatus,
   });
   const [dirty, setDirty] = useState(false);
+
+  const [draftDialogOpen, setDraftDialogOpen] = useState(false);
+  const contentDirty = useChapterContentStore((s) => s.dirty);
+  const loadContent = useChapterContentStore((s) => s.load);
+  const resetContent = useChapterContentStore((s) => s.reset);
+  const resetDraft = useChapterDraftStore((s) => s.reset);
+
+  // 章节变化时加载该章正文；组件卸载时清空正文状态、断开任务流。
+  useEffect(() => {
+    if (selected && novelId) void loadContent(novelId, selected.id);
+  }, [selected?.id, novelId, loadContent]);
+
+  useEffect(
+    () => () => {
+      resetContent();
+      resetDraft();
+    },
+    [resetContent, resetDraft],
+  );
+
+  const handleSelectChapter = async (chapterId: string) => {
+    if (chapterId === selectedId) return;
+    if (contentDirty) {
+      const ok = await askConfirm({
+        title: zh.outline.leaveUnsavedTitle,
+        message: zh.outline.leaveUnsavedContent,
+        confirmLabel: zh.outline.leaveUnsavedConfirm,
+      });
+      if (!ok) return;
+    }
+    selectChapter(chapterId);
+  };
+
+  const openDraftDialog = () => {
+    if (!selected) return;
+    setDraftDialogOpen(true);
+  };
 
   useEffect(() => {
     if (!selected) return;
@@ -356,7 +397,7 @@ export function OutlinePage() {
                             >
                               <button
                                 type="button"
-                                onClick={() => selectChapter(chapter.id)}
+                                onClick={() => void handleSelectChapter(chapter.id)}
                                 className="focus-ring flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2 py-2 text-left"
                               >
                                 <span className="w-6 shrink-0 text-right font-mono text-[10px] text-faint">
@@ -515,6 +556,15 @@ export function OutlinePage() {
                     </p>
                   ) : null}
 
+                  <div className="!mt-5 border-t border-line/60 pt-5">
+                    <ChapterContentPanel
+                      novelId={novelId}
+                      chapterId={selected.id}
+                      disabled={busy}
+                      onGenerate={openDraftDialog}
+                    />
+                  </div>
+
                   <div className="flex flex-wrap items-center justify-between gap-2 border-t border-line/60 pt-3">
                     <button
                       type="button"
@@ -644,6 +694,15 @@ export function OutlinePage() {
           ) : null}
         </form>
       </Dialog>
+
+      {selected && novelId ? (
+        <ChapterDraftDialog
+          open={draftDialogOpen}
+          onClose={() => setDraftDialogOpen(false)}
+          novelId={novelId}
+          chapterId={selected.id}
+        />
+      ) : null}
     </div>
   );
 }

@@ -1,4 +1,5 @@
 import type {
+  ChapterContent,
   ChapterDto,
   CreateChapterReq,
   CreateCharacterReq,
@@ -7,6 +8,7 @@ import type {
   CreateSessionReq,
   CreateVolumeReq,
   CharacterDto,
+  DraftJob,
   ItemDto,
   MoveReq,
   NovelDto,
@@ -16,6 +18,7 @@ import type {
   PutRelationsReq,
   RelationDto,
   RestoreReq,
+  SaveChapterContentReq,
   UpdateChapterReq,
   UpdateCharacterReq,
   UpdateItemReq,
@@ -69,6 +72,10 @@ export const paths = {
   moveVolume: (nid: string, vid: string) => `/novels/${nid}/volumes/${vid}/move`,
   chapters: (nid: string, vid: string) => `/novels/${nid}/volumes/${vid}/chapters`,
   chapter: (nid: string, cid: string) => `/novels/${nid}/chapters/${cid}`,
+  chapterContent: (nid: string, cid: string) => `/novels/${nid}/chapters/${cid}/content`,
+  chapterDrafts: (nid: string, cid: string) => `/novels/${nid}/chapters/${cid}/drafts`,
+  draft: (id: string) => `/chapter-drafts/${id}`,
+  draftEvents: (id: string) => `/chapter-drafts/${id}/events`,
   novelSessions: (nid: string) => `/novels/${nid}/sandbox-sessions`,
   chapterSessions: (cid: string) => `/chapters/${cid}/sandbox-sessions`,
   session: (sid: string) => `/sandbox-sessions/${sid}`,
@@ -251,6 +258,56 @@ export async function updateChapter(
 
 export async function deleteChapter(nid: string, cid: string): Promise<void> {
   await request<void>("DELETE", paths.chapter(nid, cid));
+}
+
+/**
+ * 按章节大纲生成正文（schema_version=7）。
+ * CreateDraftReq 是 cargo 生成物，未包含可选的人称字段；这里补全为空值安全的请求体。
+ */
+export type CreateChapterDraftBody = {
+  style_name?: string | null;
+  style_sample?: string | null;
+  instruction?: string | null;
+  target_words?: number | null;
+  pov?: string | null;
+};
+
+export async function getChapterContent(nid: string, cid: string): Promise<Wire<ChapterContent>> {
+  return request<Wire<ChapterContent>>("GET", paths.chapterContent(nid, cid));
+}
+
+/** 保存正文；后端返回 204，无响应体。 */
+export async function saveChapterContent(
+  nid: string,
+  cid: string,
+  req: Wire<SaveChapterContentReq>,
+): Promise<void> {
+  await request<void>("PUT", paths.chapterContent(nid, cid), { body: req });
+}
+
+export async function createChapterDraft(
+  nid: string,
+  cid: string,
+  req: CreateChapterDraftBody,
+  idempotencyKey = newIdempotencyKey("draft"),
+): Promise<Wire<DraftJob>> {
+  return request<Wire<DraftJob>>("POST", paths.chapterDrafts(nid, cid), {
+    body: req,
+    idempotencyKey,
+  });
+}
+
+export async function getChapterDraft(id: string): Promise<Wire<DraftJob>> {
+  return request<Wire<DraftJob>>("GET", paths.draft(id));
+}
+
+export async function cancelChapterDraft(id: string): Promise<void> {
+  await request<void>("DELETE", paths.draft(id));
+}
+
+export function draftEventsUrl(id: string, extra?: Record<string, QueryValue>): string {
+  const query = buildQuery(extra);
+  return `${apiUrl(paths.draftEvents(id))}${query}`;
 }
 
 export async function listSessions(

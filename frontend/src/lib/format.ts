@@ -47,6 +47,16 @@ export function formatNumber(value?: number | null): string {
   return new Intl.NumberFormat("zh-CN").format(value);
 }
 
+/** 与后端 count_words 一致：按 Unicode 字符计数，忽略空白。 */
+export function countWords(text?: string | null): number {
+  if (!text) return 0;
+  let count = 0;
+  for (const char of text) {
+    if (!/\s/u.test(char)) count += 1;
+  }
+  return count;
+}
+
 export function formatDuration(totalSeconds?: number | null): string {
   if (totalSeconds == null || totalSeconds <= 0) return "00:00";
   const s = Math.max(0, Math.floor(totalSeconds));

@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { formatCost, formatDuration, truncate } from "./format";
+import { countWords, formatCost, formatDuration, truncate } from "./format";
 
 describe("format", () => {
+  it("counts non-whitespace characters like the backend", () => {
+    expect(countWords("")).toBe(0);
+    expect(countWords("第一段 正文\n\n第二段")).toBe(8);
+    expect(countWords("a\tb\n c")).toBe(3);
+  });
+
   it("formats durations", () => {
     expect(formatDuration(0)).toBe("00:00");
     expect(formatDuration(65)).toBe("01:05");

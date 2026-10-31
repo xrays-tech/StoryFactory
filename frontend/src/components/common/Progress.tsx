@@ -5,11 +5,15 @@ export function ProgressBar({
   max,
   className,
   tone = "accent",
+  label,
+  valueText,
 }: {
   value: number;
   max: number;
   className?: string;
   tone?: "accent" | "success" | "danger" | "info";
+  label?: string;
+  valueText?: string;
 }) {
   const ratio = max > 0 ? Math.max(0, Math.min(1, value / max)) : 0;
   const tones = {
@@ -25,6 +29,8 @@ export function ProgressBar({
       aria-valuemin={0}
       aria-valuemax={max}
       aria-valuenow={value}
+      aria-label={label}
+      aria-valuetext={valueText}
     >
       <div
         className={cn("h-full rounded-full transition-[width] duration-200", tones[tone])}
