@@ -139,6 +139,7 @@ pub enum LlmErrorKind {
     Timeout,
     RateLimited,
     InvalidOutput,
+    Truncated,
     Auth,
     BadRequest,
     Server,
@@ -151,10 +152,22 @@ impl LlmErrorKind {
             LlmErrorKind::Timeout => "timeout",
             LlmErrorKind::RateLimited => "rate_limited",
             LlmErrorKind::InvalidOutput => "invalid_output",
+            LlmErrorKind::Truncated => "truncated",
             LlmErrorKind::Auth => "auth",
             LlmErrorKind::BadRequest => "bad_request",
             LlmErrorKind::Server => "server",
         }
+    }
+
+    /// 仅瞬时故障允许 failover 退避重试；预算升级由 service 层负责。
+    pub fn retryable(self) -> bool {
+        matches!(
+            self,
+            LlmErrorKind::Network
+                | LlmErrorKind::Timeout
+                | LlmErrorKind::RateLimited
+                | LlmErrorKind::Server
+        )
     }
 }
 
@@ -181,13 +194,7 @@ impl LlmError {
     }
 
     pub fn retryable(&self) -> bool {
-        matches!(
-            self.kind,
-            LlmErrorKind::Network
-                | LlmErrorKind::Timeout
-                | LlmErrorKind::RateLimited
-                | LlmErrorKind::Server
-        )
+        self.kind.retryable()
     }
 }
 

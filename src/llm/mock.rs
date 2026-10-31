@@ -1,6 +1,6 @@
 // src/llm/mock.rs — 测试用脚本化 Provider（无网络）
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -21,6 +21,7 @@ pub struct MockProvider {
     mode: StructuredMode,
     steps: Mutex<VecDeque<MockStep>>,
     calls: AtomicUsize,
+    last_max_tokens: AtomicU32,
 }
 
 impl MockProvider {
@@ -31,6 +32,7 @@ impl MockProvider {
             mode,
             steps: Mutex::new(VecDeque::new()),
             calls: AtomicUsize::new(0),
+            last_max_tokens: AtomicU32::new(0),
         }
     }
 
@@ -55,6 +57,11 @@ impl MockProvider {
     pub fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    /// 最近一次请求使用的 max_tokens；用于断言预算升级。
+    pub fn last_max_tokens(&self) -> u32 {
+        self.last_max_tokens.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
@@ -71,8 +78,9 @@ impl LlmProvider for MockProvider {
         self.mode
     }
 
-    async fn complete(&self, _req: CompletionReq) -> Result<CompletionResp, LlmError> {
+    async fn complete(&self, req: CompletionReq) -> Result<CompletionResp, LlmError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.last_max_tokens.store(req.max_tokens, Ordering::SeqCst);
         let step = self
             .steps
             .lock()

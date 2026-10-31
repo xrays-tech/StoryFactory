@@ -20,6 +20,11 @@ pub struct LlmService {
 /// 结构化输出的默认 max_tokens（沿用 v4.0 行为）。
 pub const DEFAULT_STRUCTURED_MAX_TOKENS: u32 = 1500;
 
+/// 截断后的一次性预算升级：至少不变，最多 16k。
+fn escalated_tokens(requested: u32) -> u32 {
+    requested.saturating_mul(4).min(16_000).max(requested)
+}
+
 impl LlmService {
     pub fn new(chain: ProviderChain, pool: SqlitePool, session_id: Option<String>) -> Self {
         Self {
@@ -73,9 +78,11 @@ impl LlmService {
             LlmError::new(LlmErrorKind::InvalidOutput, format!("Schema 编译失败: {e}"))
         })?;
         let mut collected: Vec<AttemptRecord> = Vec::new();
-        let mut last_error = String::from("未产生输出");
+        let mut last_error: String;
+        let mut repairs = 0u32;
+        let mut escalated = false;
 
-        for attempt in 0..=max_repairs {
+        loop {
             if Instant::now() >= req.deadline {
                 return Err(LlmError::new(LlmErrorKind::Timeout, "结构化输出预算耗尽"));
             }
@@ -91,7 +98,7 @@ impl LlmService {
                         },
                         None => last_error = "输出不是合法 JSON 对象".to_string(),
                     }
-                    if attempt == max_repairs {
+                    if repairs == max_repairs {
                         break;
                     }
                     req.messages.push(Message::assistant(content));
@@ -100,10 +107,25 @@ impl LlmService {
                     )));
                     req.purpose = Purpose::Repair;
                     req.temperature = 0.2;
+                    repairs += 1;
                 }
                 Err((err, attempts)) => {
                     self.record_attempts(&attempts).await;
                     collected.extend(attempts);
+                    // 首次截断由 service 升级预算重试，不占用 repair 配额；
+                    // 升级后仍截断则交回上层（如 novel_import 的二分逻辑）。
+                    if err.kind == LlmErrorKind::Truncated && !escalated && repairs == 0 {
+                        escalated = true;
+                        let requested = req.max_tokens;
+                        let next = escalated_tokens(requested);
+                        tracing::info!(
+                            requested,
+                            escalated = next,
+                            "结构化输出被截断，提升 max_tokens 后重试一次"
+                        );
+                        req.max_tokens = next;
+                        continue;
+                    }
                     return Err(err);
                 }
             }
@@ -121,14 +143,34 @@ impl LlmService {
         let mut req = CompletionReq::new(messages, budget.hard_deadline(), purpose);
         req.max_tokens = max_tokens;
         req.temperature = 0.4;
-        match self.chain.complete_tracked(req).await {
+        match self.chain.complete_tracked(req.clone()).await {
             Ok(outcome) => {
                 self.record_attempts(&outcome.attempts).await;
                 Ok(outcome.resp.content)
             }
             Err((err, attempts)) => {
                 self.record_attempts(&attempts).await;
-                Err(err)
+                if err.kind != LlmErrorKind::Truncated {
+                    return Err(err);
+                }
+                let requested = req.max_tokens;
+                let escalated = escalated_tokens(requested);
+                tracing::info!(
+                    requested,
+                    escalated,
+                    "文本输出被截断，提升 max_tokens 后重试一次"
+                );
+                req.max_tokens = escalated;
+                match self.chain.complete_tracked(req).await {
+                    Ok(outcome) => {
+                        self.record_attempts(&outcome.attempts).await;
+                        Ok(outcome.resp.content)
+                    }
+                    Err((err, attempts)) => {
+                        self.record_attempts(&attempts).await;
+                        Err(err)
+                    }
+                }
             }
         }
     }
@@ -165,5 +207,19 @@ impl LlmService {
                 tracing::warn!(error = %e, "llm_usage 写入失败");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escalated_tokens;
+
+    #[test]
+    fn escalated_tokens_is_bounded() {
+        assert_eq!(escalated_tokens(0), 0);
+        assert_eq!(escalated_tokens(500), 2_000);
+        assert_eq!(escalated_tokens(1_800), 7_200);
+        assert_eq!(escalated_tokens(4_000), 16_000);
+        assert_eq!(escalated_tokens(16_000), 16_000);
     }
 }

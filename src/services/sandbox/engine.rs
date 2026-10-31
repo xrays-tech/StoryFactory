@@ -470,7 +470,7 @@ async fn finalize(
             &budget,
             Purpose::Finalize,
             vec![Message::user(prompt)],
-            1800,
+            3000,
         )
         .await
     {

@@ -179,6 +179,13 @@ fn truncation_error() -> LlmError {
     )
 }
 
+fn truncated_error() -> LlmError {
+    LlmError::new(
+        LlmErrorKind::Truncated,
+        "输出在 max_tokens 处被截断（推理模型的 reasoning tokens 也计入该预算）",
+    )
+}
+
 fn text_with_chapters(count: usize, body_chars: usize) -> String {
     let mut text = String::new();
     for index in 1..=count {
@@ -569,6 +576,42 @@ async fn chunk_truncation_bisects_and_merges_subchunks() {
 }
 
 #[tokio::test]
+async fn truncated_chunk_bisects_after_budget_escalation() {
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    // service 层会在首个 Truncated 后升级预算重试一次；两次都截断才应由二分接管。
+    mock.push_err(truncated_error());
+    mock.push_err(truncated_error());
+    mock.push_ok(SUBCHUNK_LEFT);
+    mock.push_ok(SUBCHUNK_RIGHT);
+    mock.push_ok(STRUCTURE);
+    let (state, app) = build_mock_state(mock.clone()).await;
+
+    let (status, created) = upload(&app, &"剧".repeat(2_000), "truncated-bisect.txt").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "upload: {created}");
+    let job_id = created["id"].as_str().expect("job id").to_string();
+    let job = wait_terminal(&state, &job_id).await;
+    assert_eq!(job["status"], "ready", "job: {job}");
+    assert_eq!(job["chunks_total"], 1);
+    assert_eq!(job["chunks_done"], 1);
+    assert_eq!(
+        mock.call_count(),
+        5,
+        "首块截断 + 升级后仍截断 + 2 个子块 + 1 次结构"
+    );
+
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novel-imports/{job_id}/preview"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preview: {body}");
+    assert_eq!(body["characters"].as_array().expect("characters").len(), 3);
+    assert_eq!(body["relations"].as_array().expect("relations").len(), 2);
+}
+
+#[tokio::test]
 async fn dense_chunk_is_skipped_without_failing_job() {
     let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
     mock.push_err(truncation_error());
@@ -639,6 +682,44 @@ async fn structure_truncation_splits_batches_and_merges_volumes() {
         .map(|volume| volume["chapters"].as_array().expect("chapters").len())
         .collect();
     assert_eq!(chapter_counts, vec![2, 1, 3]);
+}
+
+#[tokio::test]
+async fn truncated_structure_bisects_after_budget_escalation() {
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..11 {
+        mock.push_ok(SURVIVOR_CHUNK);
+    }
+    // service 层升级一次后仍截断，才进入结构分批二分。
+    mock.push_err(truncated_error());
+    mock.push_err(truncated_error());
+    mock.push_ok(STRUCTURE_BATCH_A);
+    mock.push_ok(STRUCTURE_BATCH_B);
+    mock.push_ok(STRUCTURE_BATCH_C);
+    let (state, app) = build_mock_state(mock.clone()).await;
+
+    let text = text_with_chapters(11, 300);
+    let (status, created) = upload(&app, &text, "truncated-structure.txt").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "upload: {created}");
+    let job_id = created["id"].as_str().expect("job id").to_string();
+    let job = wait_terminal(&state, &job_id).await;
+    assert_eq!(job["status"], "ready", "job: {job}");
+    assert_eq!(job["chunks_total"], 11);
+    assert_eq!(
+        mock.call_count(),
+        16,
+        "11 分块 + 2 次截断（含升级重试） + 2 子批 + 1 尾批"
+    );
+
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/novel-imports/{job_id}/preview"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "preview: {body}");
+    assert_eq!(body["volumes"].as_array().expect("volumes").len(), 3);
 }
 
 #[tokio::test]

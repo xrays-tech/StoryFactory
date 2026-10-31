@@ -615,7 +615,12 @@ async fn analyze_chunk_text(
 ) -> Result<ChunkOutcome, RunError> {
     match call_chunk(llm, index, total, text, token).await {
         Ok(output) => Ok(ChunkOutcome::Parsed(output)),
-        Err(RunError::Llm(error)) if error.kind == LlmErrorKind::InvalidOutput => {
+        Err(RunError::Llm(error))
+            if matches!(
+                error.kind,
+                LlmErrorKind::InvalidOutput | LlmErrorKind::Truncated
+            ) =>
+        {
             if depth >= MAX_SUBCHUNK_DEPTH || text.chars().count() <= MIN_SUBCHUNK_CHARS {
                 return Ok(ChunkOutcome::Skipped);
             }
@@ -820,7 +825,12 @@ async fn structure_batch(
     .await
     {
         Ok(value) => value,
-        Err(RunError::Llm(error)) if error.kind == LlmErrorKind::InvalidOutput => {
+        Err(RunError::Llm(error))
+            if matches!(
+                error.kind,
+                LlmErrorKind::InvalidOutput | LlmErrorKind::Truncated
+            ) =>
+        {
             return split_structure_batch(llm, summaries, token).await;
         }
         Err(error) => return Err(error),

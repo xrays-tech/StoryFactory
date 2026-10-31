@@ -41,12 +41,16 @@ assets/prompts/ Prompt 模板（seed 到 DB）
 ## 测试
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+scripts/check.sh                      # 快速门：fmt + clippy + 定向集成测试
+scripts/check.sh --full               # 提交前：再加全量 cargo test
+scripts/check.sh --test novel_import  # 只跑某个集成测试
 npm --prefix frontend run typecheck
 npm --prefix frontend run build
 ```
+
+`scripts/check.sh` 会实时打印每个阶段的输出与耗时，不重定向、不经过任何 shell 包装器。
+
+注意：`clippy --all-targets` 与 `cargo test` 使用不同的编译产物指纹。首次在两者之间切换会整体重编（约 5–10 分钟，日志看似"卡住"），之后两边缓存同时命中，完整质量门约 15 秒。改动越小、越应该用 `--test <name>` 只跑相关套件。
 
 ## 安全
 

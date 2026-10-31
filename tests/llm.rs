@@ -200,6 +200,100 @@ fn factory_without_key_is_empty() {
     assert!(chain.is_empty());
 }
 
+async fn service_with_mock(
+    provider: Arc<MockProvider>,
+) -> (LlmService, sqlx::SqlitePool, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let data_dir = dir.path().display().to_string();
+    let pool = story_architect::db::open_pool(&data_dir).await.unwrap();
+    story_architect::db::migrate(&pool).await.unwrap();
+    let chain = ProviderChain::new(vec![provider], 0, Duration::from_secs(2));
+    (LlmService::new(chain, pool.clone(), None), pool, dir)
+}
+
+#[test]
+fn truncated_error_is_not_retryable() {
+    assert_eq!(LlmErrorKind::Truncated.as_str(), "truncated");
+    assert!(!LlmError::new(LlmErrorKind::Truncated, "truncated").retryable());
+}
+
+#[tokio::test]
+async fn complete_text_escalates_once_on_truncation() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    provider.push_err(LlmError::new(LlmErrorKind::Truncated, "truncated"));
+    provider.push_ok("完成");
+    let (service, pool, _dir) = service_with_mock(provider.clone()).await;
+    let budget = Budget::new(60, 30, 10);
+
+    let text = service
+        .complete_text(&budget, Purpose::Finalize, vec![Message::user("go")], 500)
+        .await
+        .expect("escalated retry should succeed");
+
+    assert_eq!(text, "完成");
+    assert_eq!(provider.call_count(), 2);
+    assert_eq!(provider.last_max_tokens(), 2_000);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM llm_usage")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2, "两次尝试都必须记 usage");
+}
+
+#[tokio::test]
+async fn complete_text_returns_error_when_escalated_retry_is_truncated() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    provider.push_err(LlmError::new(LlmErrorKind::Truncated, "truncated"));
+    provider.push_err(LlmError::new(LlmErrorKind::Truncated, "truncated again"));
+    let (service, pool, _dir) = service_with_mock(provider.clone()).await;
+    let budget = Budget::new(60, 30, 10);
+
+    let err = service
+        .complete_text(&budget, Purpose::Finalize, vec![Message::user("go")], 500)
+        .await
+        .expect_err("second truncation must surface");
+
+    assert_eq!(err.kind, LlmErrorKind::Truncated);
+    assert_eq!(provider.call_count(), 2);
+    assert_eq!(provider.last_max_tokens(), 2_000);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM llm_usage")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn structured_escalates_truncated_without_consuming_repair_quota() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    provider.push_err(LlmError::new(LlmErrorKind::Truncated, "truncated"));
+    provider.push_ok(valid_actor_json());
+    let (service, pool, _dir) = service_with_mock(provider.clone()).await;
+    let budget = Budget::new(60, 30, 10);
+
+    let (value, attempts) = service
+        .complete_structured_with_tokens(
+            &budget,
+            Purpose::ActorStep,
+            vec![Message::system("s")],
+            actor_step_schema(),
+            0,
+            1_000,
+        )
+        .await
+        .expect("escalated retry should succeed without repair rounds");
+
+    assert_eq!(value["actor_action"]["content"], "你好");
+    assert_eq!(provider.call_count(), 2);
+    assert_eq!(provider.last_max_tokens(), 4_000);
+    assert_eq!(attempts.len(), 2);
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM llm_usage")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
 #[tokio::test]
 async fn llm_service_records_usage_and_returns_value() {
     let dir = tempfile::tempdir().unwrap();

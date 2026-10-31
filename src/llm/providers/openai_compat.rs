@@ -161,21 +161,22 @@ impl LlmProvider for OpenAiCompatProvider {
             let finish_reason = choice["finish_reason"].as_str().unwrap_or("");
             let content =
                 match choice["message"]["content"].as_str() {
-                    // 推理模型的 reasoning tokens 计入 max_tokens；被截断的 JSON 无法修复，直接失败。
                     Some(_) if finish_reason == "length" => return Err(LlmError::new(
-                        LlmErrorKind::InvalidOutput,
+                        LlmErrorKind::Truncated,
                         "输出在 max_tokens 处被截断（推理模型的 reasoning tokens 也计入该预算）",
                     )),
                     Some(text) => text,
                     None => {
+                        if finish_reason == "length" {
+                            return Err(LlmError::new(
+                                LlmErrorKind::Truncated,
+                                "输出在 max_tokens 处被截断，未返回正文内容",
+                            ));
+                        }
                         return Err(LlmError::new(
                             LlmErrorKind::InvalidOutput,
-                            if finish_reason == "length" {
-                                "输出在 max_tokens 处被截断，未返回正文内容"
-                            } else {
-                                "响应缺少 choices[0].message.content"
-                            },
-                        ))
+                            "响应缺少 choices[0].message.content",
+                        ));
                     }
                 };
             let prompt_tokens = value["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
