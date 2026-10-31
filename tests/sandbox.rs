@@ -11,6 +11,7 @@ use story_architect::llm::{MessageRole, Purpose, StructuredMode};
 use story_architect::models::sandbox::{
     ControlAction, CreateSessionReq, DirectorMode, SessionSnapshot, SessionStatus,
 };
+use story_architect::services::sandbox::engine::validate_outline;
 use story_architect::state::AppState;
 
 use common::{
@@ -27,7 +28,67 @@ fn actor_json(text: &str) -> String {
 }
 
 fn outline_text() -> String {
-    "## 章节标题\n雨夜\n## 剧情梗概\n这是测试大纲。".to_string()
+    format!(
+        "## 章节标题\n雨夜重逢\n\
+         ## 剧情梗概\n{} 已推演的行动仅限厅内试探，未发生的门外对手戏与私盐定策不得写成既成事实。\n\
+         ## 关键场景\n- 旧城车站：两人雨夜重逢，彼此试探来意与底牌。\n\
+         ## 人物变化\n- 角色A：由戒备转为愿意倾听，但尚未交出全部秘密。\n\
+         ## 未覆盖要点\n- 门外对手戏：本场未推演。\n- 私盐定策：本场未推演。\n\
+         ## 衔接下一章\n两人约定明日再谈，门外来客尚未现身。",
+        "这是测试大纲，用于验证收束写入流程与未覆盖情节的区分。".repeat(3)
+    )
+}
+
+fn degraded_outline() -> String {
+    format!(
+        "⚠️ 降级模式（LLM 不可用）\n\n## 剧情梗概\n{}",
+        "演员原始台词堆叠。".repeat(40)
+    )
+}
+
+fn outline_without_uncovered() -> String {
+    format!(
+        "## 章节标题\n雨夜\n## 剧情梗概\n{}",
+        "这段大纲长度足够但没有未覆盖要点小节。".repeat(12)
+    )
+}
+
+fn finalize_prompt(provider: &MockProvider) -> String {
+    provider
+        .captured_requests()
+        .into_iter()
+        .find(|(purpose, _)| *purpose == Purpose::Finalize)
+        .map(|(_, messages)| {
+            messages
+                .into_iter()
+                .map(|message| message.content)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .expect("应捕获到收束 prompt")
+}
+
+#[test]
+fn validate_outline_covers_failure_conditions_and_pass_sample() {
+    assert_eq!(
+        validate_outline(&degraded_outline()),
+        Err("输出包含降级或不可用标记")
+    );
+    let short = format!("## 剧情梗概\n{}\n## 未覆盖要点\n无", "短".repeat(20));
+    assert_eq!(validate_outline(&short), Err("大纲正文不足 200 字"));
+    assert_eq!(
+        validate_outline(&outline_without_uncovered()),
+        Err("缺少「未覆盖要点」小节")
+    );
+    let missing_summary = format!(
+        "## 章节标题\n雨夜\n## 未覆盖要点\n无\n{}",
+        "内容。".repeat(80)
+    );
+    assert_eq!(
+        validate_outline(&missing_summary),
+        Err("缺少「剧情梗概」小节")
+    );
+    assert!(validate_outline(&outline_text()).is_ok());
 }
 
 fn director_prompt(provider: &MockProvider) -> String {
@@ -60,6 +121,29 @@ async fn base_novel(state: &AppState) -> (String, String, String) {
     let vid = create_volume(&app, &nid, "第一卷").await;
     let cid = create_chapter(&app, &nid, &vid, "第一章").await;
     (nid, format!("{a},{b}"), cid)
+}
+
+async fn run_bound_finalize(state: &AppState, plan_outline: &str) -> (String, String) {
+    let (nid, actors, cid) = base_novel(state).await;
+    sqlx::query("UPDATE chapters SET final_outline = ? WHERE id = ?")
+        .bind(plan_outline)
+        .bind(&cid)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    let req = CreateSessionReq {
+        chapter_id: None,
+        actor_ids: actors.split(',').map(str::to_string).collect(),
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
+    wait_for(state, &created.id, |s| s.status == SessionStatus::Completed).await;
+    (cid, created.id)
 }
 
 async fn wait_for<F>(state: &AppState, sid: &str, predicate: F) -> SessionSnapshot
@@ -990,6 +1074,166 @@ async fn create_session_with_chapter_binds_and_finalizes() {
     .await
     .unwrap();
     assert_eq!(ready, 1, "绑定章节的会话必须持久化 outline_ready 事件");
+}
+
+#[tokio::test]
+async fn finalize_rejects_degraded_output_and_keeps_chapter_outline() {
+    let state = test_state_with_chain(Some(mock_chain(vec![
+        actor_json("厅内试探"),
+        degraded_outline(),
+    ])))
+    .await;
+    let (cid, sid) = run_bound_finalize(&state, "原始章节大纲").await;
+
+    let outline: Option<String> =
+        sqlx::query_scalar("SELECT final_outline FROM chapters WHERE id = ?")
+            .bind(&cid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        outline.as_deref(),
+        Some("原始章节大纲"),
+        "降级输出不得覆盖章节大纲"
+    );
+
+    let summary: Option<String> =
+        sqlx::query_scalar("SELECT summary_text FROM sandbox_sessions WHERE id = ?")
+            .bind(&sid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert!(
+        summary.unwrap_or_default().contains("本次大纲未写入章节"),
+        "会话摘要必须说明章节大纲未写入"
+    );
+
+    let skipped: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? AND event_type = 'outline_skipped'",
+    )
+    .bind(&sid)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(skipped, 1, "必须产生 outline_skipped 事件");
+    let reason: String = sqlx::query_scalar(
+        "SELECT json_extract(payload, '$.reason') FROM sandbox_events WHERE session_id = ? AND event_type = 'outline_skipped'",
+    )
+    .bind(&sid)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert!(reason.contains("降级"), "跳过原因应标明降级标记: {reason}");
+}
+
+#[tokio::test]
+async fn finalize_rejects_outline_without_uncovered_section() {
+    let state = test_state_with_chain(Some(mock_chain(vec![
+        actor_json("厅内试探"),
+        outline_without_uncovered(),
+    ])))
+    .await;
+    let (cid, sid) = run_bound_finalize(&state, "原始章节大纲").await;
+
+    let outline: Option<String> =
+        sqlx::query_scalar("SELECT final_outline FROM chapters WHERE id = ?")
+            .bind(&cid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        outline.as_deref(),
+        Some("原始章节大纲"),
+        "缺少未覆盖小节的输出不得覆盖章节大纲"
+    );
+
+    let summary: Option<String> =
+        sqlx::query_scalar("SELECT summary_text FROM sandbox_sessions WHERE id = ?")
+            .bind(&sid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert!(summary.unwrap_or_default().contains("未写入章节"));
+
+    let skipped: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? AND event_type = 'outline_skipped'",
+    )
+    .bind(&sid)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(skipped, 1);
+}
+
+#[tokio::test]
+async fn finalize_writes_outline_with_uncovered_section() {
+    let state = test_state_with_chain(Some(mock_chain(vec![
+        actor_json("厅内试探"),
+        outline_text(),
+    ])))
+    .await;
+    let (cid, sid) = run_bound_finalize(&state, "原始章节大纲").await;
+
+    let outline: Option<String> =
+        sqlx::query_scalar("SELECT final_outline FROM chapters WHERE id = ?")
+            .bind(&cid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert!(
+        outline.unwrap_or_default().contains("## 未覆盖要点"),
+        "合格大纲必须写入章节"
+    );
+
+    let ready: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? AND event_type = 'outline_ready'",
+    )
+    .bind(&sid)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(ready, 1);
+    let skipped: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? AND event_type = 'outline_skipped'",
+    )
+    .bind(&sid)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(skipped, 0);
+}
+
+#[tokio::test]
+async fn finalize_prompt_marks_plan_vs_played() {
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    provider.push_ok(actor_json("厅内试探，未出门"));
+    provider.push_ok(outline_text());
+    let state = test_state_with_chain(Some(ProviderChain::new(
+        vec![provider.clone()],
+        0,
+        Duration::from_secs(2),
+    )))
+    .await;
+    run_bound_finalize(&state, "计划：门外对手戏与私盐定策").await;
+
+    let prompt = finalize_prompt(&provider);
+    for needle in [
+        "既定大纲",
+        "已推演",
+        "未覆盖要点",
+        "门外对手戏",
+        "私盐定策",
+        "厅内试探",
+    ] {
+        assert!(
+            prompt.contains(needle),
+            "收束 prompt 缺少「{needle}」: {prompt}"
+        );
+    }
+    assert!(
+        !prompt.contains("{{"),
+        "收束 prompt 不应残留模板变量: {prompt}"
+    );
 }
 
 #[tokio::test]

@@ -445,6 +445,28 @@ async fn commit_step(
     Ok(())
 }
 
+const FINALIZE_OUTLINE_MAX_CHARS: usize = 2000;
+const FINALIZE_STEPS_MAX_TOKENS: usize = 5500;
+const FINALIZE_PROMPT_RESERVE_TOKENS: usize = 800;
+
+/// 收束结果写入章节前的最低质量闸门：降级/过短/结构缺失都不得覆盖既有大纲。
+pub fn validate_outline(text: &str) -> Result<(), &'static str> {
+    const DEGRADED_MARKERS: [&str; 3] = ["⚠️", "降级", "LLM 不可用"];
+    if DEGRADED_MARKERS.iter().any(|marker| text.contains(marker)) {
+        return Err("输出包含降级或不可用标记");
+    }
+    if text.chars().filter(|ch| !ch.is_whitespace()).count() < 200 {
+        return Err("大纲正文不足 200 字");
+    }
+    if !text.contains("## 未覆盖要点") {
+        return Err("缺少「未覆盖要点」小节");
+    }
+    if !text.contains("## 剧情梗概") {
+        return Err("缺少「剧情梗概」小节");
+    }
+    Ok(())
+}
+
 async fn finalize(
     pool: &SqlitePool,
     session_id: &str,
@@ -468,24 +490,46 @@ async fn finalize(
         return Ok(());
     }
 
-    let history = context::load_history(pool, session_id, 0, 10000).await?;
-    let chapter_context = match &row.chapter_id {
+    // 章节大纲是“计划”，历史步骤是“实际发生”；二者必须分块注入，避免把未演绎情节写成既成事实。
+    let (chapter_title, plan_outline) = match &row.chapter_id {
         Some(cid) => {
-            let title: Option<String> =
-                sqlx::query_scalar("SELECT title FROM chapters WHERE id = ?")
+            let chapter: Option<(String, Option<String>)> =
+                sqlx::query_as("SELECT title, final_outline FROM chapters WHERE id = ?")
                     .bind(cid)
                     .fetch_optional(pool)
                     .await
                     .map_err(db_err)?;
-            title.unwrap_or_default()
+            match chapter {
+                Some((title, outline)) => (title, outline),
+                None => ("（无关联章节）".to_string(), None),
+            }
         }
-        None => "（无关联章节）".to_string(),
+        None => ("（无关联章节）".to_string(), None),
     };
+    let plan_outline = plan_outline
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| row.scene_prompt.clone());
+    let plan_outline = context::truncate_chars(&plan_outline, FINALIZE_OUTLINE_MAX_CHARS);
+    let rolling_summary = row.rolling_summary.clone().unwrap_or_default();
+    let user_directive = row.user_directive.clone().unwrap_or_default();
+    let fixed_tokens = context::estimate_tokens(&plan_outline)
+        + context::estimate_tokens(&rolling_summary)
+        + context::estimate_tokens(&user_directive)
+        + FINALIZE_PROMPT_RESERVE_TOKENS;
+    let steps_budget = (cfg.sandbox.context_hard_cap_tokens as usize)
+        .saturating_sub(fixed_tokens)
+        .clamp(256, FINALIZE_STEPS_MAX_TOKENS);
+    let history = context::load_history_window(pool, session_id, 0, steps_budget).await?;
+
     let ctx = json!({
-        "chapter_context": chapter_context,
-        "rolling_summary": row.rolling_summary.clone().unwrap_or_default(),
+        "chapter_title": chapter_title,
+        "chapter_outline": plan_outline,
+        "rolling_summary": rolling_summary,
         "steps": history,
-        "user_directive": row.user_directive.clone().unwrap_or_default(),
+        "user_directive": user_directive,
     });
     let prompt = crate::llm::prompts::render(crate::llm::prompts::OUTLINE_FINALIZE, &ctx)?;
     let budget = Budget::new(
@@ -514,22 +558,47 @@ async fn finalize(
         }
     };
 
+    let validation = validate_outline(&outline);
+    let summary_text = match validation {
+        Ok(()) => outline.clone(),
+        Err(reason) => {
+            tracing::warn!(session_id = %session_id, reason, "大纲未通过校验，跳过章节写入");
+            format!("{outline}\n\n（本次大纲未写入章节：{reason}）")
+        }
+    };
+
     let mut tx = db::begin_immediate(pool).await.map_err(db_err)?;
+    let mut skipped_event = None;
     if let Some(cid) = &row.chapter_id {
-        sqlx::query(
-            "UPDATE chapters SET final_outline = ?, updated_at = strftime('%s','now') WHERE id = ?",
-        )
-        .bind(&outline)
-        .bind(cid)
-        .execute(&mut *tx)
-        .await
-        .map_err(db_err)?;
-        crate::services::outline::reindex_chapter(&mut tx, &row.novel_id, cid).await?;
+        match validation {
+            Ok(()) => {
+                sqlx::query(
+                    "UPDATE chapters SET final_outline = ?, updated_at = strftime('%s','now') WHERE id = ?",
+                )
+                .bind(&outline)
+                .bind(cid)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?;
+                crate::services::outline::reindex_chapter(&mut tx, &row.novel_id, cid).await?;
+            }
+            Err(reason) => {
+                skipped_event = Some(
+                    persist_event(
+                        &mut tx,
+                        session_id,
+                        SandboxEventType::OutlineSkipped,
+                        json!({ "chapter_id": cid, "reason": reason }),
+                    )
+                    .await?,
+                );
+            }
+        }
     }
     let completed = sqlx::query(
         "UPDATE sandbox_sessions SET summary_text = ?, status = 'completed', finished_at = strftime('%s','now'), updated_at = strftime('%s','now') WHERE id = ? AND status = 'finalizing'",
     )
-    .bind(&outline)
+    .bind(&summary_text)
     .bind(session_id)
     .execute(&mut *tx)
     .await
@@ -539,7 +608,7 @@ async fn finalize(
         tx.rollback().await.map_err(db_err)?;
         return Ok(());
     }
-    if row.chapter_id.is_some() {
+    if row.chapter_id.is_some() && validation.is_ok() {
         persist_event(
             &mut tx,
             session_id,
@@ -556,6 +625,9 @@ async fn finalize(
     )
     .await?;
     tx.commit().await.map_err(db_err)?;
+    if let Some(event) = skipped_event {
+        let _ = hub.send(event);
+    }
     let _ = hub.send(done);
     Ok(())
 }

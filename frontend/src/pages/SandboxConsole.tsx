@@ -224,6 +224,22 @@ export function SandboxConsole() {
 
   const active = !!session && !isSessionTerminal(session.status);
   const blocker = useBlocker(active);
+  // 事件到达顺序不保证：终态快照可能先到、outline 事件后到，先判定会误报“已写入”。
+  const outlineSkipReason = useMemo(() => {
+    const skipped = [...events]
+      .reverse()
+      .find((event) => event.original_type === "outline_skipped");
+    const reason = skipped?.payload.reason;
+    return typeof reason === "string" ? reason : null;
+  }, [events]);
+  const outlineSignalled = useMemo(
+    () =>
+      events.some(
+        (event) =>
+          event.original_type === "outline_ready" || event.original_type === "outline_skipped",
+      ),
+    [events],
+  );
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
@@ -303,11 +319,17 @@ export function SandboxConsole() {
     const previous = previousStatusRef.current;
     previousStatusRef.current = status;
     if (!session || !status || previous === null) return;
-    if (previous === "completed" || status !== "completed" || !session.chapter_id) return;
+    if (previous === "completed" || status !== "completed") return;
+    if (!outlineSignalled) return;
     if (completedNoticeRef.current === session.id) return;
     completedNoticeRef.current = session.id;
+    if (outlineSkipReason !== null) {
+      toast({ tone: "warning", message: `本次大纲未写入章节：${outlineSkipReason}` });
+      return;
+    }
+    if (!session.chapter_id) return;
     toast({ tone: "success", message: "大纲已写入该章节" });
-  }, [session?.id, session?.status, session?.chapter_id, toast]);
+  }, [session?.id, session?.status, session?.chapter_id, outlineSkipReason, outlineSignalled, toast]);
 
   if (!sid) return null;
 
@@ -478,6 +500,14 @@ export function SandboxConsole() {
 
   const renderEvent = (event: SandboxEvent) => {
     const payload = event.payload;
+    if (event.original_type === "outline_skipped") {
+      return (
+        <div key={event.seq} className="rounded-xl border border-warning/35 bg-warning-soft/60 px-3 py-2 text-[11px] leading-5 text-warning">
+          <AlertTriangle className="mr-1 inline h-3 w-3" />
+          本次大纲未写入章节：{asString(payload.reason) || "输出未通过校验"}
+        </div>
+      );
+    }
     switch (event.event_type) {
       case "step_started":
         return null;
