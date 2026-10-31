@@ -5,10 +5,13 @@
 ## 构建与运行
 
 ```bash
-# 后端（开发）
-cargo run -- --data-dir ./dev-data
-# 或
+# 后端（开发，前台运行，Ctrl-C 退出）
 APP_DATA_DIR=./dev-data APP_HTTP__DEV_CORS=true cargo run
+
+# 后端（脱离终端常驻，脚本管理：start|stop|restart|status|log）
+scripts/serve.sh start          # 日志 /tmp/story-architect.log
+scripts/serve.sh status
+scripts/serve.sh stop
 
 # 前端（开发，:5173 代理 /api → :8080）
 npm --prefix frontend install
@@ -19,7 +22,9 @@ npm --prefix frontend run build
 cargo build --release
 ```
 
-- 默认监听 `127.0.0.1:8080`，数据目录遵循平台约定（Linux `~/.local/share/story-architect`）。
+- 默认监听 `127.0.0.1:8080`，数据目录遵循平台约定（macOS `~/Library/Application Support/StoryArchitect`、Linux `~/.local/share/story-architect`、Windows `%APPDATA%/StoryArchitect`），可用 `APP_DATA_DIR` 覆盖。
+- 同一数据目录只允许一个实例（`story-architect.lock`）；重复启动会直接报错退出，避免多个进程对同一 WAL 各自持有视图。
+- 用 `scripts/serve.sh` 启动时进程已脱离终端：命令立即返回，不会在任务面板里显示成「一直运行中」。
 - `APP_BIND=0.0.0.0` 时强制启动令牌（`app.token`，0600），首次访问用 `?token=`，前端存储后以 `X-App-Token` 发送。
 - LLM 密钥只从环境变量读取：`APP_LLM_API_KEY`、`APP_LLM_FALLBACK_API_KEY_<N>`；不写入数据库/日志。
 
