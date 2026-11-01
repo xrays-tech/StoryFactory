@@ -16,6 +16,8 @@ type ChapterContentState = {
   /** 当前编辑中的文本（含未保存改动）。 */
   editable: string;
   wordCount: number;
+  /** 该章最近一次生成的 AI 味检查结果（来自服务端，刷新后仍可展示）。 */
+  lint: Wire<ChapterContent>["lint"];
   loaded: boolean;
   loading: boolean;
   error: string | null;
@@ -44,6 +46,7 @@ export const useChapterContentStore = create<ChapterContentState>()(
     content: "",
     editable: "",
     wordCount: 0,
+    lint: null,
     loaded: false,
     loading: false,
     error: null,
@@ -58,6 +61,7 @@ export const useChapterContentStore = create<ChapterContentState>()(
         state.content = "";
         state.editable = "";
         state.wordCount = 0;
+        state.lint = null;
         state.loaded = false;
         state.loading = true;
         state.error = null;
@@ -72,6 +76,7 @@ export const useChapterContentStore = create<ChapterContentState>()(
           state.content = result.content;
           state.editable = result.content;
           state.wordCount = result.word_count;
+          state.lint = result.lint ?? null;
           state.loaded = true;
           state.loading = false;
         });
@@ -150,6 +155,7 @@ export const useChapterContentStore = create<ChapterContentState>()(
         state.content = view.content;
         state.editable = view.content;
         state.wordCount = view.word_count;
+        state.lint = view.lint ?? null;
         state.loaded = true;
         state.loading = false;
         state.error = null;

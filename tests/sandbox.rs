@@ -152,6 +152,122 @@ async fn base_novel(state: &AppState) -> (String, String, String) {
     (nid, format!("{a},{b}"), cid)
 }
 
+const NOVEL_SUMMARY_MARKER: &str = "全书结局：主角最终发现她不是亲生的妹妹。";
+
+async fn set_novel_summary(state: &AppState, novel_id: &str) {
+    sqlx::query("UPDATE novels SET summary = ? WHERE id = ?")
+        .bind(NOVEL_SUMMARY_MARKER)
+        .bind(novel_id)
+        .execute(&state.pool)
+        .await
+        .expect("set novel summary");
+}
+
+fn use_director_chain(state: &mut AppState, provider: &Arc<MockProvider>) {
+    state.sessions = Arc::new(
+        story_architect::services::sandbox::SessionManager::with_chain(
+            state.pool.clone(),
+            state.config.clone(),
+            4,
+            ProviderChain::new(vec![provider.clone()], 0, Duration::from_secs(2)),
+        ),
+    );
+}
+
+#[tokio::test]
+async fn chapter_session_hides_novel_summary() {
+    let state = test_state_with_chain(Some(mock_chain(vec![
+        actor_json("占位行动"),
+        outline_text(),
+    ])))
+    .await;
+    let (nid, actors, cid) = base_novel(&state).await;
+    let first = actors.split(',').next().expect("actor").to_string();
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    provider.push_ok(json!({ "next_actor_id": first, "reason": "冲突" }).to_string());
+    provider.push_ok(actor_json("本章内的行动"));
+    provider.push_ok(outline_text());
+
+    let mut state = state;
+    use_director_chain(&mut state, &provider);
+    set_novel_summary(&state, &nid).await;
+
+    let req = CreateSessionReq {
+        chapter_id: Some(cid.clone()),
+        actor_ids: actors.split(',').map(str::to_string).collect(),
+        mode: DirectorMode::Director,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state
+        .sessions
+        .create(&nid, None, req)
+        .await
+        .expect("create");
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let prompt = director_prompt(&provider);
+    assert!(
+        !prompt.contains(NOVEL_SUMMARY_MARKER),
+        "章节级会话不应看到全书梗概（含结局）: {prompt}"
+    );
+}
+
+#[tokio::test]
+async fn novel_session_labels_summary_as_reference() {
+    let state = test_state_with_chain(Some(mock_chain(vec![
+        actor_json("占位行动"),
+        outline_text(),
+    ])))
+    .await;
+    let (nid, actors, _cid) = base_novel(&state).await;
+    let first = actors.split(',').next().expect("actor").to_string();
+    let provider = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    provider.push_ok(json!({ "next_actor_id": first, "reason": "开场" }).to_string());
+    provider.push_ok(actor_json("序幕拉开"));
+    provider.push_ok(outline_text());
+
+    let mut state = state;
+    use_director_chain(&mut state, &provider);
+    set_novel_summary(&state, &nid).await;
+
+    let req = CreateSessionReq {
+        chapter_id: None,
+        actor_ids: actors.split(',').map(str::to_string).collect(),
+        mode: DirectorMode::Director,
+        scene_prompt: "故事开始，雨落在空荡的码头。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+    };
+    let created = state
+        .sessions
+        .create(&nid, None, req)
+        .await
+        .expect("create");
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let prompt = director_prompt(&provider);
+    assert!(
+        prompt.contains(NOVEL_SUMMARY_MARKER),
+        "整本书级会话应保留全书梗概: {prompt}"
+    );
+    assert!(
+        prompt.contains("仅供架构参考"),
+        "全书梗概必须标注为架构参考: {prompt}"
+    );
+}
+
 async fn run_bound_finalize(state: &AppState, plan_outline: &str) -> (String, String) {
     let (nid, actors, cid) = base_novel(state).await;
     sqlx::query("UPDATE chapters SET final_outline = ? WHERE id = ?")

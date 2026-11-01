@@ -1,8 +1,12 @@
 // tests/chapter_draft.rs — 章节正文生成（文风参考 / 场景切分 / 失败跳过）
+mod common;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use axum::http::{Method, StatusCode};
+use serde_json::json;
 use sqlx::sqlite::SqlitePool;
 
 use story_architect::config::{self, AppConfig};
@@ -12,7 +16,11 @@ use story_architect::llm::failover::ProviderChain;
 use story_architect::llm::mock::MockProvider;
 use story_architect::llm::{LlmError, LlmErrorKind, StructuredMode};
 use story_architect::models::draft::{CreateDraftReq, DraftJob, DraftStatus};
+use story_architect::router;
 use story_architect::services::chapter_draft::{load_job, DraftRegistry};
+use story_architect::services::novel_import::{ImportRegistry, IMPORT_SEMAPHORE};
+use story_architect::services::sandbox::SessionManager;
+use story_architect::state::AppState;
 
 const OUTLINE_THREE_SCENES: &str = "\
 ## 剧情梗概
@@ -100,6 +108,31 @@ fn mock_chain(mock: Arc<MockProvider>) -> ProviderChain {
 
 fn registry(fixture: &Fixture, chain: ProviderChain) -> DraftRegistry {
     DraftRegistry::with_chain(fixture.config.clone(), fixture.pool.clone(), 2, chain)
+}
+
+fn app(fixture: &Fixture) -> axum::Router {
+    let state = AppState {
+        config: fixture.config.clone(),
+        pool: fixture.pool.clone(),
+        bind_host: "127.0.0.1".to_string(),
+        bind_port: 8080,
+        is_public: false,
+        app_token: String::new(),
+        origins: vec!["http://127.0.0.1:8080".to_string()],
+        dev_cors: false,
+        sessions: Arc::new(SessionManager::new(
+            fixture.pool.clone(),
+            fixture.config.clone(),
+            1,
+        )),
+        imports: Arc::new(ImportRegistry::new(IMPORT_SEMAPHORE)),
+        drafts: Arc::new(DraftRegistry::new(
+            fixture.config.clone(),
+            fixture.pool.clone(),
+            None,
+        )),
+    };
+    router::build_router(state)
 }
 
 async fn wait_terminal(pool: &SqlitePool, id: &str) -> DraftJob {
@@ -529,4 +562,108 @@ async fn draft_skips_deslop_when_disabled() {
         .await
         .expect("chapter content");
     assert!(content.contains("这不是害怕"), "{content}");
+}
+
+#[tokio::test]
+async fn prose_prompt_excludes_novel_summary() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let summary_marker = "全书结局：老者在最后一章才揭示自己是少年的生父。";
+    let background_marker = "少年入城时身无分文，只带着一把旧伞";
+    sqlx::query("UPDATE novels SET summary = ?, background = ? WHERE id = ?")
+        .bind(summary_marker)
+        .bind(background_marker)
+        .bind(&fixture.novel_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("set novel summary and background");
+
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..3 {
+        mock.push_ok("正文。");
+    }
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(&fixture.novel_id, &fixture.chapter_id, draft_request(900))
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+
+    let prompts: Vec<String> = mock
+        .captured_requests()
+        .into_iter()
+        .flat_map(|(_, messages)| messages)
+        .filter(|message| message.role == story_architect::llm::MessageRole::User)
+        .map(|message| message.content)
+        .collect();
+    assert!(!prompts.is_empty(), "expected prose requests");
+    for prompt in &prompts {
+        assert!(
+            !prompt.contains(summary_marker),
+            "章节正文 prompt 不应注入全书摘要: {prompt}"
+        );
+    }
+    let first_prompt = &prompts[0];
+    assert!(
+        first_prompt.contains(background_marker),
+        "章节正文 prompt 应保留作品背景: {first_prompt}"
+    );
+}
+
+#[tokio::test]
+async fn chapter_content_returns_latest_lint() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    sqlx::query("UPDATE chapters SET content = ?, word_count = ? WHERE id = ?")
+        .bind("正文内容")
+        .bind(4_i64)
+        .bind(&fixture.chapter_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("set chapter content");
+
+    let older = json!({
+        "before_total": 9,
+        "after_total": 9,
+        "rewritten": 0,
+        "issues": []
+    });
+    let newer = json!({
+        "before_total": 3,
+        "after_total": 1,
+        "rewritten": 1,
+        "issues": [{ "kind": "template_phrase", "label": "翻案腔", "count": 2 }]
+    });
+    for (lint, created_at) in [(&older, 100_i64), (&newer, 200_i64)] {
+        sqlx::query(
+            "INSERT INTO chapter_drafts(novel_id, chapter_id, status, content, lint_json, created_at, updated_at) \
+             VALUES(?, ?, 'ready', ?, ?, ?, ?)",
+        )
+        .bind(&fixture.novel_id)
+        .bind(&fixture.chapter_id)
+        .bind("正文内容")
+        .bind(lint.to_string())
+        .bind(created_at)
+        .bind(created_at)
+        .execute(&fixture.pool)
+        .await
+        .expect("insert draft with lint");
+    }
+
+    let app = app(&fixture);
+    let (status, body) = common::call(
+        &app,
+        Method::GET,
+        &format!(
+            "/api/v1/novels/{}/chapters/{}/content",
+            fixture.novel_id, fixture.chapter_id
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["content"], "正文内容");
+    assert_eq!(body["lint"]["before_total"], 3, "{body}");
+    assert_eq!(body["lint"]["after_total"], 1, "{body}");
+    assert_eq!(body["lint"]["rewritten"], 1, "{body}");
+    assert_eq!(body["lint"]["issues"][0]["label"], "翻案腔", "{body}");
 }

@@ -131,6 +131,9 @@ pub struct DraftJob {
 pub struct ChapterContent {
     pub content: String,
     pub word_count: i64,
+    /// 该章节最近一条草稿的去 AI 味检查报告；无草稿或未检查时为 None。
+    #[serde(default)]
+    pub lint: Option<DraftLint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

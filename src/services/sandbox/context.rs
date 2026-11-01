@@ -329,6 +329,8 @@ fn list_label(index: i64, title: &str, unit: &str) -> String {
 }
 
 /// 纯函数：渲染作品设定与卷章定位，总长 ≤2000 字符。
+/// `chapter` 为 None 表示整本书级会话：此时才注入全书梗概（含结局），并标注仅供架构参考；
+/// 章节级会话只看世界观/背景/本卷与本章，避免全书结局污染本章。
 pub fn render_global_plot(
     novel: &NovelContext,
     chapter: Option<&ChapterContext>,
@@ -344,8 +346,10 @@ pub fn render_global_plot(
     if let Some(background) = clip(novel.background.as_deref(), 600) {
         out.push_str(&format!("背景：{background}\n"));
     }
-    if let Some(summary) = clip(novel.summary.as_deref(), 600) {
-        out.push_str(&format!("简介：{summary}\n"));
+    if chapter.is_none() {
+        if let Some(summary) = clip(novel.summary.as_deref(), 600) {
+            out.push_str(&format!("全书梗概（仅供架构参考）：{summary}\n"));
+        }
     }
 
     if let (Some(chapter), Some(volume)) = (chapter, volume) {

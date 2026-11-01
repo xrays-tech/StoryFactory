@@ -45,6 +45,7 @@ export function ChapterContentPanel({ novelId, chapterId, disabled, onGenerate }
 
   const job = useChapterDraftStore((s) => s.job);
   const draftLint = useChapterDraftStore((s) => s.lint);
+  const storedLint = useChapterContentStore((s) => s.lint);
   const draftChapterId = useChapterDraftStore((s) => s.chapterId);
   const creating = useChapterDraftStore((s) => s.creating);
   const cancelling = useChapterDraftStore((s) => s.cancelling);
@@ -74,7 +75,8 @@ export function ChapterContentPanel({ novelId, chapterId, disabled, onGenerate }
   const currentStage = contextMatches ? draftStage : null;
   const currentProgress = contextMatches ? draftProgress : 0;
   const currentStartedAt = contextMatches ? startedAt : null;
-  const currentLint = contextMatches && !running ? draftLint : null;
+  // 本次运行优先用实时结果；页面刷新后回落到服务端记录的最近一次检查。
+  const currentLint = contextMatches && !running ? (draftLint ?? storedLint) : null;
   const lintChips = useMemo(
     () => (currentLint ? draftLintChips(currentLint) : { chips: [], overflow: 0 }),
     [currentLint],

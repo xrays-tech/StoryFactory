@@ -119,12 +119,23 @@ describe("useChapterContentStore.applyContent", () => {
   it("replaces the editing buffer with generated content", () => {
     useChapterContentStore.setState({ editable: "旧草稿", dirty: true });
 
-    useChapterContentStore.getState().applyContent({ content: "生成好的正文", word_count: 6 });
+    useChapterContentStore.getState().applyContent({
+      content: "生成好的正文",
+      word_count: 6,
+      lint: { before_total: 6, after_total: 1, rewritten: 2, issues: [] },
+    });
 
     const state = useChapterContentStore.getState();
     expect(state.content).toBe("生成好的正文");
     expect(state.editable).toBe("生成好的正文");
     expect(state.wordCount).toBe(6);
+    expect(state.lint?.before_total).toBe(6);
     expect(state.dirty).toBe(false);
+  });
+
+  it("keeps lint from the server snapshot after reload", async () => {
+    await useChapterContentStore.getState().load("novel-1", "chapter-1");
+    const state = useChapterContentStore.getState();
+    expect(state.lint).toBeNull();
   });
 });

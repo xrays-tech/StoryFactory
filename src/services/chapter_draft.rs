@@ -323,9 +323,27 @@ pub async fn load_content(
     .map_err(db_err)?;
     let (content, word_count) =
         row.ok_or_else(|| AppError::new(ErrorCode::ChapterNotFound, "章节不存在或不属于该项目"))?;
+    let lint_json: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT lint_json FROM chapter_drafts \
+         WHERE chapter_id = ? AND novel_id = ? \
+         ORDER BY created_at DESC, updated_at DESC LIMIT 1",
+    )
+    .bind(chapter_id)
+    .bind(novel_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(db_err)?;
+    let lint = lint_json.flatten().and_then(|json| {
+        serde_json::from_str::<DraftLint>(&json)
+            .map_err(|error| {
+                tracing::warn!(chapter_id, error = %error, "草稿 lint_json 解析失败，忽略");
+            })
+            .ok()
+    });
     Ok(ChapterContent {
         content: content.unwrap_or_default(),
         word_count,
+        lint,
     })
 }
 
@@ -497,7 +515,6 @@ struct NovelRow {
     title: String,
     world_view: Option<String>,
     background: Option<String>,
-    summary: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -887,7 +904,7 @@ async fn load_context(
     .ok_or_else(|| RunError::Failed("章节已被删除".to_string()))?;
 
     let novel = sqlx::query_as::<_, NovelRow>(
-        "SELECT title, world_view, background, summary FROM novels \
+        "SELECT title, world_view, background FROM novels \
          WHERE id = ? AND deleted_at IS NULL",
     )
     .bind(&params.novel_id)
@@ -922,13 +939,14 @@ async fn load_context(
         .take(8)
         .collect();
 
-    let background = [novel.background.as_deref(), novel.summary.as_deref()]
-        .into_iter()
-        .flatten()
+    // 只注入作品背景：全书摘要含结局，会污染本章正文（本卷梗概已在 chapter_outline 中给出）。
+    let background = novel
+        .background
+        .as_deref()
         .map(str::trim)
         .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
+        .unwrap_or_default()
+        .to_string();
     let chapter_title = match chapter.volume_title.trim() {
         "" => chapter.title,
         volume_title => format!("{volume_title}·{}", chapter.title),
