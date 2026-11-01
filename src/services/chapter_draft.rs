@@ -613,6 +613,16 @@ async fn run_job_inner(
         .await
         {
             Ok(text) => {
+                // 每场都会拿到上一场结尾作为衔接上文，模型常把这段又复述一遍。
+                let text = if content.is_empty() {
+                    text
+                } else {
+                    dedupe_scene_junction(&text, &content)
+                };
+                if text.trim().is_empty() {
+                    tracing::warn!(draft_id = %id, scene = index + 1, "正文场景与上一场完全重复，已跳过");
+                    continue;
+                }
                 if !content.is_empty() {
                     content.push_str("\n\n");
                 }
@@ -855,6 +865,59 @@ fn deslop_max_tokens(paragraph: &str) -> u32 {
 }
 
 /// 只接受「单段」重写结果：取首个非空行，并拒绝明显超出原段长度的回显（模型有时会把后续段落一起返回）。
+/// 去掉新场景开头对上一场结尾的复述。
+///
+/// 模型每场都能看到「上一场结尾」作为衔接上下文，常会把这段原样再写一遍，
+/// 于是正文在场景拼接处出现整块重复。这里按段落去重，只在前几段范围内生效，
+/// 且如果去重后剩得太少就保留原样（宁可重复，也不吞掉真正的正文）。
+pub fn dedupe_scene_junction(new_text: &str, accumulated: &str) -> String {
+    const LOOKBACK_PARAGRAPHS: usize = 12;
+    const JUNCTION_PARAGRAPHS: usize = 10;
+    const MIN_KEEP_RATIO: f64 = 0.5;
+
+    let compact = |text: &str| text.split_whitespace().collect::<String>();
+    let previous: Vec<String> = accumulated
+        .split('\n')
+        .map(compact)
+        .filter(|p| p.chars().count() >= 8)
+        .collect::<Vec<_>>();
+    if previous.is_empty() {
+        return new_text.to_string();
+    }
+    let lookback: Vec<&String> = previous.iter().rev().take(LOOKBACK_PARAGRAPHS).collect();
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = 0usize;
+    let mut misses = 0usize;
+    for (index, paragraph) in new_text.split('\n').enumerate() {
+        let trimmed = paragraph.trim();
+        let key = compact(trimmed);
+        let in_junction = index < JUNCTION_PARAGRAPHS && misses < 2;
+        let echoed = in_junction
+            && key.chars().count() >= 8
+            && lookback.iter().any(|p| p.as_str() == key.as_str());
+        if echoed {
+            dropped += 1;
+            continue;
+        }
+        if in_junction && !key.is_empty() {
+            misses += 1;
+        }
+        kept.push(paragraph);
+    }
+
+    if dropped == 0 {
+        return new_text.to_string();
+    }
+    let candidate = kept.join("\n");
+    let candidate_chars = compact(&candidate).chars().count();
+    let original_chars = compact(new_text).chars().count();
+    if (candidate_chars as f64) < (original_chars as f64) * MIN_KEEP_RATIO {
+        return new_text.to_string();
+    }
+    candidate.trim_start().to_string()
+}
+
 fn normalize_rewrite(raw: &str, original: &str) -> Option<String> {
     let candidate = raw.lines().map(str::trim).find(|line| !line.is_empty())?;
     if candidate.is_empty() {
@@ -1416,6 +1479,36 @@ mod tests {
             system_chars + scene_chars <= 1_055,
             "prose prompts too large: {system_chars} + {scene_chars}"
         );
+    }
+
+    #[test]
+    fn dedupe_scene_junction_drops_echoed_block() {
+        let previous =
+            "她抹了一把脸，往后退。\n“兄妹……兄妹！”她忽然喊起来。\n门被带得重撞，弹回来。";
+        let next = "“兄妹……兄妹！”她忽然喊起来。\n门被带得重撞，弹回来。\n我站在原地没动，灶上的水开了。\n窗纸透进一点灰白。\n我把碗端起来，又放下。";
+        let out = dedupe_scene_junction(next, previous);
+        assert_eq!(
+            out,
+            "我站在原地没动，灶上的水开了。\n窗纸透进一点灰白。\n我把碗端起来，又放下。"
+        );
+    }
+
+    #[test]
+    fn dedupe_scene_junction_keeps_late_repeats() {
+        let previous = "门被带得重撞，弹回来。";
+        let mut next = String::from("我走进院子，风很凉。");
+        for _ in 0..12 {
+            next.push_str("\n檐下的灯晃了一下。");
+        }
+        next.push_str("\n门被带得重撞，弹回来。");
+        assert_eq!(dedupe_scene_junction(&next, previous), next);
+    }
+
+    #[test]
+    fn dedupe_scene_junction_keeps_text_when_most_would_be_dropped() {
+        let previous = "第一段重复内容够长了吧。\n第二段重复内容够长了吧。";
+        let next = "第一段重复内容够长了吧。\n第二段重复内容够长了吧。\n短。";
+        assert_eq!(dedupe_scene_junction(next, previous), next);
     }
 
     #[test]
