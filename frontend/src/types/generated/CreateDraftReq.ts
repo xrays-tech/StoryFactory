@@ -4,4 +4,8 @@ export type CreateDraftReq = { style_name: string | null, style_sample: string |
 /**
  * 叙述人称（如「第一人称」「第三人称」）；风格样本不改变人称，留空按第三人称。
  */
-pov: string | null, };
+pov: string | null, 
+/**
+ * 是否在生成后做「去 AI 味」lint 与定点重写；缺省开启。
+ */
+deslop: boolean | null, };

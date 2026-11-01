@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Eye, FileText, Loader2, Pencil, RefreshCw, Save, Sparkles } from "lucide-react";
 import { zh } from "../../copy/zh";
 import {
+  draftLintChips,
+  draftLintSummary,
   draftStageLabel,
   draftStatusLabel,
   isDraftRunning,
@@ -42,6 +44,7 @@ export function ChapterContentPanel({ novelId, chapterId, disabled, onGenerate }
   const discard = useChapterContentStore((s) => s.discard);
 
   const job = useChapterDraftStore((s) => s.job);
+  const draftLint = useChapterDraftStore((s) => s.lint);
   const draftChapterId = useChapterDraftStore((s) => s.chapterId);
   const creating = useChapterDraftStore((s) => s.creating);
   const cancelling = useChapterDraftStore((s) => s.cancelling);
@@ -71,6 +74,11 @@ export function ChapterContentPanel({ novelId, chapterId, disabled, onGenerate }
   const currentStage = contextMatches ? draftStage : null;
   const currentProgress = contextMatches ? draftProgress : 0;
   const currentStartedAt = contextMatches ? startedAt : null;
+  const currentLint = contextMatches && !running ? draftLint : null;
+  const lintChips = useMemo(
+    () => (currentLint ? draftLintChips(currentLint) : { chips: [], overflow: 0 }),
+    [currentLint],
+  );
   const streamUnstable =
     running && (connection === "reconnecting" || connection === "error" || !!streamError);
   const stageText =
@@ -308,6 +316,27 @@ export function ChapterContentPanel({ novelId, chapterId, disabled, onGenerate }
 
         {showContent ? (
           <>
+            {currentLint ? (
+              <div
+                role="status"
+                className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-info/20 bg-info-soft/40 px-3 py-2 text-xs leading-5 text-info"
+              >
+                <span>{draftLintSummary(currentLint)}</span>
+                {lintChips.chips.length > 0 ? (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {lintChips.chips.map((chip) => (
+                      <Badge key={chip.key} tone="info">
+                        {chip.label} · {chip.count}
+                      </Badge>
+                    ))}
+                    {lintChips.overflow > 0 ? (
+                      <Badge tone="muted">{zh.draft.lintMore(lintChips.overflow)}</Badge>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
             {editing && !running ? (
               <Textarea
                 value={editable}

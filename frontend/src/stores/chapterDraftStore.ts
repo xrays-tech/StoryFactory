@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { immer } from "zustand/middleware/immer";
-import type { ChapterContent, DraftJob, DraftStatus } from "../types/domain";
+import type { ChapterContent, DraftJob, DraftLint, DraftStatus } from "../types/domain";
 import type { Wire } from "../types/api";
 import * as api from "../api/endpoints";
 import { EventStream, type StreamState } from "../api/eventStream";
@@ -17,12 +17,16 @@ export type DraftPrefs = {
   instruction: string | null;
   target_words: number;
   pov: DraftPov | null;
+  /** 生成后是否做「去 AI 味」检查与定点重写。 */
+  deslop: boolean;
 };
 
 type ChapterDraftState = {
   novelId: string | null;
   chapterId: string | null;
   job: Wire<DraftJob> | null;
+  /** 最近一次生成任务的去 AI 味检查结果；终态后仍保留供结果条展示。 */
+  lint: Wire<DraftLint> | null;
   /** POST 请求进行中（SSE 尚未建立）。 */
   creating: boolean;
   /** DELETE 请求进行中。 */
@@ -86,6 +90,10 @@ export function draftStageLabel(stage: string | null | undefined): string {
       return zh.draft.stagePreparing;
     case "writing":
       return zh.draft.stageWriting;
+    case "linting":
+      return zh.draft.stageLinting;
+    case "rewriting":
+      return zh.draft.stageRewriting;
     case "finished":
       return zh.draft.stageFinished;
     case "failed":
@@ -123,6 +131,43 @@ function toBody(prefs: DraftPrefs): api.CreateChapterDraftBody {
     target_words: prefs.target_words,
     // null 表示沿用小说档案（未设置时由后端回退到第三人称）。
     pov: prefs.pov,
+    deslop: prefs.deslop,
+  };
+}
+
+/** 结果条的一句话结论。 */
+export function draftLintSummary(lint: Wire<DraftLint>): string {
+  if (lint.rewritten > 0) {
+    return zh.draft.lintRewritten(lint.before_total, lint.after_total, lint.rewritten);
+  }
+  if (lint.before_total > 0) {
+    return zh.draft.lintMinor(lint.before_total);
+  }
+  return zh.draft.lintClean;
+}
+
+export type DraftLintChip = {
+  key: string;
+  label: string;
+  count: number;
+};
+
+/** 结果条最多展示的 issue 数量；其余折叠成 +N。 */
+const LINT_CHIP_LIMIT = 4;
+
+export function draftLintChips(
+  lint: Wire<DraftLint>,
+  limit = LINT_CHIP_LIMIT,
+): { chips: DraftLintChip[]; overflow: number } {
+  const all = lint.issues.map((issue, index) => ({
+    key: `${issue.kind}-${index}`,
+    // 后端一般已给中文 label；缺失时回退到 kind 映射，避免展示英文标识。
+    label: issue.label.trim() || zh.draft.lintKinds[issue.kind] || issue.kind,
+    count: issue.count,
+  }));
+  return {
+    chips: all.slice(0, limit),
+    overflow: Math.max(0, all.length - limit),
   };
 }
 
@@ -192,6 +237,7 @@ function settleTerminal(
       draft.stage = "finished";
       draft.progress = 100;
       draft.job = null;
+      draft.lint = job?.lint ?? draft.lint;
       draft.error = null;
       draft.message = message ?? draft.message;
       draft.refreshing = !!job && !!novelId;
@@ -255,6 +301,7 @@ export const useChapterDraftStore = create<ChapterDraftState>()(
     novelId: null,
     chapterId: null,
     job: null,
+    lint: null,
     creating: false,
     cancelling: false,
     error: null,
@@ -291,6 +338,7 @@ export const useChapterDraftStore = create<ChapterDraftState>()(
         state.streamError = null;
         state.startedAt = null;
         state.job = null;
+        state.lint = null;
         state.connection = "connecting";
         state.refreshing = false;
         state.refreshError = null;
@@ -302,6 +350,7 @@ export const useChapterDraftStore = create<ChapterDraftState>()(
         set((state) => {
           state.creating = false;
           state.job = job;
+          state.lint = job.lint ?? null;
           state.stage = job.stage;
           state.progress = job.progress;
           state.message = job.message?.trim() || null;
@@ -349,6 +398,7 @@ export const useChapterDraftStore = create<ChapterDraftState>()(
           set((state) => {
             state.cancelling = false;
             state.job = null;
+            state.lint = null;
             state.stage = null;
             state.progress = 0;
             state.message = null;
@@ -366,6 +416,7 @@ export const useChapterDraftStore = create<ChapterDraftState>()(
       set((state) => {
         if (!shouldApply(state.job, job)) return;
         state.job = job;
+        state.lint = job.lint ?? state.lint;
         state.stage = job.stage;
         state.progress = job.progress;
         state.message = job.message?.trim() || state.message;
@@ -386,6 +437,7 @@ export const useChapterDraftStore = create<ChapterDraftState>()(
         state.novelId = null;
         state.chapterId = null;
         state.job = null;
+        state.lint = null;
         state.creating = false;
         state.cancelling = false;
         state.error = null;

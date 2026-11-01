@@ -16,8 +16,9 @@ pub const NOVEL_ANALYZE_STRUCTURE: &str =
 pub const CHAPTER_PROSE_SYSTEM: &str =
     include_str!("../../assets/prompts/chapter_prose_system.txt");
 pub const CHAPTER_PROSE_SCENE: &str = include_str!("../../assets/prompts/chapter_prose_scene.txt");
+pub const PROSE_DESLOP: &str = include_str!("../../assets/prompts/prose_deslop.txt");
 
-pub const TEMPLATES: [(&str, &str); 9] = [
+pub const TEMPLATES: [(&str, &str); 10] = [
     ("actor_step", ACTOR_STEP),
     ("actor_step_user", ACTOR_STEP_USER),
     ("director_decide", DIRECTOR_DECIDE),
@@ -27,6 +28,7 @@ pub const TEMPLATES: [(&str, &str); 9] = [
     ("novel_analyze_structure", NOVEL_ANALYZE_STRUCTURE),
     ("chapter_prose_system", CHAPTER_PROSE_SYSTEM),
     ("chapter_prose_scene", CHAPTER_PROSE_SCENE),
+    ("prose_deslop", PROSE_DESLOP),
 ];
 
 pub fn render(body: &str, ctx: &serde_json::Value) -> Result<String, AppError> {

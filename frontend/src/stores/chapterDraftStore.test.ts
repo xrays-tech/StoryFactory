@@ -31,10 +31,19 @@ vi.mock("../api/eventStream", () => ({
   },
 }));
 
-import { useChapterDraftStore, isDraftRunning, type DraftPrefs } from "./chapterDraftStore";
+import {
+  draftLintChips,
+  draftLintSummary,
+  draftStageLabel,
+  isDraftRunning,
+  useChapterDraftStore,
+  type DraftPrefs,
+} from "./chapterDraftStore";
 import { useChapterContentStore } from "./chapterContentStore";
+import type { DraftLint } from "../types/domain";
 
 type Job = Wire<DraftJob>;
+type Lint = Wire<DraftLint>;
 
 const prefs: DraftPrefs = {
   style_name: null,
@@ -42,6 +51,7 @@ const prefs: DraftPrefs = {
   instruction: null,
   target_words: 1200,
   pov: "第三人称",
+  deslop: true,
 };
 
 function job(overrides: Partial<Job> = {}): Job {
@@ -55,8 +65,19 @@ function job(overrides: Partial<Job> = {}): Job {
     target_words: 1200,
     message: null,
     error: null,
+    lint: null,
     created_at: 1,
     updated_at: 1,
+    ...overrides,
+  };
+}
+
+function lint(overrides: Partial<Lint> = {}): Lint {
+  return {
+    before_total: 0,
+    after_total: 0,
+    rewritten: 0,
+    issues: [],
     ...overrides,
   };
 }
@@ -96,6 +117,7 @@ describe("useChapterDraftStore.create", () => {
         instruction: null,
         target_words: 1200,
         pov: "第三人称",
+        deslop: true,
       },
       expect.stringMatching(/^draft-/),
     );
@@ -105,6 +127,14 @@ describe("useChapterDraftStore.create", () => {
     expect(state.creating).toBe(false);
     expect(state.startedAt).not.toBeNull();
     expect(harness.streamConfig.current).not.toBeNull();
+  });
+
+  it("submits deslop=false when the switch is off", async () => {
+    harness.createChapterDraft.mockResolvedValue(job({ status: "generating", progress: 5 }));
+
+    await useChapterDraftStore.getState().create("n1", "c1", { ...prefs, deslop: false });
+
+    expect(harness.createChapterDraft.mock.calls[0]?.[2]).toMatchObject({ deslop: false });
   });
 
   it("uses a fresh idempotency key on retry", async () => {
@@ -139,6 +169,46 @@ describe("useChapterDraftStore.create", () => {
       "已有生成任务在进行中",
     );
     expect(harness.createChapterDraft).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("draftStageLabel", () => {
+  it("maps the deslop stages to Chinese copy", () => {
+    expect(draftStageLabel("linting")).toBe("检查 AI 味");
+    expect(draftStageLabel("rewriting")).toBe("定点重写");
+  });
+});
+
+describe("draftLintSummary", () => {
+  it("describes rewrite, minor hits and clean drafts", () => {
+    expect(draftLintSummary(lint({ before_total: 6, after_total: 1, rewritten: 2 }))).toBe(
+      "AI 味检查：修前 6 处 → 修后 1 处，重写 2 段",
+    );
+    expect(draftLintSummary(lint({ before_total: 2, after_total: 2 }))).toBe(
+      "AI 味检查：2 处轻微命中（未触发重写）",
+    );
+    expect(draftLintSummary(lint())).toBe("AI 味检查：未命中明显模板化表达");
+  });
+});
+
+describe("draftLintChips", () => {
+  it("caps visible issues, reports overflow and falls back to kind labels", () => {
+    const report = lint({
+      before_total: 9,
+      issues: [
+        { kind: "lead_comment", label: "评论腔", count: 2 },
+        { kind: "not_but", label: "", count: 1 },
+        { kind: "enumeration", label: "抽象罗列", count: 1 },
+        { kind: "body_cliche", label: "身体套话", count: 1 },
+        { kind: "ending_moral", label: "结尾升华", count: 1 },
+      ],
+    });
+
+    const { chips, overflow } = draftLintChips(report);
+
+    expect(chips).toHaveLength(4);
+    expect(chips[1]?.label).toBe("翻案腔");
+    expect(overflow).toBe(1);
   });
 });
 
@@ -188,6 +258,28 @@ describe("useChapterDraftStore terminal events", () => {
     expect(state.job).toBeNull();
     expect(state.message).toBe("已跳过 1 场");
     expect(state.refreshing).toBe(false);
+  });
+
+  it("keeps the lint report after completion", async () => {
+    harness.createChapterDraft.mockResolvedValue(job({ status: "generating", progress: 5 }));
+    harness.getChapterContent.mockResolvedValue({ content: "生成好的正文", word_count: 6 });
+    await useChapterDraftStore.getState().create("n1", "c1", prefs);
+
+    lastStream().onDone?.(
+      "draft.done",
+      job({
+        status: "ready",
+        stage: "finished",
+        progress: 100,
+        lint: lint({ before_total: 3, after_total: 1, rewritten: 1 }),
+      }),
+    );
+
+    await vi.waitFor(() => {
+      expect(useChapterContentStore.getState().content).toBe("生成好的正文");
+    });
+    expect(useChapterDraftStore.getState().job).toBeNull();
+    expect(useChapterDraftStore.getState().lint?.before_total).toBe(3);
   });
 
   it("surfaces the failure reason for retry", async () => {

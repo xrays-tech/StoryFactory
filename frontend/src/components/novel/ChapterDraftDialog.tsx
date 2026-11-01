@@ -41,6 +41,7 @@ export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: Chapte
   const [pov, setPov] = useState<DraftPov>("第三人称");
   const [targetWords, setTargetWords] = useState(String(TARGET_DEFAULT));
   const [instruction, setInstruction] = useState("");
+  const [deslop, setDeslop] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const profileId = profile?.id ?? null;
@@ -54,6 +55,7 @@ export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: Chapte
     setPov(novel?.pov === "第一人称" ? "第一人称" : "第三人称");
     setTargetWords(String(TARGET_DEFAULT));
     setInstruction(novel?.style_instruction ?? "");
+    setDeslop(true);
     setError(null);
   }, [open, chapterId, novelId, profileId]);
 
@@ -82,6 +84,7 @@ export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: Chapte
     const prefs: DraftPrefs = {
       ...style,
       target_words: target,
+      deslop,
     };
 
     try {
@@ -221,6 +224,24 @@ export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: Chapte
             <p className="text-xs leading-5 text-faint">{zh.draft.targetWordsHint}</p>
           </div>
         </div>
+
+        <label className="flex cursor-pointer items-start gap-3 rounded-xl border border-line/70 bg-raised px-3 py-3">
+          <input
+            type="checkbox"
+            checked={deslop}
+            onChange={(event) => {
+              setDeslop(event.target.checked);
+              setError(null);
+            }}
+            className="mt-0.5 h-4 w-4 rounded border-line text-accent focus:ring-accent"
+          />
+          <span>
+            <span className="block text-sm font-medium text-ink">{zh.draft.deslop}</span>
+            <span className="mt-0.5 block text-[11px] leading-5 text-muted">
+              {zh.draft.deslopHint}
+            </span>
+          </span>
+        </label>
 
         <Field
           label={zh.draft.instruction}

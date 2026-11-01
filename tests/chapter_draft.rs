@@ -24,6 +24,15 @@ const OUTLINE_THREE_SCENES: &str = "\
 - 木匣中剑光乍现
 ";
 
+/// 首轮正文：2 处翻案腔 + 4 段连续纯对白。
+const PROBLEMATIC_SCENE: &str = "\
+这不是害怕，而是兴奋。
+他不是在等人，而是在等一个答案。
+「你来了。」
+「我来了。」
+「东西呢。」
+「在这里。」";
+
 struct Fixture {
     _dir: tempfile::TempDir,
     pool: SqlitePool,
@@ -447,4 +456,77 @@ async fn draft_request_overrides_novel_style() {
             .expect("draft style snapshot");
     assert_eq!(sample.as_deref(), Some(request_sample));
     assert_eq!(pov.as_deref(), Some("第三人称"));
+}
+
+#[tokio::test]
+async fn draft_lints_and_rewrites_marked_paragraph() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    mock.push_ok(PROBLEMATIC_SCENE);
+    mock.push_ok("雨声渐密，他把窗子掩上。");
+    mock.push_ok("长街尽头传来更鼓。");
+    // 最多 3 段定点重写：2 段翻案腔 + 对白乒乓的首段。
+    mock.push_ok("雨点敲在窗棂上，他数着檐下的水珠。");
+    mock.push_ok("桌上的茶凉了，他没有去碰。");
+    mock.push_ok("门外有人咳了一声，他抬眼。");
+
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(&fixture.novel_id, &fixture.chapter_id, draft_request(1_200))
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+
+    let lint = job.lint.as_ref().expect("lint report");
+    assert!(lint.rewritten >= 1, "{lint:?}");
+    assert!(lint.after_total < lint.before_total, "{lint:?}");
+    assert!(lint.before_total >= 4, "{lint:?}");
+    assert_eq!(mock.call_count(), 3 + lint.rewritten as usize);
+
+    let content: String = sqlx::query_scalar("SELECT content FROM chapters WHERE id = ?")
+        .bind(&fixture.chapter_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("chapter content");
+    assert!(content.contains("雨点敲在窗棂上"), "{content}");
+    assert!(!content.contains("这不是害怕"), "{content}");
+    assert!(!content.contains("「你来了。」"), "{content}");
+}
+
+#[tokio::test]
+async fn draft_skips_deslop_when_disabled() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    mock.push_ok(PROBLEMATIC_SCENE);
+    mock.push_ok("第二场正文。");
+    mock.push_ok("第三场正文。");
+
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(
+            &fixture.novel_id,
+            &fixture.chapter_id,
+            CreateDraftReq {
+                deslop: Some(false),
+                ..draft_request(1_200)
+            },
+        )
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+    assert_eq!(mock.call_count(), 3);
+
+    let lint = job.lint.as_ref().expect("lint still reported");
+    assert_eq!(lint.rewritten, 0);
+    assert_eq!(lint.before_total, lint.after_total);
+    assert!(lint.before_total > 0);
+
+    let content: String = sqlx::query_scalar("SELECT content FROM chapters WHERE id = ?")
+        .bind(&fixture.chapter_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("chapter content");
+    assert!(content.contains("这不是害怕"), "{content}");
 }

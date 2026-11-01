@@ -18,7 +18,10 @@ use crate::llm::failover::ProviderChain;
 use crate::llm::prompts;
 use crate::llm::service::LlmService;
 use crate::llm::{LlmErrorKind, Message, Purpose};
-use crate::models::draft::{ChapterContent, CreateDraftReq, DraftJob, DraftStatus};
+use crate::models::draft::{
+    ChapterContent, CreateDraftReq, DraftJob, DraftLint, DraftLintIssue, DraftStage, DraftStatus,
+};
+use crate::services::prose_lint::{self, LintKind};
 use crate::services::util::{db_err, not_found};
 
 pub const DRAFT_SEMAPHORE: usize = 2;
@@ -34,6 +37,8 @@ const PROSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(180);
 const PROSE_STEP_TIMEOUT_SECS: u64 = 240;
 const PROSE_SESSION_TIMEOUT_SECS: u64 = 3_600;
 
+const DESLOP_SYSTEM: &str = "你是小说编辑。只改写用户给出的这一段正文，只输出改写后的纯正文。";
+
 const PROSE_RULES: &str = "1. 只写大纲给定的情节，不得写大纲之外的内容。\n\
 2. 不得新增原文没有的关键事实（数字、年龄、亲缘、疾病、职业）。\n\
 3. 不得跳到大纲后面的情节。\n\
@@ -42,7 +47,7 @@ const PROSE_RULES: &str = "1. 只写大纲给定的情节，不得写大纲之�
 
 const DRAFT_COLS: &str =
     "id, chapter_id, status, stage, progress, style_name, target_words, message, error, \
-     created_at, updated_at";
+     lint_json, created_at, updated_at";
 
 /// 章节大纲 + 小说文风档案（一次查询完成回退所需的读取）。
 #[derive(sqlx::FromRow)]
@@ -172,20 +177,25 @@ impl DraftRegistry {
             MAX_INSTRUCTION_CHARS,
         );
         let pov = normalize_optional_text(first_non_blank(req.pov, chapter.pov), 20);
+        let deslop = req
+            .deslop
+            .map(|enabled| if enabled { 1_i64 } else { 0_i64 });
 
         let id: String = sqlx::query_scalar(
             "INSERT INTO chapter_drafts( \
                 novel_id, chapter_id, status, stage, progress, style_name, style_sample, \
-                instruction, target_words, pov, message \
-             ) VALUES(?, ?, 'queued', 'queued', 0, ?, ?, ?, ?, ?, ?) RETURNING id",
+                instruction, target_words, pov, deslop, message \
+             ) VALUES(?, ?, 'queued', ?, 0, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         )
         .bind(novel_id)
         .bind(chapter_id)
+        .bind(DraftStage::Queued.as_str())
         .bind(&style_name)
         .bind(&style_sample)
         .bind(&instruction)
         .bind(target_words)
         .bind(&pov)
+        .bind(deslop)
         .bind(&message)
         .fetch_one(&self.pool)
         .await
@@ -218,6 +228,7 @@ struct DraftRow {
     target_words: i64,
     message: Option<String>,
     error: Option<String>,
+    lint_json: Option<String>,
     created_at: i64,
     updated_at: i64,
 }
@@ -234,6 +245,9 @@ impl DraftRow {
             target_words: self.target_words,
             message: self.message,
             error: self.error,
+            lint: self
+                .lint_json
+                .and_then(|json| serde_json::from_str::<DraftLint>(&json).ok()),
             created_at: self.created_at,
             updated_at: self.updated_at,
         }
@@ -281,10 +295,11 @@ pub async fn cancel_job(
     }
     // 没有活跃 runner（例如崩溃恢复窗口）：直接落终态，避免任务永久挂起。
     sqlx::query(
-        "UPDATE chapter_drafts SET status = 'cancelled', stage = 'cancelled', \
+        "UPDATE chapter_drafts SET status = 'cancelled', stage = ?, \
          message = '用户已取消', updated_at = strftime('%s','now') \
          WHERE id = ? AND status IN ('queued','generating')",
     )
+    .bind(DraftStage::Cancelled.as_str())
     .bind(id)
     .execute(pool)
     .await
@@ -348,10 +363,11 @@ pub async fn save_content(
 /// 启动恢复：上次进程中断时仍在排队/生成的草稿一律置为失败。
 pub async fn recover_startup(pool: &SqlitePool) -> Result<u64, AppError> {
     let affected = sqlx::query(
-        "UPDATE chapter_drafts SET status = 'failed', stage = 'failed', \
+        "UPDATE chapter_drafts SET status = 'failed', stage = ?, \
          error = '服务重启中断', updated_at = strftime('%s','now') \
          WHERE status IN ('queued','generating')",
     )
+    .bind(DraftStage::Failed.as_str())
     .execute(pool)
     .await
     .map_err(db_err)?
@@ -417,10 +433,11 @@ async fn run_job(pool: SqlitePool, id: String, registry: DraftRegistry, token: C
 
 async fn mark_cancelled(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE chapter_drafts SET status = 'cancelled', stage = 'cancelled', \
+        "UPDATE chapter_drafts SET status = 'cancelled', stage = ?, \
          message = '用户已取消', updated_at = strftime('%s','now') \
          WHERE id = ? AND status IN ('queued','generating')",
     )
+    .bind(DraftStage::Cancelled.as_str())
     .bind(id)
     .execute(pool)
     .await
@@ -429,10 +446,11 @@ async fn mark_cancelled(pool: &SqlitePool, id: &str) -> Result<(), sqlx::Error> 
 
 async fn mark_failed(pool: &SqlitePool, id: &str, message: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "UPDATE chapter_drafts SET status = 'failed', stage = 'failed', error = ?, \
+        "UPDATE chapter_drafts SET status = 'failed', stage = ?, error = ?, \
          updated_at = strftime('%s','now') \
          WHERE id = ? AND status IN ('queued','generating')",
     )
+    .bind(DraftStage::Failed.as_str())
     .bind(message)
     .bind(id)
     .execute(pool)
@@ -449,12 +467,14 @@ struct DraftParams {
     instruction: Option<String>,
     target_words: i64,
     pov: Option<String>,
+    deslop: Option<i64>,
     message: Option<String>,
 }
 
 async fn load_params(pool: &SqlitePool, id: &str) -> Result<DraftParams, RunError> {
     sqlx::query_as::<_, DraftParams>(
-        "SELECT novel_id, chapter_id, style_name, style_sample, instruction, target_words, pov, message \
+        "SELECT novel_id, chapter_id, style_name, style_sample, instruction, target_words, \
+         pov, deslop, message \
          FROM chapter_drafts WHERE id = ?",
     )
     .bind(id)
@@ -514,10 +534,11 @@ async fn run_job_inner(
     let _permit = permit;
 
     let affected = sqlx::query(
-        "UPDATE chapter_drafts SET status = 'generating', stage = 'preparing', progress = 5, \
+        "UPDATE chapter_drafts SET status = 'generating', stage = ?, progress = 5, \
          error = NULL, updated_at = strftime('%s','now') \
          WHERE id = ? AND status = 'queued'",
     )
+    .bind(DraftStage::Preparing.as_str())
     .bind(id)
     .execute(pool)
     .await
@@ -594,9 +615,10 @@ async fn run_job_inner(
 
         let progress = 5 + (90 * (index as i64 + 1)) / total as i64;
         sqlx::query(
-            "UPDATE chapter_drafts SET stage = 'writing', progress = ?, \
+            "UPDATE chapter_drafts SET stage = ?, progress = ?, \
              updated_at = strftime('%s','now') WHERE id = ? AND status = 'generating'",
         )
+        .bind(DraftStage::Writing.as_str())
         .bind(progress)
         .bind(id)
         .execute(pool)
@@ -609,7 +631,22 @@ async fn run_job_inner(
     if content.is_empty() {
         return Err(RunError::Failed("所有场景生成失败".to_string()));
     }
+
+    let (content, lint) = run_deslop(
+        pool,
+        id,
+        &llm,
+        &content,
+        params.deslop.unwrap_or(1) != 0,
+        params.style_name.as_deref().unwrap_or(""),
+        &context.pov,
+        token,
+    )
+    .await?;
+    ensure_active(token)?;
     let word_count = count_words(&content);
+    let lint_json = serde_json::to_string(&lint).ok();
+
     let mut message = params.message.clone();
     if skipped > 0 {
         append_note(
@@ -636,18 +673,201 @@ async fn run_job_inner(
         return Err(RunError::Failed("章节已被删除，正文未写入".to_string()));
     }
     sqlx::query(
-        "UPDATE chapter_drafts SET status = 'ready', stage = 'finished', progress = 100, \
-         content = ?, message = ?, error = NULL, updated_at = strftime('%s','now') \
+        "UPDATE chapter_drafts SET status = 'ready', stage = ?, progress = 100, \
+         content = ?, message = ?, error = NULL, lint_json = ?, \
+         updated_at = strftime('%s','now') \
          WHERE id = ? AND status = 'generating'",
     )
+    .bind(DraftStage::Finished.as_str())
     .bind(&content)
     .bind(&message)
+    .bind(&lint_json)
     .bind(id)
     .execute(&mut *tx)
     .await
     .map_err(db_failure)?;
     tx.commit().await.map_err(db_failure)?;
     Ok(())
+}
+
+/// 生成后 lint；命中阈值时定点重写最多 3 段。返回最终正文与报告。
+#[allow(clippy::too_many_arguments)]
+async fn run_deslop(
+    pool: &SqlitePool,
+    id: &str,
+    llm: &LlmService,
+    content: &str,
+    enabled: bool,
+    style_name: &str,
+    pov: &str,
+    token: &CancellationToken,
+) -> Result<(String, DraftLint), RunError> {
+    ensure_active(token)?;
+    update_stage(pool, id, DraftStage::Linting, 90).await?;
+    let before = prose_lint::lint(content);
+    let before_total = before.total;
+
+    if !enabled || !prose_lint::needs_rewrite(&before) {
+        return Ok((content.to_string(), draft_lint(&before, before_total, 0)));
+    }
+
+    update_stage(pool, id, DraftStage::Rewriting, 95).await?;
+    let targets = prose_lint::rewrite_targets(content, &before, 3);
+    let mut rewrites: Vec<(usize, String)> = Vec::new();
+    for (index, paragraph, reasons) in targets {
+        ensure_active(token)?;
+        match rewrite_paragraph(llm, pov, style_name, &paragraph, &reasons, token).await? {
+            Some(rewritten) => rewrites.push((index, rewritten)),
+            None => {
+                tracing::warn!(draft_id = %id, paragraph = index, "去 AI 味重写失败，已跳过该段");
+            }
+        }
+    }
+
+    if rewrites.is_empty() {
+        return Ok((content.to_string(), draft_lint(&before, before_total, 0)));
+    }
+
+    let rewritten_content = apply_paragraph_rewrites(content, &rewrites);
+    let after = prose_lint::lint(&rewritten_content);
+    let report = draft_lint(&after, before_total, rewrites.len() as i64);
+    Ok((rewritten_content, report))
+}
+
+async fn update_stage(
+    pool: &SqlitePool,
+    id: &str,
+    stage: DraftStage,
+    progress: i64,
+) -> Result<(), RunError> {
+    sqlx::query(
+        "UPDATE chapter_drafts SET stage = ?, progress = ?, updated_at = strftime('%s','now') \
+         WHERE id = ? AND status = 'generating'",
+    )
+    .bind(stage.as_str())
+    .bind(progress)
+    .bind(id)
+    .execute(pool)
+    .await
+    .map_err(db_failure)?;
+    Ok(())
+}
+
+async fn rewrite_paragraph(
+    llm: &LlmService,
+    pov: &str,
+    style_name: &str,
+    paragraph: &str,
+    reasons: &[LintKind],
+    token: &CancellationToken,
+) -> Result<Option<String>, RunError> {
+    ensure_active(token)?;
+    let reasons = reasons
+        .iter()
+        .map(|kind| kind.reason())
+        .collect::<Vec<_>>()
+        .join("；");
+    let user = match prompts::render(
+        prompts::PROSE_DESLOP,
+        &json!({
+            "paragraph": paragraph,
+            "reasons": reasons,
+            "pov": pov,
+            "style_name": style_name,
+        }),
+    ) {
+        Ok(user) => user,
+        Err(error) => {
+            tracing::warn!(error = %error.message, "去 AI 味 prompt 渲染失败，已跳过该段");
+            return Ok(None);
+        }
+    };
+
+    let messages = vec![
+        Message::system(DESLOP_SYSTEM.to_string()),
+        Message::user(user),
+    ];
+    let budget = Budget::new(
+        PROSE_SESSION_TIMEOUT_SECS,
+        PROSE_STEP_TIMEOUT_SECS,
+        PROSE_ATTEMPT_TIMEOUT.as_secs(),
+    );
+    let max_tokens = deslop_max_tokens(paragraph);
+    let result = tokio::select! {
+        _ = token.cancelled() => return Err(RunError::Cancelled),
+        result = llm.complete_text(&budget, Purpose::Prose, messages, max_tokens) => result,
+    };
+
+    match result {
+        Ok(text) => {
+            let text = normalize_rewrite(&text);
+            if text.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(text))
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error = %error.message, "去 AI 味重写调用失败，已跳过该段");
+            Ok(None)
+        }
+    }
+}
+
+fn draft_lint(report: &prose_lint::LintReport, before_total: i64, rewritten: i64) -> DraftLint {
+    DraftLint {
+        before_total,
+        after_total: report.total,
+        rewritten,
+        issues: report
+            .issues
+            .iter()
+            .map(|issue| DraftLintIssue {
+                kind: issue.kind.as_str().to_string(),
+                label: issue.kind.label().to_string(),
+                count: issue.count,
+            })
+            .collect(),
+    }
+}
+
+fn deslop_max_tokens(paragraph: &str) -> u32 {
+    (count_words(paragraph).saturating_mul(2) + 400).clamp(800, 4_000) as u32
+}
+
+fn normalize_rewrite(raw: &str) -> String {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+/// 按段索引替换：空行与未命中的行原样保留。
+fn apply_paragraph_rewrites(text: &str, rewrites: &[(usize, String)]) -> String {
+    if rewrites.is_empty() {
+        return text.to_string();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut paragraph_index = 0usize;
+    for (line_index, line) in text.split('\n').enumerate() {
+        if line_index > 0 {
+            result.push('\n');
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            result.push_str(line);
+            continue;
+        }
+        match rewrites.iter().find(|(index, _)| *index == paragraph_index) {
+            Some((_, replacement)) => result.push_str(replacement),
+            None => result.push_str(line),
+        }
+        paragraph_index += 1;
+    }
+    result
 }
 
 async fn load_context(

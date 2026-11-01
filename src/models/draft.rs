@@ -13,6 +13,36 @@ pub enum DraftStatus {
     Cancelled,
 }
 
+/// 任务阶段（仅用于进度展示，DB 中是无约束文本）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export)]
+pub enum DraftStage {
+    Queued,
+    Preparing,
+    Writing,
+    Linting,
+    Rewriting,
+    Finished,
+    Failed,
+    Cancelled,
+}
+
+impl DraftStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DraftStage::Queued => "queued",
+            DraftStage::Preparing => "preparing",
+            DraftStage::Writing => "writing",
+            DraftStage::Linting => "linting",
+            DraftStage::Rewriting => "rewriting",
+            DraftStage::Finished => "finished",
+            DraftStage::Failed => "failed",
+            DraftStage::Cancelled => "cancelled",
+        }
+    }
+}
+
 impl DraftStatus {
     pub fn to_db(self) -> String {
         match self {
@@ -56,6 +86,27 @@ pub struct CreateDraftReq {
     /// 叙述人称（如「第一人称」「第三人称」）；风格样本不改变人称，留空按第三人称。
     #[serde(default)]
     pub pov: Option<String>,
+    /// 是否在生成后做「去 AI 味」lint 与定点重写；缺省开启。
+    #[serde(default)]
+    pub deslop: Option<bool>,
+}
+
+/// 正文 lint 结果（after 报告，未重写时即 before）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DraftLint {
+    pub before_total: i64,
+    pub after_total: i64,
+    pub rewritten: i64,
+    pub issues: Vec<DraftLintIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct DraftLintIssue {
+    pub kind: String,
+    pub label: String,
+    pub count: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -70,6 +121,7 @@ pub struct DraftJob {
     pub target_words: i64,
     pub message: Option<String>,
     pub error: Option<String>,
+    pub lint: Option<DraftLint>,
     pub created_at: i64,
     pub updated_at: i64,
 }

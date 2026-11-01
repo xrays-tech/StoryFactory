@@ -270,6 +270,8 @@ export type CreateChapterDraftBody = {
   instruction?: string | null;
   target_words?: number | null;
   pov?: string | null;
+  /** 是否在生成后做「去 AI 味」lint 与定点重写；缺省开启。 */
+  deslop?: boolean | null;
 };
 
 export async function getChapterContent(nid: string, cid: string): Promise<Wire<ChapterContent>> {

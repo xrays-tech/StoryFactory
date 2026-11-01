@@ -6,6 +6,7 @@ pub mod item;
 pub mod novel;
 pub mod novel_import;
 pub mod outline;
+pub mod prose_lint;
 pub mod recycle;
 pub mod sandbox;
 pub mod search;
