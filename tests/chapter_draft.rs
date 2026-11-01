@@ -1,10 +1,11 @@
 // tests/chapter_draft.rs — 章节正文生成（文风参考 / 场景切分 / 失败跳过）
 mod common;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use axum::http::{Method, StatusCode};
 use serde_json::json;
 use sqlx::sqlite::SqlitePool;
@@ -14,7 +15,9 @@ use story_architect::db;
 use story_architect::error::ErrorCode;
 use story_architect::llm::failover::ProviderChain;
 use story_architect::llm::mock::MockProvider;
-use story_architect::llm::{LlmError, LlmErrorKind, StructuredMode};
+use story_architect::llm::{
+    CompletionReq, CompletionResp, LlmError, LlmErrorKind, LlmProvider, StructuredMode,
+};
 use story_architect::models::draft::{CreateDraftReq, DraftJob, DraftStatus};
 use story_architect::router;
 use story_architect::services::chapter_draft::{load_job, DraftRegistry};
@@ -158,6 +161,80 @@ fn draft_request(target_words: i64) -> CreateDraftReq {
         target_words: Some(target_words),
         ..CreateDraftReq::default()
     }
+}
+
+/// 记录每次请求的 reasoning_effort，用于断言正文场景的推理强度。
+struct RecordingProvider {
+    content: String,
+    efforts: Mutex<Vec<Option<&'static str>>>,
+}
+
+impl RecordingProvider {
+    fn new(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            efforts: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn efforts(&self) -> Vec<Option<&'static str>> {
+        self.efforts
+            .lock()
+            .map(|efforts| efforts.clone())
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl LlmProvider for RecordingProvider {
+    fn name(&self) -> &str {
+        "recording"
+    }
+
+    fn model(&self) -> &str {
+        "recording-model"
+    }
+
+    fn structured_mode(&self) -> StructuredMode {
+        StructuredMode::JsonObject
+    }
+
+    async fn complete(&self, req: CompletionReq) -> Result<CompletionResp, LlmError> {
+        if let Ok(mut efforts) = self.efforts.lock() {
+            efforts.push(req.reasoning_effort);
+        }
+        Ok(CompletionResp {
+            content: self.content.clone(),
+            prompt_tokens: 10,
+            completion_tokens: 10,
+        })
+    }
+}
+
+#[tokio::test]
+async fn prose_scene_requests_minimal_reasoning() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let provider = Arc::new(RecordingProvider::new("少年推门而入，雨水顺着屋檐落下。"));
+    let chain = ProviderChain::new(vec![provider.clone()], 0, Duration::from_secs(5));
+    let registry = registry(&fixture, chain);
+
+    let job = registry
+        .create(&fixture.novel_id, &fixture.chapter_id, draft_request(1_200))
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+
+    let efforts = provider.efforts();
+    assert_eq!(
+        efforts.len(),
+        3,
+        "expected three scene requests: {efforts:?}"
+    );
+    assert!(
+        efforts.iter().all(|effort| *effort == Some("minimal")),
+        "scene requests must use minimal reasoning: {efforts:?}"
+    );
 }
 
 #[tokio::test]

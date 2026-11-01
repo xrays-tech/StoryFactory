@@ -107,6 +107,9 @@ pub struct CompletionReq {
     pub temperature: f32,
     pub deadline: Instant,
     pub purpose: Purpose,
+    /// 供应商支持的推理强度（如 `minimal` / `low` / `medium` / `high`）。
+    /// `None` 表示不传该字段，保持既有请求不变。
+    pub reasoning_effort: Option<&'static str>,
 }
 
 impl CompletionReq {
@@ -118,7 +121,13 @@ impl CompletionReq {
             temperature: 0.7,
             deadline,
             purpose,
+            reasoning_effort: None,
         }
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: &'static str) -> Self {
+        self.reasoning_effort = Some(effort);
+        self
     }
 }
 
@@ -206,4 +215,33 @@ pub trait LlmProvider: Send + Sync {
     fn model(&self) -> &str;
     fn structured_mode(&self) -> StructuredMode;
     async fn complete(&self, req: CompletionReq) -> Result<CompletionResp, LlmError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{CompletionReq, Message, Purpose};
+
+    #[test]
+    fn completion_req_defaults_without_reasoning_effort() {
+        let req = CompletionReq::new(
+            vec![Message::user("写一段正文")],
+            Instant::now() + Duration::from_secs(30),
+            Purpose::Prose,
+        );
+        assert_eq!(req.reasoning_effort, None);
+        assert_eq!(req.max_tokens, 1500);
+    }
+
+    #[test]
+    fn completion_req_with_reasoning_effort_sets_field() {
+        let req = CompletionReq::new(
+            vec![Message::user("写一段正文")],
+            Instant::now() + Duration::from_secs(30),
+            Purpose::Prose,
+        )
+        .with_reasoning_effort("minimal");
+        assert_eq!(req.reasoning_effort, Some("minimal"));
+    }
 }

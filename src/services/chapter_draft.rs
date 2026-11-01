@@ -816,14 +816,16 @@ async fn rewrite_paragraph(
     };
 
     match result {
-        Ok(text) => {
-            let text = normalize_rewrite(&text);
-            if text.is_empty() {
+        Ok(text) => match normalize_rewrite(&text, paragraph) {
+            Some(rewritten) => Ok(Some(rewritten)),
+            None => {
+                tracing::warn!(
+                    paragraph_len = paragraph.chars().count(),
+                    "去 AI 味重写结果异常（过长或多段回显），已跳过该段"
+                );
                 Ok(None)
-            } else {
-                Ok(Some(text))
             }
-        }
+        },
         Err(error) => {
             tracing::warn!(error = %error.message, "去 AI 味重写调用失败，已跳过该段");
             Ok(None)
@@ -852,14 +854,24 @@ fn deslop_max_tokens(paragraph: &str) -> u32 {
     (count_words(paragraph).saturating_mul(2) + 400).clamp(800, 4_000) as u32
 }
 
-fn normalize_rewrite(raw: &str) -> String {
-    raw.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string()
+/// 只接受「单段」重写结果：取首个非空行，并拒绝明显超出原段长度的回显（模型有时会把后续段落一起返回）。
+fn normalize_rewrite(raw: &str, original: &str) -> Option<String> {
+    let candidate = raw.lines().map(str::trim).find(|line| !line.is_empty())?;
+    if candidate.is_empty() {
+        return None;
+    }
+    let original_len = original.chars().count();
+    let limit = original_len.saturating_mul(2) + 80;
+    if candidate.chars().count() > limit {
+        return None;
+    }
+    // 模型偶尔把原段连同后续段落一起回显，拼进单段会制造重复正文。
+    let anchor = original.trim();
+    if !anchor.is_empty() && candidate.contains(anchor) && candidate.chars().count() > original_len
+    {
+        return None;
+    }
+    Some(candidate.to_string())
 }
 
 /// 按段索引替换：空行与未命中的行原样保留。
@@ -1063,9 +1075,22 @@ async fn generate_scene(
         PROSE_ATTEMPT_TIMEOUT.as_secs(),
     );
     let max_tokens = scene_max_tokens(target_words);
+    tracing::info!(
+        system_chars = messages[0].content.chars().count(),
+        user_chars = messages[1].content.chars().count(),
+        target_words,
+        max_tokens,
+        "prose scene request"
+    );
     let result = tokio::select! {
         _ = token.cancelled() => return Err(SceneError::Cancelled),
-        result = llm.complete_text(&budget, Purpose::Prose, messages.clone(), max_tokens) => result,
+        result = llm.complete_text_with(
+            &budget,
+            Purpose::Prose,
+            messages.clone(),
+            max_tokens,
+            Some("minimal"),
+        ) => result,
     };
 
     match result {
@@ -1079,11 +1104,17 @@ async fn generate_scene(
         }
         Err(error) if error.kind == LlmErrorKind::Truncated => {
             // 推理模型的 reasoning tokens 与正文共享预算：短场景没有二分空间，先升预算重试一次。
-            let escalated = max_tokens.saturating_mul(2).min(8_000);
+            let escalated = max_tokens.saturating_mul(2).min(16_000);
             if escalated > max_tokens {
                 let retry = tokio::select! {
                     _ = token.cancelled() => return Err(SceneError::Cancelled),
-                    retry = llm.complete_text(&budget, Purpose::Prose, messages.clone(), escalated) => retry,
+                    retry = llm.complete_text_with(
+                        &budget,
+                        Purpose::Prose,
+                        messages.clone(),
+                        escalated,
+                        Some("minimal"),
+                    ) => retry,
                 };
                 match retry {
                     Ok(text) => {
@@ -1194,8 +1225,10 @@ pub fn count_words(text: &str) -> i64 {
     text.chars().filter(|c| !c.is_whitespace()).count() as i64
 }
 
+/// 中文场景里 1 字≈1 token，推理模型还要额外消耗 reasoning token，
+/// 因此按目标字数的 3 倍再加固定余量，避免每场都撞 finish_reason=length。
 pub fn scene_max_tokens(target_words: i64) -> u32 {
-    (target_words.saturating_mul(2) + 1_200).clamp(1_500, 8_000) as u32
+    (target_words.saturating_mul(4) + 3_000).clamp(3_000, 16_000) as u32
 }
 
 pub fn distribute_targets(total_words: i64, scene_count: usize) -> Vec<i64> {
@@ -1361,6 +1394,45 @@ mod tests {
         assert_eq!(distribute_targets(10, 3), vec![4, 3, 3]);
         assert_eq!(distribute_targets(9, 3), vec![3, 3, 3]);
         assert!(distribute_targets(10, 0).is_empty());
+    }
+
+    #[test]
+    fn scene_max_tokens_leaves_room_for_reasoning() {
+        assert_eq!(scene_max_tokens(0), 3_000);
+        assert_eq!(scene_max_tokens(300), 4_200);
+        assert_eq!(scene_max_tokens(10_000), 16_000);
+    }
+
+    #[test]
+    fn prose_prompts_stay_compact() {
+        let system = crate::llm::prompts::CHAPTER_PROSE_SYSTEM;
+        let scene = crate::llm::prompts::CHAPTER_PROSE_SCENE;
+        let system_chars = system.chars().count();
+        let scene_chars = scene.chars().count();
+        assert!(system_chars <= 450, "system prompt {system_chars} chars");
+        assert!(scene_chars <= 550, "scene prompt {scene_chars} chars");
+        // 精简前合计 1624 字符，要求至少减少 35%。
+        assert!(
+            system_chars + scene_chars <= 1_055,
+            "prose prompts too large: {system_chars} + {scene_chars}"
+        );
+    }
+
+    #[test]
+    fn normalize_rewrite_keeps_single_paragraph() {
+        let original = "他推开门，屋里没有人。";
+        assert_eq!(
+            normalize_rewrite("他推门进去，屋里空着。\n\n多余的段落。", original).as_deref(),
+            Some("他推门进去，屋里空着。")
+        );
+    }
+
+    #[test]
+    fn normalize_rewrite_rejects_echoed_tail() {
+        let original = "他推开门，屋里没有人。";
+        let echoed =
+            format!("{original}她坐在窗边，手里捏着一封信，信封已经拆开，边角被摩挲得起毛。");
+        assert!(normalize_rewrite(&echoed, original).is_none());
     }
 
     #[test]

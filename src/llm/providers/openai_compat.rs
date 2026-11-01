@@ -74,6 +74,39 @@ fn map_transport_error(e: reqwest::Error) -> LlmError {
     }
 }
 
+/// 纯构造函数：把 `CompletionReq` 映射为 OpenAI 兼容请求体，便于序列化测试。
+fn build_body(model: &str, req: &CompletionReq) -> Value {
+    let messages: Vec<Value> = req
+        .messages
+        .iter()
+        .map(|m| json!({ "role": m.role.as_str(), "content": m.content }))
+        .collect();
+
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "max_tokens": req.max_tokens,
+        "temperature": req.temperature,
+    });
+    match &req.response_format {
+        Some(ResponseFormat::JsonObject) => {
+            body["response_format"] = json!({ "type": "json_object" });
+        }
+        Some(ResponseFormat::JsonSchema { name, schema }) => {
+            body["response_format"] = json!({
+                "type": "json_schema",
+                "json_schema": { "name": name, "schema": schema }
+            });
+        }
+        None => {}
+    }
+    // 仅显式设置时透传；供应商不支持时由 HTTP 400 映射为 BadRequest，不静默吞掉。
+    if let Some(effort) = req.reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    body
+}
+
 #[async_trait]
 impl LlmProvider for OpenAiCompatProvider {
     fn name(&self) -> &str {
@@ -89,30 +122,7 @@ impl LlmProvider for OpenAiCompatProvider {
     }
 
     async fn complete(&self, req: CompletionReq) -> Result<CompletionResp, LlmError> {
-        let messages: Vec<Value> = req
-            .messages
-            .iter()
-            .map(|m| json!({ "role": m.role.as_str(), "content": m.content }))
-            .collect();
-
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages,
-            "max_tokens": req.max_tokens,
-            "temperature": req.temperature,
-        });
-        match &req.response_format {
-            Some(ResponseFormat::JsonObject) => {
-                body["response_format"] = json!({ "type": "json_object" });
-            }
-            Some(ResponseFormat::JsonSchema { name, schema }) => {
-                body["response_format"] = json!({
-                    "type": "json_schema",
-                    "json_schema": { "name": name, "schema": schema }
-                });
-            }
-            None => {}
-        }
+        let mut body = build_body(&self.model, &req);
 
         let deadline: Instant = req.deadline;
         let endpoint = self.endpoint();
@@ -159,26 +169,43 @@ impl LlmProvider for OpenAiCompatProvider {
             let value: Value = response.json().await.map_err(map_transport_error)?;
             let choice = &value["choices"][0];
             let finish_reason = choice["finish_reason"].as_str().unwrap_or("");
-            let content =
-                match choice["message"]["content"].as_str() {
-                    Some(_) if finish_reason == "length" => return Err(LlmError::new(
+            let content = match choice["message"]["content"].as_str() {
+                Some(text) if finish_reason == "length" => {
+                    tracing::warn!(
+                        completion_tokens = value["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                        reasoning_tokens = value["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0),
+                        content_chars = text.chars().count(),
+                        content_head = %text.chars().take(120).collect::<String>(),
+                        "输出被截断，记录用量与开头"
+                    );
+                    return Err(LlmError::new(
                         LlmErrorKind::Truncated,
                         "输出在 max_tokens 处被截断（推理模型的 reasoning tokens 也计入该预算）",
-                    )),
-                    Some(text) => text,
-                    None => {
-                        if finish_reason == "length" {
-                            return Err(LlmError::new(
-                                LlmErrorKind::Truncated,
-                                "输出在 max_tokens 处被截断，未返回正文内容",
-                            ));
-                        }
+                    ));
+                }
+                Some(text) => text,
+                None => {
+                    if finish_reason == "length" {
+                        tracing::warn!(
+                            completion_tokens =
+                                value["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                            reasoning_tokens = value["usage"]["completion_tokens_details"]
+                                ["reasoning_tokens"]
+                                .as_u64()
+                                .unwrap_or(0),
+                            "输出被截断且无正文，预算全部被推理占用"
+                        );
                         return Err(LlmError::new(
-                            LlmErrorKind::InvalidOutput,
-                            "响应缺少 choices[0].message.content",
+                            LlmErrorKind::Truncated,
+                            "输出在 max_tokens 处被截断，未返回正文内容",
                         ));
                     }
-                };
+                    return Err(LlmError::new(
+                        LlmErrorKind::InvalidOutput,
+                        "响应缺少 choices[0].message.content",
+                    ));
+                }
+            };
             let prompt_tokens = value["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32;
             let completion_tokens =
                 value["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32;
@@ -192,5 +219,34 @@ impl LlmProvider for OpenAiCompatProvider {
         tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), fut)
             .await
             .map_err(|_| LlmError::new(LlmErrorKind::Timeout, "单次尝试超出预算"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::build_body;
+    use crate::llm::{CompletionReq, Message, Purpose};
+
+    fn req() -> CompletionReq {
+        CompletionReq::new(
+            vec![Message::user("写一段正文")],
+            Instant::now() + Duration::from_secs(30),
+            Purpose::Prose,
+        )
+    }
+
+    #[test]
+    fn openai_compat_body_includes_reasoning_effort_when_set() {
+        let body = build_body("mock-model", &req().with_reasoning_effort("minimal"));
+        assert_eq!(body["reasoning_effort"], "minimal");
+        assert_eq!(body["max_tokens"], 1500);
+    }
+
+    #[test]
+    fn openai_compat_body_omits_reasoning_effort_by_default() {
+        let body = build_body("mock-model", &req());
+        assert!(body.get("reasoning_effort").is_none());
     }
 }

@@ -140,9 +140,23 @@ impl LlmService {
         messages: Vec<Message>,
         max_tokens: u32,
     ) -> Result<String, LlmError> {
+        self.complete_text_with(budget, purpose, messages, max_tokens, None)
+            .await
+    }
+
+    /// 文本输出，可指定推理强度；`None` 表示与 `complete_text` 行为一致。
+    pub async fn complete_text_with(
+        &self,
+        budget: &Budget,
+        purpose: Purpose,
+        messages: Vec<Message>,
+        max_tokens: u32,
+        reasoning_effort: Option<&'static str>,
+    ) -> Result<String, LlmError> {
         let mut req = CompletionReq::new(messages, budget.hard_deadline(), purpose);
         req.max_tokens = max_tokens;
         req.temperature = 0.4;
+        req.reasoning_effort = reasoning_effort;
         match self.chain.complete_tracked(req.clone()).await {
             Ok(outcome) => {
                 self.record_attempts(&outcome.attempts).await;
