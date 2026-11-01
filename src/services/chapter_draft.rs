@@ -31,7 +31,7 @@ pub const MAX_TARGET_WORDS: i64 = 8_000;
 pub const MAX_STYLE_SAMPLE_CHARS: usize = 6_000;
 pub const MAX_INSTRUCTION_CHARS: usize = 1_000;
 pub const MAX_SCENES: usize = 12;
-pub const PREVIOUS_TAIL_CHARS: usize = 300;
+pub const PREVIOUS_TAIL_CHARS: usize = 120;
 
 const PROSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(180);
 const PROSE_STEP_TIMEOUT_SECS: u64 = 240;
@@ -872,7 +872,7 @@ fn deslop_max_tokens(paragraph: &str) -> u32 {
 /// 且如果去重后剩得太少就保留原样（宁可重复，也不吞掉真正的正文）。
 pub fn dedupe_scene_junction(new_text: &str, accumulated: &str) -> String {
     const LOOKBACK_PARAGRAPHS: usize = 12;
-    const JUNCTION_PARAGRAPHS: usize = 10;
+    const JUNCTION_PARAGRAPHS: usize = 6;
     const MIN_KEEP_RATIO: f64 = 0.5;
 
     let compact = |text: &str| text.split_whitespace().collect::<String>();
@@ -886,22 +886,32 @@ pub fn dedupe_scene_junction(new_text: &str, accumulated: &str) -> String {
     }
     let lookback: Vec<&String> = previous.iter().rev().take(LOOKBACK_PARAGRAPHS).collect();
 
+    let paragraphs: Vec<&str> = new_text.split('\n').collect();
+    let keys: Vec<String> = paragraphs.iter().map(|p| compact(p.trim())).collect();
+    let candidates: Vec<usize> = keys
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| {
+            key.chars().count() >= 8 && lookback.iter().any(|p| p.as_str() == key.as_str())
+        })
+        .map(|(index, _)| index)
+        .collect();
+    // 孤立的单段重复可能是作者有意呼应；只有成簇出现（相邻两段以内）或贴着开头，才判定为复述。
+    let drop: Vec<bool> = (0..paragraphs.len())
+        .map(|index| {
+            candidates.contains(&index)
+                && (index < JUNCTION_PARAGRAPHS
+                    || candidates
+                        .iter()
+                        .any(|other| *other != index && other.abs_diff(index) <= 2))
+        })
+        .collect();
     let mut kept: Vec<&str> = Vec::new();
     let mut dropped = 0usize;
-    let mut misses = 0usize;
-    for (index, paragraph) in new_text.split('\n').enumerate() {
-        let trimmed = paragraph.trim();
-        let key = compact(trimmed);
-        let in_junction = index < JUNCTION_PARAGRAPHS && misses < 2;
-        let echoed = in_junction
-            && key.chars().count() >= 8
-            && lookback.iter().any(|p| p.as_str() == key.as_str());
-        if echoed {
+    for (index, paragraph) in paragraphs.iter().enumerate() {
+        if drop[index] {
             dropped += 1;
             continue;
-        }
-        if in_junction && !key.is_empty() {
-            misses += 1;
         }
         kept.push(paragraph);
     }
