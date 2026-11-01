@@ -32,6 +32,7 @@ pub const MAX_STYLE_SAMPLE_CHARS: usize = 6_000;
 pub const MAX_INSTRUCTION_CHARS: usize = 1_000;
 pub const MAX_SCENES: usize = 12;
 pub const PREVIOUS_TAIL_CHARS: usize = 120;
+const COMPLETED_SCENE_TITLE_CHARS: usize = 40;
 
 const PROSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(180);
 const PROSE_STEP_TIMEOUT_SECS: u64 = 240;
@@ -507,7 +508,6 @@ struct ChapterRow {
     title: String,
     final_outline: Option<String>,
     volume_title: String,
-    volume_summary: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -530,7 +530,6 @@ struct ProseContext {
     chapter_title: String,
     world_view: String,
     background: String,
-    chapter_outline: String,
     characters: String,
     instruction: String,
     pov: String,
@@ -603,6 +602,7 @@ async fn run_job_inner(
             &llm,
             &system,
             &context,
+            &scenes,
             index,
             total,
             scene,
@@ -654,7 +654,7 @@ async fn run_job_inner(
     }
 
     ensure_active(token)?;
-    let content = content.trim().to_string();
+    let content = collapse_adjacent_duplicates(content.trim());
     if content.is_empty() {
         return Err(RunError::Failed("所有场景生成失败".to_string()));
     }
@@ -865,6 +865,24 @@ fn deslop_max_tokens(paragraph: &str) -> u32 {
 }
 
 /// 只接受「单段」重写结果：取首个非空行，并拒绝明显超出原段长度的回显（模型有时会把后续段落一起返回）。
+/// 去掉相邻的完全相同段落（模型偶发把同一句连写两遍）。
+///
+/// 只处理“紧挨着、内容完全一致（忽略空白）”的段落，正常重复出现的对白（相隔较远）保持不动。
+pub fn collapse_adjacent_duplicates(text: &str) -> String {
+    let compact = |line: &str| line.split_whitespace().collect::<String>();
+    let mut out: Vec<&str> = Vec::new();
+    let mut previous_key: Option<String> = None;
+    for line in text.split('\n') {
+        let key = compact(line);
+        if !key.is_empty() && Some(&key) == previous_key.as_ref() {
+            continue;
+        }
+        previous_key = if key.is_empty() { None } else { Some(key) };
+        out.push(line);
+    }
+    out.join("\n").trim().to_string()
+}
+
 /// 去掉新场景开头对上一场结尾的复述。
 ///
 /// 模型每场都能看到「上一场结尾」作为衔接上下文，常会把这段原样再写一遍，
@@ -977,7 +995,7 @@ async fn load_context(
     params: &DraftParams,
 ) -> Result<(ProseContext, String), RunError> {
     let chapter = sqlx::query_as::<_, ChapterRow>(
-        "SELECT c.title, c.final_outline, v.title AS volume_title, v.summary AS volume_summary \
+        "SELECT c.title, c.final_outline, v.title AS volume_title \
          FROM chapters c JOIN volumes v ON v.id = c.volume_id \
          WHERE c.id = ? AND c.novel_id = ? AND c.deleted_at IS NULL",
     )
@@ -1036,15 +1054,6 @@ async fn load_context(
         "" => chapter.title,
         volume_title => format!("{volume_title}·{}", chapter.title),
     };
-    let chapter_outline = match chapter
-        .volume_summary
-        .as_deref()
-        .map(str::trim)
-        .filter(|text| !text.is_empty())
-    {
-        Some(summary) => format!("（本卷梗概：{summary}）\n{outline}"),
-        None => outline.clone(),
-    };
 
     Ok((
         ProseContext {
@@ -1052,7 +1061,6 @@ async fn load_context(
             chapter_title,
             world_view: novel.world_view.unwrap_or_default(),
             background,
-            chapter_outline,
             characters: format_characters(&characters),
             instruction: params.instruction.clone().unwrap_or_default(),
             pov: params
@@ -1109,11 +1117,53 @@ fn format_characters(characters: &[CharacterRow]) -> String {
         .join("\n")
 }
 
+/// 已完成场次清单：只给标题，避免后续场次重看整章大纲后重演前文。
+fn completed_scenes_block(scenes: &[String]) -> String {
+    if scenes.is_empty() {
+        return String::new();
+    }
+    let items = scenes
+        .iter()
+        .enumerate()
+        .map(|(index, scene)| format!("- 第{}场：{}", index + 1, scene_title(scene)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("## 已完成场次（均已写完，禁止重演）\n{items}")
+}
+
+/// 后续场次清单：只给标题，并明确尚未发生，避免本场提前写后面的情节。
+fn upcoming_scenes_block(scenes: &[String], offset: usize) -> String {
+    if scenes.is_empty() {
+        return String::new();
+    }
+    let items = scenes
+        .iter()
+        .enumerate()
+        .map(|(index, scene)| format!("- 第{}场：{}", offset + index + 1, scene_title(scene)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("## 后续场次（尚未发生，本场禁止提前写）\n{items}")
+}
+
+/// 场景标题取首句，超长截断，保证清单本身足够短。
+fn scene_title(scene: &str) -> String {
+    let first_sentence = scene
+        .split(['\n', '。', '；', ';'])
+        .map(str::trim)
+        .find(|part| !part.is_empty())
+        .unwrap_or("");
+    first_sentence
+        .chars()
+        .take(COMPLETED_SCENE_TITLE_CHARS)
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn generate_scene(
     llm: &LlmService,
     system: &str,
     context: &ProseContext,
+    scenes: &[String],
     scene_index: usize,
     scene_total: usize,
     scene: &str,
@@ -1122,6 +1172,11 @@ async fn generate_scene(
     token: &CancellationToken,
 ) -> Result<String, SceneError> {
     ensure_scene_active(token)?;
+    // 任何一场都不注入整章大纲：整章大纲会让第 1 场把后面的 beat 提前演完，
+    // 后续场次只能换写法重演（用户报的“翻出栏杆又回来”）。只给已完成场次与后续场次标题。
+    let chapter_outline = "";
+    let completed_scenes = completed_scenes_block(&scenes[..scene_index]);
+    let upcoming_scenes = upcoming_scenes_block(&scenes[scene_index + 1..], scene_index + 1);
     let user = prompts::render(
         prompts::CHAPTER_PROSE_SCENE,
         &json!({
@@ -1129,7 +1184,9 @@ async fn generate_scene(
             "chapter_title": &context.chapter_title,
             "world_view": &context.world_view,
             "background": &context.background,
-            "chapter_outline": &context.chapter_outline,
+            "chapter_outline": chapter_outline,
+            "completed_scenes": completed_scenes,
+            "upcoming_scenes": upcoming_scenes,
             "scene_index": scene_index + 1,
             "scene_total": scene_total,
             "scene_beats": scene,
@@ -1157,12 +1214,11 @@ async fn generate_scene(
     );
     let result = tokio::select! {
         _ = token.cancelled() => return Err(SceneError::Cancelled),
-        result = llm.complete_text_with(
+        result = llm.complete_text_creative(
             &budget,
             Purpose::Prose,
             messages.clone(),
             max_tokens,
-            Some("minimal"),
         ) => result,
     };
 
@@ -1181,12 +1237,11 @@ async fn generate_scene(
             if escalated > max_tokens {
                 let retry = tokio::select! {
                     _ = token.cancelled() => return Err(SceneError::Cancelled),
-                    retry = llm.complete_text_with(
+                    retry = llm.complete_text_creative(
                         &budget,
                         Purpose::Prose,
                         messages.clone(),
                         escalated,
-                        Some("minimal"),
                     ) => retry,
                 };
                 match retry {
@@ -1211,6 +1266,7 @@ async fn generate_scene(
                 llm,
                 system,
                 context,
+                scenes,
                 scene_index,
                 scene_total,
                 &left,
@@ -1224,6 +1280,7 @@ async fn generate_scene(
                 llm,
                 system,
                 context,
+                scenes,
                 scene_index,
                 scene_total,
                 &right,
@@ -1301,7 +1358,9 @@ pub fn count_words(text: &str) -> i64 {
 /// 中文场景里 1 字≈1 token，推理模型还要额外消耗 reasoning token，
 /// 因此按目标字数的 3 倍再加固定余量，避免每场都撞 finish_reason=length。
 pub fn scene_max_tokens(target_words: i64) -> u32 {
-    (target_words.saturating_mul(4) + 3_000).clamp(3_000, 16_000) as u32
+    // 中文正文 token ≈ 字数，留一倍余量足够；预算越小，推理模型偶发“把预算全耗在推理上”时
+    // 每次失败越快，重试成本越低（真正不够时仍会升级到 escalated_tokens）。
+    (target_words.saturating_mul(2) + 1_500).clamp(1_500, 12_000) as u32
 }
 
 pub fn distribute_targets(total_words: i64, scene_count: usize) -> Vec<i64> {
@@ -1421,6 +1480,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collapse_adjacent_duplicates_drops_repeated_lines_only_when_adjacent() {
+        let text = "手放下来了。\n手放下来了。\n\"哥。\"\n\n\"哥。\"";
+        assert_eq!(
+            collapse_adjacent_duplicates(text),
+            "手放下来了。\n\"哥。\"\n\n\"哥。\""
+        );
+        assert_eq!(collapse_adjacent_duplicates("  \n\n "), "");
+    }
+
+    #[test]
     fn split_scenes_prefers_key_scene_list() {
         let outline = "\
 ## 剧情梗概
@@ -1471,9 +1540,9 @@ mod tests {
 
     #[test]
     fn scene_max_tokens_leaves_room_for_reasoning() {
-        assert_eq!(scene_max_tokens(0), 3_000);
-        assert_eq!(scene_max_tokens(300), 4_200);
-        assert_eq!(scene_max_tokens(10_000), 16_000);
+        assert_eq!(scene_max_tokens(0), 1_500);
+        assert_eq!(scene_max_tokens(300), 2_100);
+        assert_eq!(scene_max_tokens(10_000), 12_000);
     }
 
     #[test]
@@ -1483,10 +1552,10 @@ mod tests {
         let system_chars = system.chars().count();
         let scene_chars = scene.chars().count();
         assert!(system_chars <= 450, "system prompt {system_chars} chars");
-        assert!(scene_chars <= 550, "scene prompt {scene_chars} chars");
-        // 精简前合计 1624 字符，要求至少减少 35%。
+        assert!(scene_chars <= 700, "scene prompt {scene_chars} chars");
+        // 加入场景边界硬约束后 scene 为 679 字符；system 409 + scene 679 = 1088，留 12 字符余量。
         assert!(
-            system_chars + scene_chars <= 1_055,
+            system_chars + scene_chars <= 1_100,
             "prose prompts too large: {system_chars} + {scene_chars}"
         );
     }

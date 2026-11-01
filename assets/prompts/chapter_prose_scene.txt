@@ -4,8 +4,13 @@
 世界观：{{ world_view }}
 背景：{{ background }}
 
-# 本章大纲
-{{ chapter_outline }}
+{% if completed_scenes %}
+{{ completed_scenes }}
+{% endif %}
+
+{% if upcoming_scenes %}
+{{ upcoming_scenes }}
+{% endif %}
 
 # 叙述人称
 {{ pov }}（全文统一，不得混用）
@@ -22,9 +27,11 @@
 {{ characters }}
 
 # 写作要求
-- 本场约 {{ target_words }} 字，严格使用「{{ pov }}」。
-- 只使用本章大纲与本场情节已有的事实，不新增数字、年龄、时间、地点、亲缘等信息。
-- 只演本场并留好衔接；亲昵与暴力止于大纲所写程度。
+- 本场约 {{ target_words }} 字，使用「{{ pov }}」。
+- 只使用已给信息的事实，不新增数字、年龄、时间、地点、亲缘等。
+- 本场只演「本场情节」。「已完成场次」已经写完，禁止重演、禁止倒叙补写、禁止换一种写法再讲一遍；「后续场次」尚未发生，禁止提前写。
+- 衔接上文是上一场结尾原文：从下一秒继续写，不得复述其中任何动作、对话或心理。
+- 亲昵与暴力止于大纲程度。
 {% if instruction %}
 - 额外指令：{{ instruction }}
 {% endif %}

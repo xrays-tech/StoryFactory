@@ -20,6 +20,9 @@ pub struct LlmService {
 /// 结构化输出的默认 max_tokens（沿用 v4.0 行为）。
 pub const DEFAULT_STRUCTURED_MAX_TOKENS: u32 = 1500;
 
+/// 纯文本截断后先按原预算重试的次数（推理模型偶发把预算全耗在推理上）。
+const TEXT_SAME_BUDGET_RETRIES: u32 = 2;
+
 /// 截断后的一次性预算升级：至少不变，最多 16k。
 fn escalated_tokens(requested: u32) -> u32 {
     requested.saturating_mul(4).min(16_000).max(requested)
@@ -145,6 +148,18 @@ impl LlmService {
     }
 
     /// 文本输出，可指定推理强度；`None` 表示与 `complete_text` 行为一致。
+    /// 创作类长文本：关闭思维链，避免推理模型把全部预算耗在内部推理上。
+    pub async fn complete_text_creative(
+        &self,
+        budget: &Budget,
+        purpose: Purpose,
+        messages: Vec<Message>,
+        max_tokens: u32,
+    ) -> Result<String, LlmError> {
+        self.complete_text_with_flags(budget, purpose, messages, max_tokens, Some("minimal"), true)
+            .await
+    }
+
     pub async fn complete_text_with(
         &self,
         budget: &Budget,
@@ -153,37 +168,73 @@ impl LlmService {
         max_tokens: u32,
         reasoning_effort: Option<&'static str>,
     ) -> Result<String, LlmError> {
+        self.complete_text_with_flags(
+            budget,
+            purpose,
+            messages,
+            max_tokens,
+            reasoning_effort,
+            false,
+        )
+        .await
+    }
+
+    async fn complete_text_with_flags(
+        &self,
+        budget: &Budget,
+        purpose: Purpose,
+        messages: Vec<Message>,
+        max_tokens: u32,
+        reasoning_effort: Option<&'static str>,
+        disable_thinking: bool,
+    ) -> Result<String, LlmError> {
         let mut req = CompletionReq::new(messages, budget.hard_deadline(), purpose);
         req.max_tokens = max_tokens;
         req.temperature = 0.4;
         req.reasoning_effort = reasoning_effort;
-        match self.chain.complete_tracked(req.clone()).await {
-            Ok(outcome) => {
-                self.record_attempts(&outcome.attempts).await;
-                Ok(outcome.resp.content)
-            }
-            Err((err, attempts)) => {
-                self.record_attempts(&attempts).await;
-                if err.kind != LlmErrorKind::Truncated {
-                    return Err(err);
+        req.disable_thinking = disable_thinking;
+        // 推理模型偶发把整份预算耗在内部推理上（content 为空、finish_reason=length）。
+        // 实测同参数立即重试通常能正常出文，而“直接升预算”会让一次偶发失败代价翻几倍，
+        // 所以先按原预算重试，最后才升一次预算兜底。
+        let mut same_budget_retries = 0u32;
+        let mut escalated_once = false;
+        loop {
+            match self.chain.complete_tracked(req.clone()).await {
+                Ok(outcome) => {
+                    self.record_attempts(&outcome.attempts).await;
+                    return Ok(outcome.resp.content);
                 }
-                let requested = req.max_tokens;
-                let escalated = escalated_tokens(requested);
-                tracing::info!(
-                    requested,
-                    escalated,
-                    "文本输出被截断，提升 max_tokens 后重试一次"
-                );
-                req.max_tokens = escalated;
-                match self.chain.complete_tracked(req).await {
-                    Ok(outcome) => {
-                        self.record_attempts(&outcome.attempts).await;
-                        Ok(outcome.resp.content)
+                Err((err, attempts)) => {
+                    self.record_attempts(&attempts).await;
+                    if err.kind != LlmErrorKind::Truncated {
+                        return Err(err);
                     }
-                    Err((err, attempts)) => {
-                        self.record_attempts(&attempts).await;
-                        Err(err)
+                    if same_budget_retries < TEXT_SAME_BUDGET_RETRIES {
+                        same_budget_retries += 1;
+                        // 轻微抖动温度，避开让模型复现同一条推理路径。
+                        req.temperature = (req.temperature + 0.1).min(0.9);
+                        tracing::info!(
+                            retry = same_budget_retries,
+                            max_tokens = req.max_tokens,
+                            "输出被截断（含推理占满预算），按原预算重试"
+                        );
+                        continue;
                     }
+                    if escalated_once {
+                        return Err(err);
+                    }
+                    let requested = req.max_tokens;
+                    let escalated = escalated_tokens(requested);
+                    if escalated <= requested {
+                        return Err(err);
+                    }
+                    tracing::info!(
+                        requested,
+                        escalated,
+                        "文本输出仍被截断，提升 max_tokens 后重试一次"
+                    );
+                    req.max_tokens = escalated;
+                    escalated_once = true;
                 }
             }
         }

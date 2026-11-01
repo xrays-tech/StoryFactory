@@ -104,6 +104,9 @@ fn build_body(model: &str, req: &CompletionReq) -> Value {
     if let Some(effort) = req.reasoning_effort {
         body["reasoning_effort"] = json!(effort);
     }
+    if req.disable_thinking {
+        body["thinking"] = json!({ "type": "disabled" });
+    }
     body
 }
 
@@ -248,5 +251,16 @@ mod tests {
     fn openai_compat_body_omits_reasoning_effort_by_default() {
         let body = build_body("mock-model", &req());
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openai_compat_body_disables_thinking_when_requested() {
+        let mut request = req();
+        request.disable_thinking = true;
+        let body = build_body("mock-model", &request);
+        assert_eq!(body["thinking"], serde_json::json!({ "type": "disabled" }));
+
+        let plain = build_body("mock-model", &req());
+        assert!(plain.get("thinking").is_none());
     }
 }

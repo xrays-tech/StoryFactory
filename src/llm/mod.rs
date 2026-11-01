@@ -110,6 +110,9 @@ pub struct CompletionReq {
     /// 供应商支持的推理强度（如 `minimal` / `low` / `medium` / `high`）。
     /// `None` 表示不传该字段，保持既有请求不变。
     pub reasoning_effort: Option<&'static str>,
+    /// 显式关闭供应商的思维链（如 DeepSeek 的 `thinking: {"type":"disabled"}`）。
+    /// 长文本创作类请求里，推理模型可能把全部预算耗在内部推理上而正文为空。
+    pub disable_thinking: bool,
 }
 
 impl CompletionReq {
@@ -122,11 +125,17 @@ impl CompletionReq {
             deadline,
             purpose,
             reasoning_effort: None,
+            disable_thinking: false,
         }
     }
 
     pub fn with_reasoning_effort(mut self, effort: &'static str) -> Self {
         self.reasoning_effort = Some(effort);
+        self
+    }
+
+    pub fn with_thinking_disabled(mut self) -> Self {
+        self.disable_thinking = true;
         self
     }
 }

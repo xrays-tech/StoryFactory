@@ -113,6 +113,17 @@ fn registry(fixture: &Fixture, chain: ProviderChain) -> DraftRegistry {
     DraftRegistry::with_chain(fixture.config.clone(), fixture.pool.clone(), 2, chain)
 }
 
+/// 按调用顺序返回正文场景 Prompt（排除去 AI 味的重写请求）。
+fn scene_prompts(mock: &MockProvider) -> Vec<String> {
+    mock.captured_requests()
+        .into_iter()
+        .flat_map(|(_, messages)| messages)
+        .filter(|message| message.role == story_architect::llm::MessageRole::User)
+        .map(|message| message.content)
+        .filter(|content| content.contains("# 本场情节"))
+        .collect()
+}
+
 fn app(fixture: &Fixture) -> axum::Router {
     let state = AppState {
         config: fixture.config.clone(),
@@ -235,6 +246,97 @@ async fn prose_scene_requests_minimal_reasoning() {
         efforts.iter().all(|effort| *effort == Some("minimal")),
         "scene requests must use minimal reasoning: {efforts:?}"
     );
+}
+
+#[tokio::test]
+async fn first_scene_avoids_full_outline_and_lists_future_scenes() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..3 {
+        mock.push_ok("正文。");
+    }
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(
+            &fixture.novel_id,
+            &fixture.chapter_id,
+            CreateDraftReq {
+                deslop: Some(false),
+                ..draft_request(900)
+            },
+        )
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+
+    let prompts = scene_prompts(&mock);
+    let first = prompts.first().expect("first scene prompt");
+    assert!(!first.contains("## 关键场景"), "prompt: {first}");
+    assert!(!first.contains("## 已完成场次"), "prompt: {first}");
+    assert!(first.contains("后续场次"), "prompt: {first}");
+    assert!(first.contains("第2场："), "prompt: {first}");
+    assert!(first.contains("木匣中剑光乍现"), "prompt: {first}");
+}
+
+#[tokio::test]
+async fn later_scene_uses_completed_scene_list() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..3 {
+        mock.push_ok("正文。");
+    }
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(
+            &fixture.novel_id,
+            &fixture.chapter_id,
+            CreateDraftReq {
+                deslop: Some(false),
+                ..draft_request(900)
+            },
+        )
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+
+    let prompts = scene_prompts(&mock);
+    let second = prompts.get(1).expect("second scene prompt");
+    assert!(!second.contains("## 关键场景"), "prompt: {second}");
+    assert!(second.contains("已完成场次"), "prompt: {second}");
+    assert!(second.contains("第1场：少年推门而入"), "prompt: {second}");
+    assert!(second.contains("禁止重演"), "prompt: {second}");
+}
+
+#[tokio::test]
+async fn scene_prompt_forbids_restating_previous_scene() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..3 {
+        mock.push_ok("正文。");
+    }
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(
+            &fixture.novel_id,
+            &fixture.chapter_id,
+            CreateDraftReq {
+                deslop: Some(false),
+                ..draft_request(900)
+            },
+        )
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+
+    let prompts = scene_prompts(&mock);
+    assert!(!prompts.is_empty(), "expected scene prompts");
+    for prompt in &prompts {
+        assert!(prompt.contains("已经写完"), "prompt: {prompt}");
+        assert!(prompt.contains("不得复述"), "prompt: {prompt}");
+    }
 }
 
 #[tokio::test]
