@@ -23,6 +23,7 @@ function session(overrides: Partial<Session> = {}): Session {
     id: "s1",
     novel_id: "n1",
     chapter_id: null,
+    prose_draft_id: null,
     status: "created",
     mode: "director",
     current_step: 0,
@@ -72,6 +73,7 @@ const createReq: Wire<CreateSessionReq> = {
   user_directive: null,
   autostart: true,
   chapter_id: null,
+  auto_prose: null,
 };
 
 function resetStore() {
@@ -139,6 +141,7 @@ describe("buildCreateSessionPayload", () => {
     userDirective: "保持悬疑",
     autostart: true,
     chapterId: null,
+    autoProse: true,
   };
 
   it("puts the bound chapter into the request body", () => {
@@ -153,6 +156,13 @@ describe("buildCreateSessionPayload", () => {
   it("sends null when the session is not bound to a chapter", () => {
     expect(buildCreateSessionPayload(draft).chapter_id).toBeNull();
     expect(buildCreateSessionPayload({ ...draft, chapterId: "   " }).chapter_id).toBeNull();
+  });
+
+  it("sends auto_prose only when a chapter is bound", () => {
+    expect(buildCreateSessionPayload({ ...draft, chapterId: "c1", autoProse: true }).auto_prose).toBe(true);
+    expect(buildCreateSessionPayload({ ...draft, chapterId: "c1", autoProse: false }).auto_prose).toBe(false);
+    expect(buildCreateSessionPayload({ ...draft, autoProse: true }).auto_prose).toBeNull();
+    expect(buildCreateSessionPayload({ ...draft, chapterId: "  ", autoProse: true }).auto_prose).toBeNull();
   });
 });
 

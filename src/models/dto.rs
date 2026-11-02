@@ -200,6 +200,8 @@ pub struct ChapterDto {
     pub title: String,
     pub scene_prompt: Option<String>,
     pub final_outline: Option<String>,
+    /// 本章目标生成字数（300..=20000，默认 3500）。
+    pub target_words: i64,
     #[serde(default)]
     pub beat_count: i64,
     pub status: ChapterStatus,
@@ -212,6 +214,9 @@ pub struct ChapterDto {
 pub struct CreateChapterReq {
     pub title: Option<String>,
     pub scene_prompt: Option<String>,
+    /// 目标生成字数；缺省 3500。
+    #[serde(default)]
+    pub target_words: Option<i64>,
     pub status: Option<ChapterStatus>,
 }
 
@@ -221,6 +226,9 @@ pub struct UpdateChapterReq {
     pub title: Option<String>,
     pub scene_prompt: Option<String>,
     pub final_outline: Option<String>,
+    /// None = 不改；Some(x) 需落在 300..=20000。
+    #[serde(default)]
+    pub target_words: Option<i64>,
     pub status: Option<ChapterStatus>,
     // 跨卷移动（§6.2）: 提供任一即触发事务内重排校验
     pub volume_id: Option<String>,

@@ -21,6 +21,13 @@ import { useChapterContentStore } from "../../stores/chapterContentStore";
 import { useChapterDraftStore } from "../../stores/chapterDraftStore";
 import { userMessage } from "../../lib/errors";
 import { formatDateTime, truncate } from "../../lib/format";
+import {
+  CHAPTER_TARGET_MAX,
+  CHAPTER_TARGET_MIN,
+  DEFAULT_CHAPTER_TARGET_WORDS,
+  chapterTargetWords,
+  parseTargetWords,
+} from "../../lib/targetWords";
 import { PageHeader } from "../../components/common/PageHeader";
 import { Button } from "../../components/common/Button";
 import { Dialog } from "../../components/common/Dialog";
@@ -75,7 +82,12 @@ export function OutlinePage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [volumeForm, setVolumeForm] = useState({ title: "", summary: "" });
-  const [chapterForm, setChapterForm] = useState({ title: "", scenePrompt: "", status: "draft" as ChapterStatus });
+  const [chapterForm, setChapterForm] = useState({
+    title: "",
+    scenePrompt: "",
+    status: "draft" as ChapterStatus,
+    targetWords: String(DEFAULT_CHAPTER_TARGET_WORDS),
+  });
 
   const selected = useMemo(() => {
     if (!selectedId) return null;
@@ -91,8 +103,10 @@ export function OutlinePage() {
     scenePrompt: "",
     finalOutline: "",
     status: "draft" as ChapterStatus,
+    targetWords: String(DEFAULT_CHAPTER_TARGET_WORDS),
   });
   const [dirty, setDirty] = useState(false);
+  const [targetWordsError, setTargetWordsError] = useState<string | null>(null);
 
   const [draftDialogOpen, setDraftDialogOpen] = useState(false);
   const contentDirty = useChapterContentStore((s) => s.dirty);
@@ -138,8 +152,10 @@ export function OutlinePage() {
       scenePrompt: selected.scene_prompt ?? "",
       finalOutline: selected.final_outline ?? "",
       status: selected.status,
+      targetWords: String(chapterTargetWords(selected.target_words)),
     });
     setDirty(false);
+    setTargetWordsError(null);
     setView("write");
   }, [selected?.id, selected?.updated_at]);
 
@@ -191,7 +207,12 @@ export function OutlinePage() {
   };
 
   const openCreateChapter = (volumeId: string) => {
-    setChapterForm({ title: "", scenePrompt: "", status: "draft" });
+    setChapterForm({
+      title: "",
+      scenePrompt: "",
+      status: "draft",
+      targetWords: String(DEFAULT_CHAPTER_TARGET_WORDS),
+    });
     setFormError(null);
     setFieldErrors({});
     setChapterDialogVolume(volumeId);
@@ -200,6 +221,17 @@ export function OutlinePage() {
   const submitChapter = async (event: FormEvent) => {
     event.preventDefault();
     if (!chapterDialogVolume) return;
+    const targetWords = parseTargetWords(
+      chapterForm.targetWords,
+      CHAPTER_TARGET_MIN,
+      CHAPTER_TARGET_MAX,
+    );
+    if (targetWords === null) {
+      setFieldErrors({
+        target_words: zh.outline.targetWordsInvalid(CHAPTER_TARGET_MIN, CHAPTER_TARGET_MAX),
+      });
+      return;
+    }
     setBusy(true);
     setFormError(null);
     setFieldErrors({});
@@ -207,6 +239,7 @@ export function OutlinePage() {
       await createChapter(novelId, chapterDialogVolume, {
         title: chapterForm.title.trim() || null,
         scene_prompt: chapterForm.scenePrompt.trim() || null,
+        target_words: targetWords,
         status: chapterForm.status,
       });
       setChapterDialogVolume(null);
@@ -221,14 +254,25 @@ export function OutlinePage() {
 
   const submitChapterEdit = async () => {
     if (!selected) return;
+    const targetWords = parseTargetWords(
+      draft.targetWords,
+      CHAPTER_TARGET_MIN,
+      CHAPTER_TARGET_MAX,
+    );
+    if (targetWords === null) {
+      setTargetWordsError(zh.outline.targetWordsInvalid(CHAPTER_TARGET_MIN, CHAPTER_TARGET_MAX));
+      return;
+    }
     try {
       await updateChapter(novelId, selected.id, {
         title: draft.title.trim() || null,
         scene_prompt: draft.scenePrompt.trim() || null,
         final_outline: draft.finalOutline.trim() || null,
+        target_words: targetWords,
         status: draft.status,
       });
       setDirty(false);
+      setTargetWordsError(null);
       toast({ tone: "success", message: zh.outline.saved });
     } catch (err) {
       toast({ tone: "error", message: userMessage(err) });
@@ -404,13 +448,18 @@ export function OutlinePage() {
                                   {chapter.chapter_index}
                                 </span>
                                 <span className="min-w-0 flex-1">
-                                  <span
-                                    className={cn(
-                                      "block truncate text-xs",
-                                      selectedId === chapter.id ? "font-medium text-accent-strong dark:text-accent" : "text-ink",
-                                    )}
-                                  >
-                                    {chapter.title || "未命名章节"}
+                                  <span className="flex items-baseline gap-1.5">
+                                    <span
+                                      className={cn(
+                                        "min-w-0 flex-1 truncate text-xs",
+                                        selectedId === chapter.id ? "font-medium text-accent-strong dark:text-accent" : "text-ink",
+                                      )}
+                                    >
+                                      {chapter.title || "未命名章节"}
+                                    </span>
+                                    <span className="shrink-0 font-mono text-[10px] text-faint">
+                                      {zh.outline.targetWordsValue(chapter.target_words)}
+                                    </span>
                                   </span>
                                   <span className="mt-0.5 flex items-center gap-1.5">
                                     <ChapterStatusBadge status={chapter.status} />
@@ -457,6 +506,9 @@ export function OutlinePage() {
                   <div className="flex min-w-0 items-center gap-2">
                     <ChapterStatusBadge status={draft.status} />
                     <span className="text-[11px] text-faint">更新于 {formatDateTime(selected.updated_at)}</span>
+                    <span className="text-[11px] text-faint">
+                      {zh.outline.targetWordsDetail(chapterTargetWords(selected.target_words))}
+                    </span>
                     {dirty ? <Badge tone="warning" dot>{zh.outline.unsaved}</Badge> : null}
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
@@ -482,7 +534,7 @@ export function OutlinePage() {
                 </div>
 
                 <div className="space-y-4 p-4">
-                  <div className="grid gap-4 sm:grid-cols-[1fr_160px]">
+                  <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_140px_160px]">
                     <Field label={zh.outline.chapterTitle} htmlFor="chapter-title">
                       <Input
                         id="chapter-title"
@@ -493,6 +545,28 @@ export function OutlinePage() {
                         }}
                         maxLength={200}
                         placeholder="给这一章一个能被记住的名字"
+                      />
+                    </Field>
+                    <Field
+                      label={zh.outline.targetWords}
+                      htmlFor="chapter-target-words"
+                      hint={zh.outline.targetWordsHint}
+                      error={targetWordsError}
+                    >
+                      <Input
+                        id="chapter-target-words"
+                        type="number"
+                        min={CHAPTER_TARGET_MIN}
+                        max={CHAPTER_TARGET_MAX}
+                        step={100}
+                        value={draft.targetWords}
+                        invalid={!!targetWordsError}
+                        onChange={(e) => {
+                          setDraft({ ...draft, targetWords: e.target.value });
+                          setTargetWordsError(null);
+                          setDirty(true);
+                        }}
+                        inputMode="numeric"
                       />
                     </Field>
                     <Field label={zh.outline.status} htmlFor="chapter-status">
@@ -652,7 +726,7 @@ export function OutlinePage() {
         }
       >
         <form onSubmit={submitChapter} className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-[1fr_160px]">
+          <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_140px_160px]">
             <Field label={zh.outline.chapterTitle} htmlFor="new-chapter-title" error={fieldErrors.title}>
               <Input
                 id="new-chapter-title"
@@ -661,6 +735,24 @@ export function OutlinePage() {
                 invalid={!!fieldErrors.title}
                 autoFocus
                 maxLength={200}
+              />
+            </Field>
+            <Field
+              label={zh.outline.targetWords}
+              htmlFor="new-chapter-target-words"
+              hint={zh.outline.targetWordsHint}
+              error={fieldErrors.target_words}
+            >
+              <Input
+                id="new-chapter-target-words"
+                type="number"
+                min={CHAPTER_TARGET_MIN}
+                max={CHAPTER_TARGET_MAX}
+                step={100}
+                value={chapterForm.targetWords}
+                invalid={!!fieldErrors.target_words}
+                onChange={(e) => setChapterForm({ ...chapterForm, targetWords: e.target.value })}
+                inputMode="numeric"
               />
             </Field>
             <Field label={zh.outline.status} htmlFor="new-chapter-status">
@@ -701,6 +793,7 @@ export function OutlinePage() {
           onClose={() => setDraftDialogOpen(false)}
           novelId={novelId}
           chapterId={selected.id}
+          chapterTargetWords={selected.target_words}
         />
       ) : null}
     </div>

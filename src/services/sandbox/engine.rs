@@ -15,9 +15,11 @@ use crate::llm::budget::Budget;
 use crate::llm::failover::ProviderChain;
 use crate::llm::service::LlmService;
 use crate::llm::{Message, Purpose};
+use crate::models::draft::CreateDraftReq;
 use crate::models::sandbox::{
     DirectorMode, SandboxEventType, ScriptedPlan, SessionRow, SessionStatus,
 };
+use crate::services::chapter_draft::DraftRegistry;
 use crate::services::sandbox::actor;
 use crate::services::sandbox::context;
 use crate::services::sandbox::director::{self, DirectorInput};
@@ -35,6 +37,7 @@ pub async fn run_engine(
     cancel: CancellationToken,
     input_notify: Arc<tokio::sync::Notify>,
     single_step: bool,
+    drafts: Option<Arc<DraftRegistry>>,
     _permit: OwnedSemaphorePermit,
 ) -> Result<(), AppError> {
     let cfg = config.load().clone();
@@ -84,7 +87,17 @@ pub async fn run_engine(
             return Ok(());
         }
         if row.current_step >= row.step_limit {
-            return finalize(&pool, &session_id, &cfg, &llm, &hub, "step_limit", &row).await;
+            return finalize(
+                &pool,
+                &session_id,
+                &cfg,
+                &llm,
+                &hub,
+                &drafts,
+                "step_limit",
+                &row,
+            )
+            .await;
         }
         if row
             .session_deadline
@@ -96,6 +109,7 @@ pub async fn run_engine(
                 &cfg,
                 &llm,
                 &hub,
+                &drafts,
                 "session_timeout",
                 &row,
             )
@@ -203,7 +217,7 @@ pub async fn run_engine(
             } else {
                 "terminate"
             };
-            return finalize(&pool, &session_id, &cfg, &llm, &hub, cause, &row).await;
+            return finalize(&pool, &session_id, &cfg, &llm, &hub, &drafts, cause, &row).await;
         }
         if let Some((question, suggestions)) = decision.request_input {
             let applied = transition_with_event(
@@ -234,6 +248,7 @@ pub async fn run_engine(
                         &cfg,
                         &llm,
                         &hub,
+                        &drafts,
                         "waiting_timeout",
                         &row,
                     )
@@ -491,6 +506,10 @@ async fn commit_step(
 }
 
 const FINALIZE_OUTLINE_MAX_CHARS: usize = 2000;
+/// 收束是长输出（整章大纲），推理模型在 45s / 3000 token 下常被截断；
+/// 稳定性优先，给足预算与时长（与正文生成同口径）。
+const FINALIZE_TIMEOUT_SECS: u64 = 240;
+const FINALIZE_MAX_TOKENS: u32 = 6_000;
 const FINALIZE_STEPS_MAX_TOKENS: usize = 5500;
 const FINALIZE_PROMPT_RESERVE_TOKENS: usize = 800;
 
@@ -512,12 +531,14 @@ pub fn validate_outline(text: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finalize(
     pool: &SqlitePool,
     session_id: &str,
     cfg: &AppConfig,
     llm: &LlmService,
     hub: &broadcast::Sender<SandboxEvent>,
+    drafts: &Option<Arc<DraftRegistry>>,
     cause: &str,
     row: &SessionRow,
 ) -> Result<(), AppError> {
@@ -577,17 +598,18 @@ async fn finalize(
         "user_directive": user_directive,
     });
     let prompt = crate::llm::prompts::render(crate::llm::prompts::OUTLINE_FINALIZE, &ctx)?;
-    let budget = Budget::new(
-        cfg.sandbox.session_timeout_seconds as u64,
-        cfg.sandbox.step_timeout_seconds as u64,
-        cfg.llm.attempt_timeout_seconds as u64,
+    let finalize_deadline = Instant::now() + Duration::from_secs(FINALIZE_TIMEOUT_SECS);
+    let budget = Budget::with_deadlines(
+        finalize_deadline,
+        finalize_deadline,
+        Duration::from_secs(FINALIZE_TIMEOUT_SECS),
     );
     let outline = match llm
-        .complete_text(
+        .complete_text_creative(
             &budget,
             Purpose::Finalize,
             vec![Message::user(prompt)],
-            3000,
+            FINALIZE_MAX_TOKENS,
         )
         .await
     {
@@ -674,7 +696,81 @@ async fn finalize(
         let _ = hub.send(event);
     }
     let _ = hub.send(done);
+    // 大纲已写入章节才可据其生成正文；未通过校验时章节仍保留旧大纲，不能自动续写。
+    if validation.is_ok() {
+        start_auto_prose(pool, session_id, row, drafts, hub).await;
+    }
     Ok(())
+}
+
+/// 收束写入章节后自动创建正文草稿。
+///
+/// 正文启动失败只广播 `prose_skipped`，绝不把已完成的会话改判为失败。
+async fn start_auto_prose(
+    pool: &SqlitePool,
+    session_id: &str,
+    row: &SessionRow,
+    drafts: &Option<Arc<DraftRegistry>>,
+    hub: &broadcast::Sender<SandboxEvent>,
+) {
+    let Some(chapter_id) = row.chapter_id.as_deref() else {
+        return;
+    };
+    if row.auto_prose == 0 {
+        return;
+    }
+    let Some(drafts) = drafts.as_ref() else {
+        return;
+    };
+
+    let job = match drafts
+        .create(&row.novel_id, chapter_id, CreateDraftReq::default())
+        .await
+    {
+        Ok(job) => job,
+        Err(error) => {
+            tracing::warn!(
+                session_id = %session_id,
+                chapter_id,
+                error = %error,
+                "收束后自动生成正文启动失败"
+            );
+            if let Err(event_error) = emit(
+                pool,
+                session_id,
+                hub,
+                SandboxEventType::ProseSkipped,
+                json!({ "chapter_id": chapter_id, "reason": error.message }),
+            )
+            .await
+            {
+                tracing::warn!(session_id = %session_id, error = %event_error, "写入 prose_skipped 事件失败");
+            }
+            return;
+        }
+    };
+
+    if let Err(error) = sqlx::query(
+        "UPDATE sandbox_sessions SET prose_draft_id = ?, updated_at = strftime('%s','now') WHERE id = ?",
+    )
+    .bind(&job.id)
+    .bind(session_id)
+    .execute(pool)
+    .await
+    {
+        tracing::warn!(session_id = %session_id, draft_id = %job.id, error = %error, "记录正文草稿 id 失败");
+    }
+    if let Err(error) = emit(
+        pool,
+        session_id,
+        hub,
+        SandboxEventType::ProseStarted,
+        json!({ "draft_id": job.id, "chapter_id": chapter_id }),
+    )
+    .await
+    {
+        tracing::warn!(session_id = %session_id, error = %error, "写入 prose_started 事件失败");
+    }
 }
 
 async fn fail(

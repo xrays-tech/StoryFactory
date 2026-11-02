@@ -5,6 +5,12 @@ import { useChapterDraftStore, type DraftPrefs } from "../../stores/chapterDraft
 import { useNovelStore } from "../../stores/novelStore";
 import { userMessage } from "../../lib/errors";
 import { resolveStylePayload, STYLE_LIMITS, type DraftPov } from "../../lib/draftStyle";
+import {
+  DRAFT_TARGET_MAX,
+  DRAFT_TARGET_MIN,
+  draftTargetWordsForChapter,
+  parseTargetWords,
+} from "../../lib/targetWords";
 import { cn } from "../../lib/cn";
 import { Button } from "../common/Button";
 import { Dialog } from "../common/Dialog";
@@ -14,18 +20,25 @@ import { Input, Textarea } from "../common/Input";
 const STYLE_NAME_LIMIT = STYLE_LIMITS.name;
 const STYLE_SAMPLE_LIMIT = STYLE_LIMITS.sample;
 const INSTRUCTION_LIMIT = STYLE_LIMITS.instruction;
-const TARGET_MIN = 500;
-const TARGET_MAX = 8000;
-const TARGET_DEFAULT = 1200;
+const TARGET_MIN = DRAFT_TARGET_MIN;
+const TARGET_MAX = DRAFT_TARGET_MAX;
 
 export type ChapterDraftDialogProps = {
   open: boolean;
   onClose: () => void;
   novelId: string;
   chapterId: string;
+  /** 章节记录的目标字数；缺失时按 3500 处理。 */
+  chapterTargetWords?: number | null;
 };
 
-export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: ChapterDraftDialogProps) {
+export function ChapterDraftDialog({
+  open,
+  onClose,
+  novelId,
+  chapterId,
+  chapterTargetWords,
+}: ChapterDraftDialogProps) {
   const creatingDraft = useChapterDraftStore((s) => s.creating);
   const createDraft = useChapterDraftStore((s) => s.create);
   const current = useNovelStore((s) => s.current);
@@ -36,10 +49,12 @@ export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: Chapte
       (value) => !!value?.trim(),
     );
 
+  const defaultTargetWords = draftTargetWordsForChapter(chapterTargetWords);
+
   const [styleName, setStyleName] = useState("");
   const [styleSample, setStyleSample] = useState("");
   const [pov, setPov] = useState<DraftPov>("第三人称");
-  const [targetWords, setTargetWords] = useState(String(TARGET_DEFAULT));
+  const [targetWords, setTargetWords] = useState(() => String(defaultTargetWords));
   const [instruction, setInstruction] = useState("");
   const [deslop, setDeslop] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -53,15 +68,15 @@ export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: Chapte
     setStyleName(novel?.style_name ?? "");
     setStyleSample(novel?.style_sample ?? "");
     setPov(novel?.pov === "第一人称" ? "第一人称" : "第三人称");
-    setTargetWords(String(TARGET_DEFAULT));
+    setTargetWords(String(defaultTargetWords));
     setInstruction(novel?.style_instruction ?? "");
     setDeslop(true);
     setError(null);
-  }, [open, chapterId, novelId, profileId]);
+  }, [open, chapterId, novelId, profileId, defaultTargetWords]);
 
   const submit = async () => {
-    const target = Number(targetWords);
-    if (!Number.isInteger(target) || target < TARGET_MIN || target > TARGET_MAX) {
+    const target = parseTargetWords(targetWords, TARGET_MIN, TARGET_MAX);
+    if (target === null) {
       setError(zh.draft.targetWordsInvalid(TARGET_MIN, TARGET_MAX));
       return;
     }
@@ -204,7 +219,7 @@ export function ChapterDraftDialog({ open, onClose, novelId, chapterId }: Chapte
           <Field
             label={zh.draft.targetWords}
             htmlFor="draft-target-words"
-            hint={zh.draft.targetWordsRange(TARGET_MIN, TARGET_MAX)}
+            hint={zh.draft.targetWordsFromChapter(TARGET_MIN, TARGET_MAX)}
           >
             <Input
               id="draft-target-words"

@@ -87,6 +87,7 @@ export function CreateSessionWizard({
   const [stepLimit, setStepLimit] = useState(20);
   const [directive, setDirective] = useState("");
   const [autostart, setAutostart] = useState(true);
+  const [autoProse, setAutoProse] = useState(true);
   const [script, setScript] = useState<ScriptStepForm[]>([]);
   const [idemKey, setIdemKey] = useState(newIdempotencyKey("session"));
   const [saving, setSaving] = useState(false);
@@ -103,6 +104,7 @@ export function CreateSessionWizard({
     setStepLimit(20);
     setDirective("");
     setAutostart(true);
+    setAutoProse(true);
     setScript([]);
     setIdemKey(newIdempotencyKey("session"));
     setSaving(false);
@@ -214,6 +216,7 @@ export function CreateSessionWizard({
         userDirective: directive.trim() || null,
         autostart,
         chapterId: chapterId || null,
+        autoProse,
       });
       const session = await createSession(novelId, chapterId || null, payload, idemKey);
       toast({ tone: "success", message: zh.sandbox.created });
@@ -327,6 +330,27 @@ export function CreateSessionWizard({
                 )}
               </Select>
             </Field>
+
+            <label
+              className={cn(
+                "flex items-start gap-3 rounded-xl border border-line/70 bg-raised px-3 py-3",
+                chapterId ? "cursor-pointer" : "cursor-not-allowed opacity-60",
+              )}
+            >
+              <input
+                type="checkbox"
+                checked={autoProse}
+                disabled={!chapterId}
+                onChange={(e) => setAutoProse(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-line text-accent focus:ring-accent"
+              />
+              <span>
+                <span className="block text-sm font-medium text-ink">{zh.sandbox.autoProse}</span>
+                <span className="mt-0.5 block text-[11px] leading-5 text-muted">
+                  {chapterId ? zh.sandbox.autoProseHint : zh.sandbox.autoProseDisabled}
+                </span>
+              </span>
+            </label>
 
             <Field
               label={
@@ -545,6 +569,7 @@ export function CreateSessionWizard({
             <div className="rounded-xl border border-line/60 bg-paper/50 px-3 py-2.5 text-[11px] leading-5 text-muted">
               <span className="font-medium text-ink">{modeLabel[mode]}</span> · {actorIds.length} 位角色 · 最多 {stepLimit} 步
               {chapterId ? " · 生成章节大纲" : " · 探索会话"}
+              {chapterId && autoProse ? ` · ${zh.sandbox.autoProseSummary}` : ""}
             </div>
           </div>
         )}

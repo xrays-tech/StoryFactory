@@ -1,5 +1,6 @@
 // src/services/sandbox/manager.rs — 会话注册表、并发闸、创建/快照/控制编排（§8.4）
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use dashmap::mapref::entry::Entry;
@@ -19,6 +20,7 @@ use crate::models::sandbox::{
     ActorName, CreateSessionReq, DirectorMode, PurposeCount, SandboxEventType, SessionRow,
     SessionSnapshot, SessionStatus, UsageSummary,
 };
+use crate::services::chapter_draft::DraftRegistry;
 use crate::services::sandbox::context;
 use crate::services::sandbox::engine;
 use crate::services::sandbox::events::{now_secs, persist_event, SandboxEvent};
@@ -40,12 +42,16 @@ pub enum StartKind {
     Step,
 }
 
+/// 单步与收束在推理模型上常超过默认 45s；稳定性优先，放宽容错窗口。
+const SANDBOX_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(180);
+
 pub struct SessionManager {
     registry: Arc<DashMap<String, SessionHandle>>,
     semaphore: Arc<Semaphore>,
     pool: SqlitePool,
     config: Arc<ArcSwap<AppConfig>>,
     chain_override: Option<ProviderChain>,
+    drafts: Option<Arc<DraftRegistry>>,
 }
 
 impl SessionManager {
@@ -56,7 +62,14 @@ impl SessionManager {
             pool,
             config,
             chain_override: None,
+            drafts: None,
         }
+    }
+
+    /// 注入正文草稿注册表：收束写入章节后由引擎自动创建正文草稿。
+    pub fn with_drafts(mut self, drafts: Arc<DraftRegistry>) -> Self {
+        self.drafts = Some(drafts);
+        self
     }
 
     pub fn with_chain(
@@ -92,7 +105,7 @@ impl SessionManager {
         if let Some(chain) = &self.chain_override {
             return chain.clone();
         }
-        factory::build_chain(&self.config.load())
+        factory::build_chain_with_attempt_timeout(&self.config.load(), SANDBOX_ATTEMPT_TIMEOUT)
     }
 
     fn reserve_handle(&self, session_id: &str) -> Result<SessionHandle, AppError> {
@@ -244,7 +257,7 @@ impl SessionManager {
         }
         // 绑定章节后，收束大纲会写入该章 final_outline 并重建 FTS 索引（engine::finalize）。
         sqlx::query(
-            "INSERT INTO sandbox_sessions(id, novel_id, chapter_id, scene_prompt, actor_ids, mode, step_limit, director_config, template_versions, user_directive) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO sandbox_sessions(id, novel_id, chapter_id, scene_prompt, actor_ids, mode, step_limit, director_config, template_versions, user_directive, auto_prose) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(novel_id)
@@ -256,6 +269,7 @@ impl SessionManager {
         .bind(&director_config)
         .bind(template_versions.to_string())
         .bind(&req.user_directive)
+        .bind(i64::from(req.auto_prose != Some(false)))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -305,6 +319,7 @@ impl SessionManager {
             id: row.id,
             novel_id: row.novel_id,
             chapter_id: row.chapter_id,
+            prose_draft_id: row.prose_draft_id,
             status,
             mode: DirectorMode::from_db(&row.mode).unwrap_or(DirectorMode::Roundrobin),
             current_step: row.current_step.max(0) as u32,
@@ -497,6 +512,7 @@ impl SessionManager {
         let hub = handle.hub.clone();
         let fail_hub = handle.hub.clone();
         let input_notify = handle.input_notify.clone();
+        let drafts = self.drafts.clone();
         tokio::spawn(async move {
             let result = engine::run_engine(
                 pool,
@@ -507,6 +523,7 @@ impl SessionManager {
                 cancel,
                 input_notify,
                 single_step,
+                drafts,
                 permit,
             )
             .await;

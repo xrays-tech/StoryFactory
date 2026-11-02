@@ -26,6 +26,8 @@ use crate::services::util::{db_err, not_found};
 
 pub const DRAFT_SEMAPHORE: usize = 2;
 pub const DEFAULT_TARGET_WORDS: i64 = 2_000;
+/// 章节未配置目标字数时的兜底值（与迁移 0010 的列默认一致）。
+pub const DEFAULT_CHAPTER_TARGET_WORDS: i64 = 3_500;
 pub const MIN_TARGET_WORDS: i64 = 500;
 pub const MAX_TARGET_WORDS: i64 = 8_000;
 pub const MAX_STYLE_SAMPLE_CHARS: usize = 6_000;
@@ -34,9 +36,9 @@ pub const MAX_SCENES: usize = 12;
 pub const PREVIOUS_TAIL_CHARS: usize = 120;
 const COMPLETED_SCENE_TITLE_CHARS: usize = 40;
 
-const PROSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(180);
-const PROSE_STEP_TIMEOUT_SECS: u64 = 240;
-const PROSE_SESSION_TIMEOUT_SECS: u64 = 3_600;
+const PROSE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(300);
+const PROSE_STEP_TIMEOUT_SECS: u64 = 480;
+const PROSE_SESSION_TIMEOUT_SECS: u64 = 5_400;
 
 const DESLOP_SYSTEM: &str = "你是小说编辑。只改写用户给出的这一段正文，只输出改写后的纯正文。";
 
@@ -58,6 +60,7 @@ struct ChapterStyleRow {
     style_sample: Option<String>,
     style_instruction: Option<String>,
     pov: Option<String>,
+    target_words: i64,
 }
 
 /// 后台任务注册表：取消令牌 + 并发闸。
@@ -135,7 +138,8 @@ impl DraftRegistry {
         req: CreateDraftReq,
     ) -> Result<DraftJob, AppError> {
         let chapter = sqlx::query_as::<_, ChapterStyleRow>(
-            "SELECT c.final_outline, n.style_name, n.style_sample, n.style_instruction, n.pov \
+            "SELECT c.final_outline, n.style_name, n.style_sample, n.style_instruction, n.pov, \
+             c.target_words \
              FROM chapters c \
              JOIN novels n ON n.id = c.novel_id \
              WHERE c.id = ? AND c.novel_id = ? AND c.deleted_at IS NULL AND n.deleted_at IS NULL",
@@ -163,7 +167,8 @@ impl DraftRegistry {
         }
 
         // 文风优先级：请求 > 小说档案 > 默认（叙述人称默认第三人称，在 ProseContext 处理）。
-        let target_words = clamp_target_words(req.target_words);
+        // 目标字数优先级：请求 > 章节设定 > 默认 3500；非正值视为未提供。
+        let target_words = resolve_target_words(req.target_words, Some(chapter.target_words));
         let mut message = None;
         let style_sample = normalize_style_sample(
             first_non_blank(req.style_sample, chapter.style_sample),
@@ -411,6 +416,13 @@ enum SceneError {
     Failed(String),
 }
 
+/// 单场生成结果：`missing_part` 表示二分后有一半彻底失败，已保留另一半。
+#[derive(Debug)]
+struct SceneOutcome {
+    text: String,
+    missing_part: bool,
+}
+
 fn db_failure(err: sqlx::Error) -> RunError {
     RunError::Failed(db_err(err).message)
 }
@@ -594,6 +606,7 @@ async fn run_job_inner(
     let mut content = String::new();
     let mut previous_tail = String::new();
     let mut skipped = 0usize;
+    let mut missing_scenes: Vec<usize> = Vec::new();
 
     for (index, scene) in scenes.iter().enumerate() {
         ensure_active(token)?;
@@ -612,16 +625,25 @@ async fn run_job_inner(
         )
         .await
         {
-            Ok(text) => {
+            Ok(outcome) => {
                 // 每场都会拿到上一场结尾作为衔接上文，模型常把这段又复述一遍。
                 let text = if content.is_empty() {
-                    text
+                    outcome.text
                 } else {
-                    dedupe_scene_junction(&text, &content)
+                    dedupe_scene_junction(&outcome.text, &content)
                 };
                 if text.trim().is_empty() {
                     tracing::warn!(draft_id = %id, scene = index + 1, "正文场景与上一场完全重复，已跳过");
                     continue;
+                }
+                if outcome.missing_part {
+                    // 二分后有一半失败：正文只缺一小段，不能整场丢弃。
+                    missing_scenes.push(index + 1);
+                    tracing::warn!(
+                        draft_id = %id,
+                        scene = index + 1,
+                        "正文场景部分内容缺失，已保留已生成部分"
+                    );
                 }
                 if !content.is_empty() {
                     content.push_str("\n\n");
@@ -680,6 +702,14 @@ async fn run_job_inner(
             &mut message,
             format!("已跳过 {skipped} 场（输出被截断/失败）"),
         );
+    }
+    if !missing_scenes.is_empty() {
+        let scenes = missing_scenes
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join("、");
+        append_note(&mut message, format!("第 {scenes} 场部分内容缺失"));
     }
 
     let mut tx = db::begin_immediate(pool).await.map_err(db_failure)?;
@@ -1170,7 +1200,7 @@ async fn generate_scene(
     target_words: i64,
     previous_tail: &str,
     token: &CancellationToken,
-) -> Result<String, SceneError> {
+) -> Result<SceneOutcome, SceneError> {
     ensure_scene_active(token)?;
     // 任何一场都不注入整章大纲：整章大纲会让第 1 场把后面的 beat 提前演完，
     // 后续场次只能换写法重演（用户报的“翻出栏杆又回来”）。只给已完成场次与后续场次标题。
@@ -1228,41 +1258,21 @@ async fn generate_scene(
             if text.is_empty() {
                 Err(SceneError::Failed("模型返回空正文".to_string()))
             } else {
-                Ok(text)
+                Ok(SceneOutcome {
+                    text,
+                    missing_part: false,
+                })
             }
         }
         Err(error) if error.kind == LlmErrorKind::Truncated => {
-            // 推理模型的 reasoning tokens 与正文共享预算：短场景没有二分空间，先升预算重试一次。
-            let escalated = max_tokens.saturating_mul(2).min(16_000);
-            if escalated > max_tokens {
-                let retry = tokio::select! {
-                    _ = token.cancelled() => return Err(SceneError::Cancelled),
-                    retry = llm.complete_text_creative(
-                        &budget,
-                        Purpose::Prose,
-                        messages.clone(),
-                        escalated,
-                    ) => retry,
-                };
-                match retry {
-                    Ok(text) => {
-                        let text = text.trim().to_string();
-                        if !text.is_empty() {
-                            return Ok(text);
-                        }
-                    }
-                    Err(retry_error) if retry_error.kind != LlmErrorKind::Truncated => {
-                        return Err(SceneError::Failed(retry_error.message));
-                    }
-                    Err(_) => {}
-                }
-            }
-            let Some((left, right)) = split_scene_text(scene) else {
+            // service 层已按原预算重试并升一次预算；仍截断说明整场写不完，
+            // 直接二分本场情节并按预算比例生成两半（宁慢勿丢）。
+            let Some((left, right)) = split_scene_half(scene) else {
                 return Err(SceneError::Truncated);
             };
             let left_target = (target_words / 2).max(1);
             let right_target = (target_words - left_target).max(1);
-            let left_text = Box::pin(generate_scene(
+            let left_result = Box::pin(generate_scene(
                 llm,
                 system,
                 context,
@@ -1274,9 +1284,13 @@ async fn generate_scene(
                 previous_tail,
                 token,
             ))
-            .await?;
-            let right_tail = tail_chars(&left_text, PREVIOUS_TAIL_CHARS);
-            let right_text = Box::pin(generate_scene(
+            .await;
+            let right_tail = match &left_result {
+                Ok(outcome) => tail_chars(&outcome.text, PREVIOUS_TAIL_CHARS),
+                Err(SceneError::Cancelled) => return Err(SceneError::Cancelled),
+                Err(_) => previous_tail.to_string(),
+            };
+            let right_result = Box::pin(generate_scene(
                 llm,
                 system,
                 context,
@@ -1288,10 +1302,31 @@ async fn generate_scene(
                 &right_tail,
                 token,
             ))
-            .await?;
-            Ok(format!("{left_text}\n\n{right_text}"))
+            .await;
+            combine_halves(left_result, right_result)
         }
         Err(error) => Err(SceneError::Failed(error.message)),
+    }
+}
+
+/// 合并二分生成结果：任一半成功即保留，缺的一半由调用方在 message 中标注。
+fn combine_halves(
+    left: Result<SceneOutcome, SceneError>,
+    right: Result<SceneOutcome, SceneError>,
+) -> Result<SceneOutcome, SceneError> {
+    match (left, right) {
+        (Err(SceneError::Cancelled), _) | (_, Err(SceneError::Cancelled)) => {
+            Err(SceneError::Cancelled)
+        }
+        (Ok(left), Ok(right)) => Ok(SceneOutcome {
+            text: format!("{}\n\n{}", left.text, right.text),
+            missing_part: left.missing_part || right.missing_part,
+        }),
+        (Ok(only), Err(_)) | (Err(_), Ok(only)) => Ok(SceneOutcome {
+            text: only.text,
+            missing_part: true,
+        }),
+        (Err(error), Err(_)) => Err(error),
     }
 }
 
@@ -1300,9 +1335,21 @@ async fn generate_scene(
 // ============================================================
 
 pub fn clamp_target_words(requested: Option<i64>) -> i64 {
-    requested
-        .unwrap_or(DEFAULT_TARGET_WORDS)
-        .clamp(MIN_TARGET_WORDS, MAX_TARGET_WORDS)
+    clamp_words(requested.unwrap_or(DEFAULT_TARGET_WORDS))
+}
+
+/// 目标字数决议：请求值 > 章节目标字数 > 默认 3500；请求非正值视为未提供。
+pub fn resolve_target_words(requested: Option<i64>, chapter: Option<i64>) -> i64 {
+    let requested = requested.filter(|value| *value > 0);
+    clamp_words(
+        requested
+            .or(chapter)
+            .unwrap_or(DEFAULT_CHAPTER_TARGET_WORDS),
+    )
+}
+
+fn clamp_words(value: i64) -> i64 {
+    value.clamp(MIN_TARGET_WORDS, MAX_TARGET_WORDS)
 }
 
 fn normalize_optional_text(value: Option<String>, max_chars: usize) -> Option<String> {
@@ -1446,15 +1493,20 @@ fn split_summary_sentences(body: &str) -> Vec<String> {
         .collect()
 }
 
-pub fn split_scene_text(text: &str) -> Option<(String, String)> {
-    let char_count = text.chars().count();
-    if char_count < 2 {
+/// 把本场情节文本二分：优先在中间附近的句号/换行处切，找不到再按字符中点切。
+pub fn split_scene_half(text: &str) -> Option<(String, String)> {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    if chars.len() < 2 {
         return None;
     }
-    let split_at = text
-        .char_indices()
-        .nth(char_count / 2)
-        .map(|(index, _)| index)?;
+    let mid = chars.len() / 2;
+    let is_break = |c: char| matches!(c, '。' | '！' | '？' | '；' | ';' | '\n');
+    // 切点在断句符之后（1..len 之间），取离中点最近的一个。
+    let boundary = (1..chars.len())
+        .filter(|&index| is_break(chars[index - 1].1))
+        .min_by_key(|&index| index.abs_diff(mid))
+        .unwrap_or(mid);
+    let split_at = chars.get(boundary).map(|(index, _)| *index)?;
     let (left, right) = text.split_at(split_at);
     let (left, right) = (left.trim(), right.trim());
     if left.is_empty() || right.is_empty() {
@@ -1608,11 +1660,32 @@ mod tests {
     }
 
     #[test]
+    fn target_words_prefer_request_then_chapter() {
+        assert_eq!(resolve_target_words(None, Some(4_200)), 4_200);
+        assert_eq!(resolve_target_words(Some(0), Some(4_200)), 4_200);
+        assert_eq!(resolve_target_words(Some(-3), Some(4_200)), 4_200);
+        assert_eq!(resolve_target_words(Some(900), Some(4_200)), 900);
+        assert_eq!(
+            resolve_target_words(None, None),
+            DEFAULT_CHAPTER_TARGET_WORDS
+        );
+        assert_eq!(resolve_target_words(Some(100), None), MIN_TARGET_WORDS);
+        assert_eq!(resolve_target_words(None, Some(99_999)), MAX_TARGET_WORDS);
+    }
+
+    #[test]
     fn truncated_scene_can_be_split_at_char_boundary() {
-        let (left, right) = split_scene_text("甲乙丙丁").expect("splittable");
+        let (left, right) = split_scene_half("甲乙丙丁").expect("splittable");
         assert_eq!(left, "甲乙");
         assert_eq!(right, "丙丁");
-        assert!(split_scene_text("甲").is_none());
+        assert!(split_scene_half("甲").is_none());
+    }
+
+    #[test]
+    fn truncated_scene_prefers_sentence_boundary() {
+        let (left, right) = split_scene_half("少年推门。老者抬头。").expect("splittable");
+        assert_eq!(left, "少年推门。");
+        assert_eq!(right, "老者抬头。");
     }
 
     #[test]

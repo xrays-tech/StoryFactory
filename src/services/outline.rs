@@ -17,8 +17,13 @@ use crate::services::util::{
 /// 章节序号上界：与两阶段重排的偏移量（100000）拉开安全距离，避免加法溢出。
 const MAX_CHAPTER_INDEX: i64 = 1_000_000;
 
+/// 章节目标字数范围与默认值（默认值与迁移 0010 的列默认一致）。
+const DEFAULT_TARGET_WORDS: i64 = 3_500;
+const MIN_TARGET_WORDS: i64 = 300;
+const MAX_TARGET_WORDS: i64 = 20_000;
+
 const VOL_COLS: &str = "id, novel_id, volume_index, title, summary, created_at, updated_at";
-const CH_COLS: &str = "id, novel_id, volume_id, chapter_index, title, scene_prompt, final_outline, beats, status, created_at, updated_at";
+const CH_COLS: &str = "id, novel_id, volume_id, chapter_index, title, scene_prompt, final_outline, target_words, beats, status, created_at, updated_at";
 
 #[derive(sqlx::FromRow)]
 struct VolumeRow {
@@ -40,6 +45,7 @@ struct ChapterRow {
     title: String,
     scene_prompt: Option<String>,
     final_outline: Option<String>,
+    target_words: i64,
     beats: Option<String>,
     status: String,
     created_at: i64,
@@ -72,6 +78,7 @@ fn ch_dto(row: ChapterRow) -> ChapterDto {
         title: row.title,
         scene_prompt: row.scene_prompt,
         final_outline: row.final_outline,
+        target_words: row.target_words,
         beat_count,
         status: ChapterStatus::from_db_or_default(row.status),
         created_at: row.created_at,
@@ -86,6 +93,18 @@ fn chapter_body(d: &ChapterDto) -> String {
         .copied()
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn push_target_words(errs: &mut Vec<(&'static str, String)>, value: Option<i64>) {
+    let Some(value) = value else {
+        return;
+    };
+    if !(MIN_TARGET_WORDS..=MAX_TARGET_WORDS).contains(&value) {
+        errs.push((
+            "target_words",
+            format!("target_words 必须为 {MIN_TARGET_WORDS}..={MAX_TARGET_WORDS}"),
+        ));
+    }
 }
 
 /// 在调用方事务内重建章节全文索引。
@@ -432,6 +451,7 @@ pub async fn create_chapter(
     let title = req.title.unwrap_or_default();
     push_len(&mut errs, "title", Some(&title), 200);
     push_len(&mut errs, "scene_prompt", req.scene_prompt.as_deref(), 4000);
+    push_target_words(&mut errs, req.target_words);
     if !errs.is_empty() {
         return Err(invalid(errs));
     }
@@ -445,14 +465,16 @@ pub async fn create_chapter(
         .status
         .map(ChapterStatus::to_db)
         .unwrap_or_else(|| "draft".to_string());
+    let target_words = req.target_words.unwrap_or(DEFAULT_TARGET_WORDS);
     let id: String = sqlx::query_scalar(
-        "INSERT INTO chapters(novel_id, volume_id, chapter_index, title, scene_prompt, status) VALUES(?, ?, ?, ?, ?, ?) RETURNING id",
+        "INSERT INTO chapters(novel_id, volume_id, chapter_index, title, scene_prompt, target_words, status) VALUES(?, ?, ?, ?, ?, ?, ?) RETURNING id",
     )
     .bind(novel_id)
     .bind(volume_id)
     .bind(index)
     .bind(&title)
     .bind(&req.scene_prompt)
+    .bind(target_words)
     .bind(&status)
     .fetch_one(&mut *tx)
     .await
@@ -511,6 +533,7 @@ pub async fn update_chapter(
         req.final_outline.as_deref(),
         200000,
     );
+    push_target_words(&mut errs, req.target_words);
     if let Some(v) = req.chapter_index {
         if !(1..=MAX_CHAPTER_INDEX).contains(&v) {
             errs.push((
@@ -605,6 +628,7 @@ pub async fn update_chapter(
     let title = req.title.unwrap_or(current.title);
     let scene_prompt = req.scene_prompt.or(current.scene_prompt);
     let final_outline = req.final_outline.or(current.final_outline);
+    let target_words = req.target_words.unwrap_or(current.target_words);
     let status = req
         .status
         .map(ChapterStatus::to_db)
@@ -616,13 +640,14 @@ pub async fn update_chapter(
     };
 
     sqlx::query(
-        "UPDATE chapters SET volume_id = ?, chapter_index = ?, title = ?, scene_prompt = ?, final_outline = ?, status = ?, updated_at = strftime('%s','now') WHERE id = ?",
+        "UPDATE chapters SET volume_id = ?, chapter_index = ?, title = ?, scene_prompt = ?, final_outline = ?, target_words = ?, status = ?, updated_at = strftime('%s','now') WHERE id = ?",
     )
     .bind(&target_volume)
     .bind(index)
     .bind(&title)
     .bind(&scene_prompt)
     .bind(&final_outline)
+    .bind(target_words)
     .bind(&status)
     .bind(cid)
     .execute(&mut *tx)

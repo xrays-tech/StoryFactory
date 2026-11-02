@@ -13,6 +13,7 @@ import {
   CornerDownLeft,
   Cpu,
   FastForward,
+  FileText,
   Pause,
   Play,
   RotateCcw,
@@ -240,6 +241,12 @@ export function SandboxConsole() {
       ),
     [events],
   );
+  // 刷新后事件可能还没回放，用快照里的 prose_draft_id 兜底展示正文入口。
+  const proseStartedEvent = useMemo(
+    () => [...events].reverse().find((event) => event.original_type === "prose_started"),
+    [events],
+  );
+  const showProseFallback = !!session?.prose_draft_id && !proseStartedEvent;
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
@@ -467,6 +474,14 @@ export function SandboxConsole() {
     }
   };
 
+  // 大纲页暂不消费 query 参数；先跳转并提示用户按章节定位。
+  const openProseDraft = (chapterId?: string | null) => {
+    const targetChapterId = chapterId || session.chapter_id;
+    if (!targetChapterId) return;
+    navigate(`/novel/${session.novel_id}/outline?chapter=${targetChapterId}`);
+    toast({ tone: "info", message: zh.sandbox.proseLocateHint });
+  };
+
   const toggleDirector = (seq: number) => {
     setExpanded((current) => {
       const next = new Set(current);
@@ -689,6 +704,38 @@ export function SandboxConsole() {
             <SparklesInline /> 大纲已生成，可在右侧预览并保存定稿。
           </div>
         );
+      case "prose_started": {
+        const chapterId = asString(payload.chapter_id) || session.chapter_id;
+        return (
+          <div
+            key={event.seq}
+            className="flex flex-wrap items-center gap-2 rounded-xl border border-accent/30 bg-accent-soft/50 px-3 py-2 text-[11px] text-accent-strong dark:text-accent"
+          >
+            <FileText className="h-3.5 w-3.5" />
+            <span className="font-medium">{zh.sandbox.proseStarted}</span>
+            <Button
+              size="sm"
+              variant="outline"
+              className="ml-auto h-7 border-accent/30 px-2 text-[10px]"
+              onClick={() => openProseDraft(chapterId)}
+            >
+              {zh.sandbox.proseView}
+            </Button>
+          </div>
+        );
+      }
+      case "prose_skipped":
+        return (
+          <div
+            key={event.seq}
+            className="rounded-xl border border-warning/35 bg-warning-soft/60 px-3 py-2 text-[11px] leading-5 text-warning"
+          >
+            <AlertTriangle className="mr-1 inline h-3 w-3" />
+            {zh.sandbox.proseSkipped(
+              asString(payload.reason) || zh.sandbox.proseSkippedFallback,
+            )}
+          </div>
+        );
       case "session_completed":
         return (
           <div key={event.seq} className="rounded-xl border border-success/30 bg-success-soft/60 px-3 py-2.5 text-sm text-success">
@@ -803,6 +850,21 @@ export function SandboxConsole() {
         >
           {statusMessage}
         </p>
+      ) : null}
+
+      {showProseFallback ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-accent/25 bg-accent-soft/40 px-3 py-2 text-xs leading-5 text-accent-strong dark:text-accent">
+          <FileText className="h-3.5 w-3.5" />
+          <span>{zh.sandbox.proseDraftPresent}</span>
+          <Button
+            size="sm"
+            variant="outline"
+            className="ml-auto h-7 border-accent/30 px-2 text-[10px]"
+            onClick={() => openProseDraft(session.chapter_id)}
+          >
+            {zh.sandbox.proseView}
+          </Button>
+        </div>
       ) : null}
 
       <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)] xl:grid-cols-[260px_minmax(0,1fr)_320px]">

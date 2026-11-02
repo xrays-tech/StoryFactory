@@ -483,6 +483,174 @@ async fn draft_escalates_truncated_scene_instead_of_skipping() {
 }
 
 #[tokio::test]
+async fn draft_uses_chapter_target_words() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    sqlx::query("UPDATE chapters SET target_words = 4200 WHERE id = ?")
+        .bind(&fixture.chapter_id)
+        .execute(&fixture.pool)
+        .await
+        .expect("set chapter target words");
+
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..3 {
+        mock.push_ok("章节目标字数正文。");
+    }
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+
+    // 请求未给 target_words：沿用章节目标字数。
+    let job = registry
+        .create(
+            &fixture.novel_id,
+            &fixture.chapter_id,
+            CreateDraftReq {
+                deslop: Some(false),
+                ..CreateDraftReq::default()
+            },
+        )
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+    assert_eq!(job.target_words, 4200, "{job:?}");
+
+    // 请求显式给出 target_words：以请求为准。
+    for _ in 0..3 {
+        mock.push_ok("请求目标字数正文。");
+    }
+    let job = registry
+        .create(
+            &fixture.novel_id,
+            &fixture.chapter_id,
+            CreateDraftReq {
+                target_words: Some(900),
+                deslop: Some(false),
+                ..CreateDraftReq::default()
+            },
+        )
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+    assert_eq!(job.target_words, 900, "{job:?}");
+}
+
+#[tokio::test]
+async fn truncated_scene_splits_into_halves_instead_of_skipping() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    // service 层同预算重试 2 次 + 升预算 1 次后仍截断（共 4 次），才由二分接管。
+    for _ in 0..4 {
+        mock.push_err(LlmError::new(LlmErrorKind::Truncated, "输出被截断"));
+    }
+    mock.push_ok("前半场正文。");
+    mock.push_ok("后半场正文。");
+    mock.push_ok("第二场正文。");
+    mock.push_ok("第三场正文。");
+
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(
+            &fixture.novel_id,
+            &fixture.chapter_id,
+            CreateDraftReq {
+                deslop: Some(false),
+                ..draft_request(1_200)
+            },
+        )
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+    let message = job.message.as_deref().unwrap_or_default();
+    assert!(!message.contains("已跳过"), "message: {message}");
+    assert!(!message.contains("缺失"), "message: {message}");
+    assert_eq!(mock.call_count(), 8);
+
+    let content: String = sqlx::query_scalar("SELECT content FROM chapters WHERE id = ?")
+        .bind(&fixture.chapter_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("chapter content");
+    assert!(content.contains("前半场正文"), "{content}");
+    assert!(content.contains("后半场正文"), "{content}");
+    assert!(content.contains("第二场正文"), "{content}");
+    assert!(content.contains("第三场正文"), "{content}");
+}
+
+#[tokio::test]
+async fn truncated_scene_keeps_half_when_other_half_fails() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    // 整场重试耗尽后仍截断 → 二分；前半成功、后半失败，正文保留前半。
+    for _ in 0..4 {
+        mock.push_err(LlmError::new(LlmErrorKind::Truncated, "输出被截断"));
+    }
+    mock.push_ok("前半场正文。");
+    mock.push_err(LlmError::new(LlmErrorKind::InvalidOutput, "后半场失败"));
+    mock.push_ok("第二场正文。");
+    mock.push_ok("第三场正文。");
+
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(
+            &fixture.novel_id,
+            &fixture.chapter_id,
+            CreateDraftReq {
+                deslop: Some(false),
+                ..draft_request(1_200)
+            },
+        )
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+    let message = job.message.as_deref().unwrap_or_default();
+    assert!(!message.contains("已跳过"), "message: {message}");
+    assert!(
+        message.contains("第 1 场部分内容缺失"),
+        "message: {message}"
+    );
+
+    let content: String = sqlx::query_scalar("SELECT content FROM chapters WHERE id = ?")
+        .bind(&fixture.chapter_id)
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("chapter content");
+    assert!(content.contains("前半场正文"), "{content}");
+    assert!(content.contains("第二场正文"), "{content}");
+    assert!(content.contains("第三场正文"), "{content}");
+}
+
+#[tokio::test]
+async fn scene_split_only_when_truncated() {
+    let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
+    let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));
+    for _ in 0..3 {
+        mock.push_ok("正常正文。");
+    }
+
+    let registry = registry(&fixture, mock_chain(mock.clone()));
+    let job = registry
+        .create(
+            &fixture.novel_id,
+            &fixture.chapter_id,
+            CreateDraftReq {
+                deslop: Some(false),
+                ..draft_request(1_200)
+            },
+        )
+        .await
+        .expect("create draft");
+    let job = wait_terminal(&fixture.pool, &job.id).await;
+
+    assert_eq!(job.status, DraftStatus::Ready, "{job:?}");
+    assert_eq!(job.message, None);
+    assert_eq!(mock.call_count(), 3, "正常场景不得额外二分请求");
+}
+
+#[tokio::test]
 async fn draft_prompt_includes_pov_and_defaults_to_third_person() {
     let fixture = setup(Some(OUTLINE_THREE_SCENES)).await;
     let mock = Arc::new(MockProvider::new("mock", StructuredMode::JsonObject));

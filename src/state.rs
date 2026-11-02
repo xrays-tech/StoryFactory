@@ -37,13 +37,17 @@ pub fn new_state(config: AppConfig, pool: SqlitePool, token: String) -> Result<A
     }
 
     let config_arc = Arc::new(ArcSwap::from_pointee(config.clone()));
-    let sessions = Arc::new(SessionManager::new(
-        pool.clone(),
-        config_arc.clone(),
-        config.sandbox.max_concurrent as usize,
-    ));
-    let imports = Arc::new(ImportRegistry::new(IMPORT_SEMAPHORE));
+    // 先建草稿注册表，再注入沙盒会话：收束写入大纲后需要它自动续写正文。
     let drafts = Arc::new(DraftRegistry::new(config_arc.clone(), pool.clone(), None));
+    let sessions = Arc::new(
+        SessionManager::new(
+            pool.clone(),
+            config_arc.clone(),
+            config.sandbox.max_concurrent as usize,
+        )
+        .with_drafts(drafts.clone()),
+    );
+    let imports = Arc::new(ImportRegistry::new(IMPORT_SEMAPHORE));
     Ok(AppState {
         config: config_arc,
         pool,

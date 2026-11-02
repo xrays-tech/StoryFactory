@@ -201,6 +201,7 @@ async fn chapter_session_hides_novel_summary() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state
         .sessions
@@ -246,6 +247,7 @@ async fn novel_session_labels_summary_as_reference() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state
         .sessions
@@ -285,6 +287,7 @@ async fn run_bound_finalize(state: &AppState, plan_outline: &str) -> (String, St
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     wait_for(state, &created.id, |s| s.status == SessionStatus::Completed).await;
@@ -325,6 +328,7 @@ async fn roundrobin_runs_to_completion_and_writes_outline() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state
         .sessions
@@ -369,6 +373,7 @@ async fn finalize_indexes_generated_outline_for_search() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     wait_for(&state, &created.id, |s| {
@@ -427,6 +432,7 @@ async fn director_mode_uses_llm_decision() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state2.sessions.create(&nid, Some(&cid), req).await.unwrap();
     let done = wait_for(&state2, &created.id, |s| {
@@ -469,6 +475,7 @@ async fn director_mode_accepts_actor_name_as_next_actor_id() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     let done = wait_for(&state, &created.id, |s| {
@@ -534,6 +541,7 @@ async fn director_mode_falls_back_on_unknown_actor_identifier() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     wait_for(&state, &created.id, |s| {
@@ -581,6 +589,7 @@ async fn step_executes_one_step_and_stays_paused() {
         director_config: None,
         user_directive: None,
         autostart: Some(false),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     sqlx::query("UPDATE sandbox_sessions SET status = 'paused' WHERE id = ?")
@@ -621,6 +630,7 @@ async fn abort_during_llm_drops_half_step() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -674,6 +684,7 @@ async fn in_flight_step_cannot_commit_after_abort() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -732,6 +743,7 @@ async fn recover_resumes_interrupted_session() {
         director_config: None,
         user_directive: None,
         autostart: Some(false),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     sqlx::query("UPDATE sandbox_sessions SET status = 'interrupted', error_code = 'PROCESS_RESTART' WHERE id = ?")
@@ -792,6 +804,7 @@ async fn waiting_input_then_input_continues() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     let waiting = wait_for(&state, &created.id, |s| {
@@ -828,6 +841,7 @@ async fn startup_recovery_marks_active_sessions_interrupted() {
         director_config: None,
         user_directive: None,
         autostart: Some(false),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     sqlx::query("UPDATE sandbox_sessions SET status = 'running' WHERE id = ?")
@@ -915,6 +929,7 @@ async fn concurrent_start_allows_only_one_engine() {
         director_config: None,
         user_directive: None,
         autostart: Some(false),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     let kind = story_architect::services::sandbox::manager::StartKind::Start;
@@ -971,6 +986,7 @@ async fn waiting_input_timeout_finalizes() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     wait_for(&state, &created.id, |s| {
@@ -1023,6 +1039,7 @@ async fn terminate_precedes_request_input() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     let done = wait_for(&state, &created.id, |s| {
@@ -1074,6 +1091,7 @@ async fn scripted_plan_exhaustion_finalizes() {
         }),
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     let done = wait_for(&state, &created.id, |s| {
@@ -1136,6 +1154,7 @@ async fn negative_emotion_delta_on_new_pair_is_clamped() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     let done = wait_for(&state, &created.id, |s| {
@@ -1173,6 +1192,7 @@ async fn create_session_with_chapter_binds_and_finalizes() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state
         .sessions
@@ -1402,6 +1422,7 @@ async fn create_session_rejects_foreign_chapter() {
         director_config: None,
         user_directive: None,
         autostart: Some(false),
+        auto_prose: None,
     };
     let err = state
         .sessions
@@ -1483,6 +1504,7 @@ async fn director_prompt_includes_global_plot_volume_and_previous_chapter() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state
         .sessions
@@ -1565,6 +1587,7 @@ async fn director_prompt_uses_recent_completed_session_as_previous_scene() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, None, req).await.unwrap();
     wait_for(&state, &created.id, |s| {
@@ -1609,6 +1632,7 @@ async fn director_prompt_marks_missing_previous_scene() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, None, req).await.unwrap();
     wait_for(&state, &created.id, |s| {
@@ -1639,6 +1663,7 @@ async fn create_session_with_blank_chapter_id_is_none() {
         director_config: None,
         user_directive: None,
         autostart: Some(false),
+        auto_prose: None,
     };
     let created = state
         .sessions
@@ -1690,6 +1715,7 @@ async fn director_prompt_lists_beats_with_indexes() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     wait_for(&state, &created.id, |s| {
@@ -1746,6 +1772,7 @@ async fn actor_receives_current_beat_and_outline() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     wait_for(&state, &created.id, |s| {
@@ -1797,6 +1824,7 @@ async fn step_limit_defaults_from_beat_count() {
         director_config: None,
         user_directive: None,
         autostart: Some(false),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
 
@@ -1832,6 +1860,7 @@ async fn beats_done_accumulates() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     let done = wait_for(&state, &created.id, |s| {
@@ -1871,4 +1900,171 @@ fn validate_outline_rejects_legacy_uncovered_heading() {
         "这一幕已经发生。".repeat(40)
     );
     assert_eq!(validate_outline(&text), Err("缺少「差异清单」小节"));
+}
+
+/// 与 test_state_with_chain 相同，但把正文草稿注册表接到会话上（复用同一 mock chain）。
+async fn state_with_drafts(chain: ProviderChain) -> AppState {
+    let mut state = test_state_with_chain(Some(chain.clone())).await;
+    let drafts = Arc::new(
+        story_architect::services::chapter_draft::DraftRegistry::new(
+            state.config.clone(),
+            state.pool.clone(),
+            Some(chain.clone()),
+        ),
+    );
+    state.drafts = drafts.clone();
+    state.sessions = Arc::new(
+        story_architect::services::sandbox::SessionManager::with_chain(
+            state.pool.clone(),
+            state.config.clone(),
+            4,
+            chain,
+        )
+        .with_drafts(drafts),
+    );
+    state
+}
+
+fn bound_session_req(chapter_id: &str, actors: &str, auto_prose: Option<bool>) -> CreateSessionReq {
+    CreateSessionReq {
+        chapter_id: Some(chapter_id.to_string()),
+        actor_ids: actors.split(',').map(str::to_string).collect(),
+        mode: DirectorMode::Roundrobin,
+        scene_prompt: "雨夜的旧城车站，两人重逢。".to_string(),
+        step_limit: Some(1),
+        director_config: None,
+        user_directive: None,
+        autostart: Some(true),
+        auto_prose,
+    }
+}
+
+#[tokio::test]
+async fn session_finalize_auto_starts_prose_draft() {
+    let state = state_with_drafts(mock_chain(vec![actor_json("厅内试探"), outline_text()])).await;
+    let (nid, actors, cid) = base_novel(&state).await;
+
+    let created = state
+        .sessions
+        .create(&nid, None, bound_session_req(&cid, &actors, None))
+        .await
+        .expect("create");
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let draft_id: Option<String> =
+        sqlx::query_scalar("SELECT prose_draft_id FROM sandbox_sessions WHERE id = ?")
+            .bind(&created.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    let draft_id = draft_id.expect("收束后必须记录自动草稿 id");
+
+    let drafts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chapter_drafts WHERE id = ? AND chapter_id = ?")
+            .bind(&draft_id)
+            .bind(&cid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(drafts, 1, "必须为绑定章节创建正文草稿");
+
+    let (outline_seq, started_seq): (i64, i64) = sqlx::query_as(
+        "SELECT MAX(CASE WHEN event_type = 'outline_ready' THEN seq END), \
+                MAX(CASE WHEN event_type = 'prose_started' THEN seq END) \
+         FROM sandbox_events WHERE session_id = ?",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert!(started_seq > 0, "必须持久化 prose_started 事件");
+    assert!(
+        started_seq > outline_seq,
+        "prose_started 必须晚于 outline_ready: outline={outline_seq}, prose={started_seq}"
+    );
+
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload FROM sandbox_events WHERE session_id = ? AND event_type = 'prose_started'",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(payload["draft_id"], draft_id);
+    assert_eq!(payload["chapter_id"], cid);
+}
+
+#[tokio::test]
+async fn auto_prose_can_be_disabled() {
+    let state = state_with_drafts(mock_chain(vec![actor_json("厅内试探"), outline_text()])).await;
+    let (nid, actors, cid) = base_novel(&state).await;
+
+    let created = state
+        .sessions
+        .create(&nid, None, bound_session_req(&cid, &actors, Some(false)))
+        .await
+        .expect("create");
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let drafts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chapter_drafts WHERE chapter_id = ?")
+            .bind(&cid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(drafts, 0, "auto_prose=false 时不得创建正文草稿");
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? AND event_type = 'prose_started'",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 0, "auto_prose=false 时不得产生 prose_started");
+}
+
+#[tokio::test]
+async fn session_without_drafts_does_not_start_prose() {
+    let state = test_state_with_chain(Some(mock_chain(vec![
+        actor_json("厅内试探"),
+        outline_text(),
+    ])))
+    .await;
+    let (nid, actors, cid) = base_novel(&state).await;
+
+    let created = state
+        .sessions
+        .create(&nid, None, bound_session_req(&cid, &actors, None))
+        .await
+        .expect("create");
+    wait_for(&state, &created.id, |s| {
+        s.status == SessionStatus::Completed
+    })
+    .await;
+
+    let drafts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chapter_drafts WHERE chapter_id = ?")
+            .bind(&cid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(drafts, 0, "未注入 drafts 时不得创建正文草稿");
+
+    let events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sandbox_events WHERE session_id = ? \
+         AND event_type IN ('prose_started','prose_skipped')",
+    )
+    .bind(&created.id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(events, 0, "未注入 drafts 时不得产生正文事件");
 }

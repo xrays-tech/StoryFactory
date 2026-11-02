@@ -132,6 +132,9 @@ pub struct CreateSessionReq {
     pub autostart: Option<bool>,
     #[serde(default)]
     pub chapter_id: Option<String>,
+    /// 收束后自动生成正文：None/Some(true) 开启，Some(false) 关闭。
+    #[serde(default)]
+    pub auto_prose: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -184,6 +187,8 @@ pub struct SessionSnapshot {
     pub id: String,
     pub novel_id: String,
     pub chapter_id: Option<String>,
+    /// 收束后自动创建的正文草稿；尚未触发或生成失败时为空。
+    pub prose_draft_id: Option<String>,
     pub status: SessionStatus,
     pub mode: DirectorMode,
     pub current_step: u32,
@@ -223,6 +228,8 @@ pub enum SandboxEventType {
     FinalizeStarted,
     OutlineReady,
     OutlineSkipped,
+    ProseStarted,
+    ProseSkipped,
     SessionCompleted,
     SessionFailed,
     SessionAborted,
@@ -247,6 +254,8 @@ impl SandboxEventType {
             SandboxEventType::FinalizeStarted => "finalize_started",
             SandboxEventType::OutlineReady => "outline_ready",
             SandboxEventType::OutlineSkipped => "outline_skipped",
+            SandboxEventType::ProseStarted => "prose_started",
+            SandboxEventType::ProseSkipped => "prose_skipped",
             SandboxEventType::SessionCompleted => "session_completed",
             SandboxEventType::SessionFailed => "session_failed",
             SandboxEventType::SessionAborted => "session_aborted",
@@ -260,6 +269,8 @@ pub struct SessionRow {
     pub id: String,
     pub novel_id: String,
     pub chapter_id: Option<String>,
+    pub prose_draft_id: Option<String>,
+    pub auto_prose: i64,
     pub scene_prompt: String,
     pub actor_ids: String,
     pub mode: String,

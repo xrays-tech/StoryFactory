@@ -10,6 +10,8 @@ export type CreateSessionDraft = {
   userDirective: string | null;
   autostart: boolean;
   chapterId: string | null;
+  /** 绑定章节且为 true 时，推演收束后自动生成该章正文。 */
+  autoProse: boolean;
 };
 
 /**
@@ -27,5 +29,7 @@ export function buildCreateSessionPayload(draft: CreateSessionDraft): Wire<Creat
     user_directive: draft.userDirective,
     autostart: draft.autostart,
     chapter_id: chapterId,
+    // 未绑定章节时后端没有可写入的正文目标，显式发 null 表示关闭。
+    auto_prose: chapterId ? draft.autoProse : null,
   };
 }

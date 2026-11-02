@@ -48,6 +48,7 @@ async fn completed_session(state: &story_architect::state::AppState) -> (String,
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     for _ in 0..300 {
@@ -116,6 +117,7 @@ async fn sse_after_seq_skips_earlier_events() {
         director_config: None,
         user_directive: None,
         autostart: Some(true),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     for _ in 0..300 {
@@ -254,6 +256,7 @@ async fn sse_attaches_to_hub_created_after_connect() {
         director_config: None,
         user_directive: None,
         autostart: Some(false),
+        auto_prose: None,
     };
     let created = state.sessions.create(&nid, Some(&cid), req).await.unwrap();
     let request = Request::builder()

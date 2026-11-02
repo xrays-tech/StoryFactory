@@ -373,6 +373,7 @@ async fn relations_put_rejected_while_session_is_active() {
                 director_config: None,
                 user_directive: None,
                 autostart: Some(false),
+                auto_prose: None,
             },
         )
         .await
@@ -747,6 +748,87 @@ async fn novel_style_fields_persist_and_clear() {
     let (_, after) = call(&app, Method::GET, &uri, None).await;
     assert!(after["pov"].is_null());
     assert_eq!(after["style_sample"], "月光如刀，刀光如雪。");
+}
+
+#[tokio::test]
+async fn chapter_target_words_defaults_to_3500() {
+    let app = test_app(test_state().await);
+    let nid = create_novel(&app, "目标字数").await;
+    let vid = create_volume(&app, &nid, "第一卷").await;
+
+    let (status, created) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v1/novels/{nid}/volumes/{vid}/chapters"),
+        Some(json!({ "title": "第一章" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["target_words"], 3500, "{created}");
+    let cid = created["id"].as_str().expect("chapter id").to_string();
+
+    let uri = format!("/api/v1/novels/{nid}/chapters/{cid}");
+    let (status, updated) = call(
+        &app,
+        Method::PATCH,
+        &uri,
+        Some(json!({ "target_words": 4200 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["target_words"], 4200, "{updated}");
+
+    // 未提供 target_words 时保持原值（部分更新语义）
+    let (status, renamed) = call(
+        &app,
+        Method::PATCH,
+        &uri,
+        Some(json!({ "title": "改名的第一章" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{renamed}");
+    assert_eq!(renamed["target_words"], 4200, "{renamed}");
+
+    let (status, fetched) = call(&app, Method::GET, &uri, None).await;
+    assert_eq!(status, StatusCode::OK, "{fetched}");
+    assert_eq!(fetched["target_words"], 4200, "{fetched}");
+}
+
+#[tokio::test]
+async fn chapter_target_words_rejects_out_of_range() {
+    let app = test_app(test_state().await);
+    let nid = create_novel(&app, "目标字数范围").await;
+    let vid = create_volume(&app, &nid, "第一卷").await;
+    let uri = format!("/api/v1/novels/{nid}/volumes/{vid}/chapters");
+
+    for value in [299_i64, 20_001] {
+        let (status, rejected) = call(
+            &app,
+            Method::POST,
+            &uri,
+            Some(json!({ "title": "越界章节", "target_words": value })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "validation_failed", "{rejected}");
+        assert_eq!(
+            rejected["error"]["details"][0]["field"], "target_words",
+            "{rejected}"
+        );
+    }
+
+    // 边界值合法
+    for value in [300_i64, 20_000] {
+        let (status, created) = call(
+            &app,
+            Method::POST,
+            &uri,
+            Some(json!({ "title": "边界章节", "target_words": value })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["target_words"], value, "{created}");
+    }
 }
 
 #[tokio::test]
